@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Video Dubber Glossary",
+  "type": "object",
+  "required": ["schema_version", "domain", "status", "terms"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "domain": {"type": "string"},
+    "status": {"type": "string", "enum": ["draft", "locked"]},
+    "terms": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["term_id", "original", "vietnamese", "category", "source_segments"],
+        "properties": {
+          "term_id": {"type": "string"},
+          "original": {"type": "string"},
+          "vietnamese": {"type": "string"},
+          "category": {"type": "string"},
+          "confidence": {"type": "number"},
+          "locked": {"type": "boolean"},
+          "source_segments": {"type": "array", "items": {"type": "string"}},
+          "occurrence_count": {"type": "integer"},
+          "status": {"type": "string"},
+          "notes": {"type": "string"}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,46 @@
+project:
+  name: video-dubber
+  output_format: mp4
+  domain: mathematics
+  output_dir: ./output
+  workspace_dir: ./workspace
+
+runtime:
+  max_parallel_jobs: 1
+  asr_concurrency: 4
+  llm_concurrency: 2
+  tts_concurrency: 4
+  retry_max_attempts: 3
+  retry_backoff_sec: 2
+  request_timeout_sec: 120
+
+input:
+  allowed_extensions: [".mp4", ".mkv", ".mov"]
+  max_file_size_mb: 4096
+  max_duration_minutes: 180
+
+translation:
+  glossary_review: true
+
+
+
+asr_service:
+  provider: openai_compatible
+  base_url: ${ASR_BASE_URL}
+  api_key: ${ASR_API_KEY}
+  model: whisper-1
+  language: en
+
+llm_service:
+  provider: openai_compatible
+  base_url: ${LLM_BASE_URL}
+  api_key: ${LLM_API_KEY}
+  model: gpt-4o-mini
+  temperature: 0.3
+
+tts_service:
+  provider: openai_compatible
+  base_url: ${TTS_BASE_URL}
+  api_key: ${TTS_API_KEY}
+  model: tts-1
+  voice: nova

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Video Dubber Translated Segments",
+  "type": "object",
+  "required": ["schema_version", "segments"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "validation_warnings": {"type": "array"},
+    "segments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["segment_id", "source_text", "vi_text", "used_terms", "translation_warnings"],
+        "properties": {
+          "segment_id": {"type": "string"},
+          "source_text": {"type": "string"},
+          "vi_text": {"type": "string"},
+          "used_terms": {"type": "array", "items": {"type": "string"}},
+          "length_ratio": {"type": "number"},
+          "translation_warnings": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}

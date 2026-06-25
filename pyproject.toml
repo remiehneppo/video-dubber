@@ -1,0 +1,27 @@
+[project]
+name = "video-dubber"
+version = "0.1.0"
+description = "CLI-first Vietnamese commentary dubbing pipeline"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "httpx",
+  "uvicorn",
+]
+
+[project.scripts]
+dubber = "cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["cli"]
+
+[tool.setuptools.packages.find]
+include = ["dubber*", "web*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
