@@ -15,7 +15,16 @@ from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.orchestrator.checkpoint_store import CheckpointStore
 from dubber.orchestrator.segment_checkpoint_store import SegmentCheckpointStore
 from dubber.pipeline.stage_context import StageContext
-from dubber.pipeline.stages import run_asr, run_audio_extract, run_glossary, run_job_init, run_translation, run_vad
+from dubber.pipeline.stages import (
+    run_asr,
+    run_audio_extract,
+    run_glossary,
+    run_job_init,
+    run_mixing,
+    run_translation,
+    run_tts,
+    run_vad,
+)
 from dubber.providers.factory import ProviderBundle, build_provider_bundle
 from dubber.providers.ffmpeg import FFmpegAdapter
 from dubber.tts.aligner import apply_time_stretch
@@ -103,8 +112,13 @@ class JobManager:
                     workspace=str(paths.root),
                 )
             run_translation(ctx)
-            tts_audio = self._stage_tts(duration_ms, paths, store, manifest, crash_stage=options.crash_stage, crash_after_segments=options.crash_after_segments)
-            output_video = self._stage_mixing(copied_input, tts_audio, duration_ms, paths, store, manifest)
+            tts_audio = run_tts(
+                ctx,
+                duration_ms,
+                crash_stage=options.crash_stage,
+                crash_after_segments=options.crash_after_segments,
+            )
+            output_video = run_mixing(ctx, copied_input, tts_audio, duration_ms)
         except Exception as exc:
             store.mark_job(JobStatus.FAILED, error=str(exc))
             store.save()
@@ -137,8 +151,8 @@ class JobManager:
             duration_ms = self.ffmpeg.duration_ms(copied_input)
             store.mark_job(JobStatus.RUNNING)
             store.save()
-            tts_audio = self._stage_tts(duration_ms, paths, store, manifest)
-            output_video = self._stage_mixing(copied_input, tts_audio, duration_ms, paths, store, manifest)
+            tts_audio = run_tts(ctx, duration_ms)
+            output_video = run_mixing(ctx, copied_input, tts_audio, duration_ms)
             store.mark_job(JobStatus.COMPLETED)
             store.save()
             manifest.save()
@@ -172,8 +186,8 @@ class JobManager:
         copied_input = paths.resolve_relative(store.state.input_file)
         duration_ms = self.ffmpeg.duration_ms(copied_input)
         run_translation(ctx)
-        tts_audio = self._stage_tts(duration_ms, paths, store, manifest)
-        output_video = self._stage_mixing(copied_input, tts_audio, duration_ms, paths, store, manifest)
+        tts_audio = run_tts(ctx, duration_ms)
+        output_video = run_mixing(ctx, copied_input, tts_audio, duration_ms)
         store.mark_job(JobStatus.COMPLETED)
         store.save()
         manifest.save()
@@ -203,15 +217,15 @@ class JobManager:
         store.save()
         if stage == StageName.TRANSLATION:
             run_translation(ctx)
-            tts_audio = self._stage_tts(duration_ms, paths, store, manifest)
-            output_video = self._stage_mixing(copied_input, tts_audio, duration_ms, paths, store, manifest)
+            tts_audio = run_tts(ctx, duration_ms)
+            output_video = run_mixing(ctx, copied_input, tts_audio, duration_ms)
         elif stage == StageName.TTS:
-            tts_audio = self._stage_tts(duration_ms, paths, store, manifest)
-            output_video = self._stage_mixing(copied_input, tts_audio, duration_ms, paths, store, manifest)
+            tts_audio = run_tts(ctx, duration_ms)
+            output_video = run_mixing(ctx, copied_input, tts_audio, duration_ms)
         elif stage == StageName.MIXING:
             tts_manifest = read_json(paths.artifact_path("tts_manifest.v1.json"))
             first_audio = paths.resolve_relative(tts_manifest["segments"][0]["audio_path"])
-            output_video = self._stage_mixing(copied_input, first_audio, duration_ms, paths, store, manifest)
+            output_video = run_mixing(ctx, copied_input, first_audio, duration_ms)
         else:
             raise ValueError(f"Rerun is not supported for stage: {stage.value}")
 

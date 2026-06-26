@@ -10,6 +10,8 @@ from dubber.core.io import write_json_atomic
 from dubber.orchestrator.segment_checkpoint_store import SegmentCheckpointStore
 from dubber.orchestrator.stage_artifacts import StageArtifacts
 from dubber.pipeline.stage_context import StageContext
+from dubber.tts.mock import synthesize_tone_wav
+from dubber.tts.segment_producer import produce_mock_tts_segment, produce_provider_tts_segment
 from dubber.translation.compressor import compress_segment_translation
 from dubber.translation.validator import validate_translations
 
@@ -267,3 +269,109 @@ def run_translation(ctx: StageContext) -> None:
         done=len(transcript["segments"]),
         total=len(transcript["segments"]),
     )
+
+
+def run_tts(
+    ctx: StageContext,
+    duration_ms: int,
+    *,
+    crash_stage: str | None = None,
+    crash_after_segments: int | None = None,
+) -> Path:
+    segments = ctx.artifact_json("segments.v1.json")["segments"]
+    ctx.store.mark_stage(StageName.TTS, StageStatus.RUNNING, done=0, total=len(segments))
+    ctx.store.save()
+    segment_store = SegmentCheckpointStore.create(
+        ctx.paths.artifact_path("tts_segments.v1.json"),
+        stage=StageName.TTS.value,
+        segment_ids=[str(segment["segment_id"]) for segment in segments],
+    )
+    if crash_stage == StageName.TTS.value and crash_after_segments == 0:
+        segment_store.save()
+        raise RuntimeError("simulated crash at tts after 0 segments")
+    translations_by_id = {
+        str(segment["segment_id"]): segment
+        for segment in ctx.artifact_json("translated.v1.json")["segments"]
+    }
+    mix_audio_path = ctx.paths.tts_dir / "mix.wav"
+    synthesize_tone_wav(mix_audio_path, duration_ms)
+    tts_segments = []
+    for segment in segments:
+        segment_id = str(segment["segment_id"])
+        if ctx.provider_mode == "openai_compatible":
+            row = asyncio.run(
+                produce_provider_tts_segment(
+                    paths=ctx.paths,
+                    segment=segment,
+                    text=translations_by_id.get(segment_id, {}).get("vi_text", ""),
+                    provider_bundle=ctx.require_provider_bundle(),
+                    ffmpeg=ctx.ffmpeg,
+                )
+            )
+        else:
+            row = produce_mock_tts_segment(paths=ctx.paths, segment=segment)
+        tts_segments.append(row)
+        segment_store.mark(segment_id, StageStatus.COMPLETED, artifact=row["audio_path"])
+        segment_store.save()
+    publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
+    publisher.publish_file(
+        stage=StageName.TTS,
+        name="tts_segments",
+        path=segment_store.path,
+        status=StageStatus.RUNNING,
+    )
+    publisher.publish_json(
+        stage=StageName.TTS,
+        name="tts_manifest",
+        filename="tts_manifest.v1.json",
+        payload={"schema_version": "1.0", "segments": tts_segments},
+        done=len(segments),
+        total=len(segments),
+    )
+    return mix_audio_path
+
+
+def run_mixing(ctx: StageContext, copied_input: Path, tts_audio: Path, duration_ms: int) -> Path:
+    ctx.store.mark_stage(StageName.MIXING, StageStatus.RUNNING)
+    ctx.store.save()
+    final_audio = ctx.paths.audio_dir / "final_mix.wav"
+    ctx.ffmpeg.mix_commentary_audio(ctx.paths.audio_dir / "original.wav", tts_audio, final_audio)
+    output_video = ctx.paths.output_dir / f"{copied_input.stem}_vi.mp4"
+    ctx.ffmpeg.mux_video_audio(copied_input, final_audio, output_video)
+    qa_path = ctx.paths.output_dir / f"{copied_input.stem}_vi.qa.json"
+    write_json_atomic(
+        qa_path,
+        {
+            "schema_version": "1.0",
+            "job_id": ctx.paths.root.name,
+            "input_duration_ms": duration_ms,
+            "output_duration_ms": ctx.ffmpeg.duration_ms(output_video),
+            "segments_total": len(ctx.artifact_json("segments.v1.json")["segments"]),
+            "low_confidence_segments": 0,
+            "glossary_terms": 1,
+            "tts_overflow_segments": 0,
+            "max_overflow_ms": 0,
+            "sync_drift_p95_ms": 0,
+            "warnings": [],
+        },
+    )
+    publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
+    publisher.publish_file(
+        stage=StageName.MIXING,
+        name="final_audio",
+        path=final_audio,
+        status=StageStatus.RUNNING,
+    )
+    publisher.publish_file(
+        stage=StageName.MIXING,
+        name="qa_report",
+        path=qa_path,
+        status=StageStatus.RUNNING,
+    )
+    publisher.publish_file(
+        stage=StageName.MIXING,
+        name="output_video",
+        path=output_video,
+        status=StageStatus.COMPLETED,
+    )
+    return output_video
