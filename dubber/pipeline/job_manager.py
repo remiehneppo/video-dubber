@@ -15,7 +15,7 @@ from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.orchestrator.checkpoint_store import CheckpointStore
 from dubber.orchestrator.segment_checkpoint_store import SegmentCheckpointStore
 from dubber.pipeline.stage_context import StageContext
-from dubber.pipeline.stages import run_audio_extract, run_job_init, run_vad
+from dubber.pipeline.stages import run_asr, run_audio_extract, run_glossary, run_job_init, run_translation, run_vad
 from dubber.providers.factory import ProviderBundle, build_provider_bundle
 from dubber.providers.ffmpeg import FFmpegAdapter
 from dubber.tts.aligner import apply_time_stretch
@@ -91,8 +91,8 @@ class JobManager:
             run_job_init(ctx, copied_input)
             duration_ms = run_audio_extract(ctx, copied_input)
             run_vad(ctx)
-            self._stage_asr(paths, store, manifest)
-            if self._stage_glossary(paths, store, manifest, glossary_review=options.glossary_review):
+            run_asr(ctx)
+            if run_glossary(ctx, glossary_review=options.glossary_review):
                 store.mark_job(JobStatus.WAITING_REVIEW)
                 store.save()
                 manifest.save()
@@ -102,7 +102,7 @@ class JobManager:
                     output_video="",
                     workspace=str(paths.root),
                 )
-            self._stage_translation(paths, store, manifest)
+            run_translation(ctx)
             tts_audio = self._stage_tts(duration_ms, paths, store, manifest, crash_stage=options.crash_stage, crash_after_segments=options.crash_after_segments)
             output_video = self._stage_mixing(copied_input, tts_audio, duration_ms, paths, store, manifest)
         except Exception as exc:
@@ -124,6 +124,14 @@ class JobManager:
         paths = WorkspacePaths.create(workspace_dir, job_id)
         store = CheckpointStore.load(paths.job_state_file)
         manifest = ArtifactManifest.load(paths.manifest_file)
+        ctx = StageContext(
+            paths=paths,
+            store=store,
+            manifest=manifest,
+            ffmpeg=self.ffmpeg,
+            provider_mode=self.provider_mode,
+            provider_bundle=self.provider_bundle,
+        )
         if store.state.status in {JobStatus.FAILED, JobStatus.RUNNING} and store.state.current_stage == StageName.TTS:
             copied_input = paths.resolve_relative(store.state.input_file)
             duration_ms = self.ffmpeg.duration_ms(copied_input)
@@ -163,7 +171,7 @@ class JobManager:
 
         copied_input = paths.resolve_relative(store.state.input_file)
         duration_ms = self.ffmpeg.duration_ms(copied_input)
-        self._stage_translation(paths, store, manifest)
+        run_translation(ctx)
         tts_audio = self._stage_tts(duration_ms, paths, store, manifest)
         output_video = self._stage_mixing(copied_input, tts_audio, duration_ms, paths, store, manifest)
         store.mark_job(JobStatus.COMPLETED)
@@ -180,13 +188,21 @@ class JobManager:
         paths = WorkspacePaths.create(workspace_dir, job_id)
         store = CheckpointStore.load(paths.job_state_file)
         manifest = ArtifactManifest.load(paths.manifest_file)
+        ctx = StageContext(
+            paths=paths,
+            store=store,
+            manifest=manifest,
+            ffmpeg=self.ffmpeg,
+            provider_mode=self.provider_mode,
+            provider_bundle=self.provider_bundle,
+        )
         copied_input = paths.resolve_relative(store.state.input_file)
         duration_ms = self.ffmpeg.duration_ms(copied_input)
 
         store.mark_job(JobStatus.RUNNING)
         store.save()
         if stage == StageName.TRANSLATION:
-            self._stage_translation(paths, store, manifest)
+            run_translation(ctx)
             tts_audio = self._stage_tts(duration_ms, paths, store, manifest)
             output_video = self._stage_mixing(copied_input, tts_audio, duration_ms, paths, store, manifest)
         elif stage == StageName.TTS:
