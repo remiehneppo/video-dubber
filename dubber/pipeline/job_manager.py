@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -26,6 +27,8 @@ from dubber.pipeline.stages import (
 from dubber.providers.factory import ProviderBundle, build_provider_bundle
 from dubber.providers.ffmpeg import FFmpegAdapter
 from dubber.tts.segment_producer import produce_mock_tts_segment
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,15 @@ class JobManager:
         copied_input = paths.input_dir / input_path.name
         shutil.copy2(input_path, copied_input)
         self._write_resolved_config(paths, options, config.project.domain)
+        logger.info(
+            "job %s started input=%s workspace=%s provider_mode=%s request_timeout_sec=%s retry_max_attempts=%s",
+            job_id,
+            input_path,
+            paths.root,
+            self.provider_mode,
+            config.runtime.request_timeout_sec,
+            config.runtime.retry_max_attempts,
+        )
 
         try:
             run_job_init(ctx, copied_input)
@@ -100,6 +112,7 @@ class JobManager:
                 store.mark_job(JobStatus.WAITING_REVIEW)
                 store.save()
                 manifest.save()
+                logger.info("job %s waiting for glossary review workspace=%s", job_id, paths.root)
                 return RunSummary(
                     job_id=job_id,
                     status=JobStatus.WAITING_REVIEW.value,
@@ -115,6 +128,7 @@ class JobManager:
             )
             output_video = run_mixing(ctx, copied_input, tts_audio, duration_ms)
         except Exception as exc:
+            logger.exception("job %s failed at stage=%s", job_id, store.state.current_stage.value)
             store.mark_job(JobStatus.FAILED, error=str(exc))
             store.save()
             raise
@@ -122,6 +136,7 @@ class JobManager:
         store.mark_job(JobStatus.COMPLETED)
         store.save()
         manifest.save()
+        logger.info("job %s completed output=%s", job_id, output_video)
         return RunSummary(
             job_id=job_id,
             status=JobStatus.COMPLETED.value,

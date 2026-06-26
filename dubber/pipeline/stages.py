@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 from pathlib import Path
 
@@ -15,8 +16,11 @@ from dubber.tts.segment_producer import produce_mock_tts_segment, produce_provid
 from dubber.translation.compressor import compress_segment_translation
 from dubber.translation.validator import validate_translations
 
+logger = logging.getLogger(__name__)
+
 
 def run_job_init(ctx: StageContext, copied_input: Path) -> None:
+    logger.info("stage job_init started input=%s", copied_input)
     ctx.store.mark_stage(StageName.JOB_INIT, StageStatus.RUNNING)
     ctx.store.save()
     metadata_path = ctx.paths.input_dir / "input_metadata.v1.json"
@@ -26,9 +30,11 @@ def run_job_init(ctx: StageContext, copied_input: Path) -> None:
         name="input_metadata",
         path=metadata_path,
     )
+    logger.info("stage job_init completed artifact=%s", ctx.paths.to_relative(metadata_path))
 
 
 def run_audio_extract(ctx: StageContext, copied_input: Path) -> int:
+    logger.info("stage audio_extract started")
     ctx.store.mark_stage(StageName.AUDIO_EXTRACT, StageStatus.RUNNING)
     ctx.store.save()
     original_wav = ctx.paths.audio_dir / "original.wav"
@@ -48,10 +54,12 @@ def run_audio_extract(ctx: StageContext, copied_input: Path) -> int:
             "source_separation_reason": "mock_vertical_slice",
         },
     )
+    logger.info("stage audio_extract completed duration_ms=%s artifact=%s", duration_ms, ctx.paths.to_relative(original_wav))
     return duration_ms
 
 
 def run_vad(ctx: StageContext) -> None:
+    logger.info("stage vad started frame_ms=%s threshold_ratio=%s min_duration_ms=%s max_duration_ms=%s", ctx.config.vad.frame_ms, ctx.config.vad.threshold_ratio, ctx.config.vad.min_duration_ms, ctx.config.vad.max_duration_ms)
     ctx.store.mark_stage(StageName.VAD, StageStatus.RUNNING)
     ctx.store.save()
     vad = ctx.config.vad
@@ -78,9 +86,12 @@ def run_vad(ctx: StageContext) -> None:
         },
     )
 
+    logger.info("stage vad completed segments=%s artifact=artifacts/segments.v1.json", len(segments))
+
 
 def run_asr(ctx: StageContext) -> None:
     segments = ctx.artifact_json("segments.v1.json")["segments"]
+    logger.info("stage asr started segments=%s provider_mode=%s", len(segments), ctx.provider_mode)
     publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
     ctx.store.mark_stage(StageName.ASR, StageStatus.RUNNING, done=0, total=len(segments))
     ctx.store.save()
@@ -95,6 +106,7 @@ def run_asr(ctx: StageContext) -> None:
         segment_id = str(segment["segment_id"])
         raw_path = ctx.paths.raw_dir / "asr" / f"{segment_id}.json"
         if ctx.provider_mode == "openai_compatible":
+            logger.info("stage asr request segment=%s index=%s/%s", segment_id, index, len(segments))
             asr_result = asyncio.run(
                 ctx.require_provider_bundle().asr.transcribe(
                     ctx.paths.audio_dir / "vocals.wav",
@@ -108,6 +120,7 @@ def run_asr(ctx: StageContext) -> None:
             text = f"Mock transcript segment {index} for vertical slice."
             confidence = 1.0
             write_json_atomic(raw_path, {"text": text, "confidence": confidence})
+        logger.info("stage asr segment completed segment=%s index=%s/%s text_chars=%s", segment_id, index, len(segments), len(text))
         segment_store.mark(segment_id, StageStatus.COMPLETED, artifact=ctx.paths.to_relative(raw_path))
         segment_store.save()
         transcript_segments.append(
@@ -143,14 +156,18 @@ def run_asr(ctx: StageContext) -> None:
         total=len(segments),
     )
 
+    logger.info("stage asr completed segments=%s artifact=artifacts/transcript.v1.json", len(segments))
+
 
 def run_glossary(ctx: StageContext, *, glossary_review: bool) -> bool:
+    logger.info("stage glossary started review=%s provider_mode=%s", glossary_review, ctx.provider_mode)
     publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
     ctx.store.mark_stage(StageName.GLOSSARY, StageStatus.RUNNING)
     ctx.store.save()
     glossary_path = ctx.paths.artifact_path("glossary.draft.json" if glossary_review else "glossary.locked.json")
     source_segments = [segment["segment_id"] for segment in ctx.artifact_json("segments.v1.json")["segments"]]
     if ctx.provider_mode == "openai_compatible":
+        logger.info("stage glossary llm request started")
         transcript = ctx.artifact_json("transcript.v1.json")
         glossary_result = asyncio.run(
             ctx.require_provider_bundle().llm.complete_json(
@@ -159,6 +176,7 @@ def run_glossary(ctx: StageContext, *, glossary_review: bool) -> bool:
                 schema={"type": "object"},
             )
         )
+        logger.info("stage glossary llm request completed terms=%s", len(glossary_result.get("terms", [])))
         terms = []
         for index, term in enumerate(glossary_result.get("terms", []), start=1):
             terms.append(
@@ -201,16 +219,19 @@ def run_glossary(ctx: StageContext, *, glossary_review: bool) -> bool:
             path=glossary_path,
             status=StageStatus.WAITING_REVIEW,
         )
+        logger.info("stage glossary waiting_review artifact=%s terms=%s", ctx.paths.to_relative(glossary_path), len(terms))
         return True
     publisher.publish_file(
         stage=StageName.GLOSSARY,
         name="glossary",
         path=glossary_path,
     )
+    logger.info("stage glossary completed artifact=%s terms=%s", ctx.paths.to_relative(glossary_path), len(terms))
     return False
 
 
 def run_translation(ctx: StageContext) -> None:
+    logger.info("stage translation started provider_mode=%s", ctx.provider_mode)
     transcript = ctx.artifact_json("transcript.v1.json")
     glossary = ctx.artifact_json("glossary.locked.json")
     publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
@@ -219,6 +240,7 @@ def run_translation(ctx: StageContext) -> None:
     translated_segments = []
     provider_translations: dict[str, dict] = {}
     if ctx.provider_mode == "openai_compatible":
+        logger.info("stage translation llm request started segments=%s", len(transcript["segments"]))
         translation_result = asyncio.run(
             ctx.require_provider_bundle().llm.complete_json(
                 "translate transcript to Vietnamese",
@@ -226,12 +248,14 @@ def run_translation(ctx: StageContext) -> None:
                 schema={"type": "object"},
             )
         )
+        logger.info("stage translation llm request completed")
         provider_translations = {
             str(segment.get("segment_id")): segment
             for segment in translation_result.get("segments", [])
             if segment.get("segment_id") is not None
         }
-    for source in transcript["segments"]:
+    for index, source in enumerate(transcript["segments"], start=1):
+        logger.info("stage translation segment started segment=%s index=%s/%s", source["segment_id"], index, len(transcript["segments"]))
         if ctx.provider_mode == "openai_compatible":
             provider_segment = provider_translations.get(str(source["segment_id"]), {})
             candidate = {
@@ -255,6 +279,7 @@ def run_translation(ctx: StageContext) -> None:
         candidate["vi_text"] = compressed.vi_text
         candidate["translation_warnings"] = candidate["translation_warnings"] + compressed.warnings
         translated_segments.append(candidate)
+        logger.info("stage translation segment completed segment=%s index=%s/%s chars=%s", source["segment_id"], index, len(transcript["segments"]), len(candidate["vi_text"]))
     validation = validate_translations(
         transcript["segments"],
         translated_segments,
@@ -274,6 +299,8 @@ def run_translation(ctx: StageContext) -> None:
         total=len(transcript["segments"]),
     )
 
+    logger.info("stage translation completed segments=%s warnings=%s artifact=artifacts/translated.v1.json", len(transcript["segments"]), len(validation.warnings))
+
 
 def run_tts(
     ctx: StageContext,
@@ -283,6 +310,7 @@ def run_tts(
     crash_after_segments: int | None = None,
 ) -> Path:
     segments = ctx.artifact_json("segments.v1.json")["segments"]
+    logger.info("stage tts started segments=%s provider_mode=%s", len(segments), ctx.provider_mode)
     ctx.store.mark_stage(StageName.TTS, StageStatus.RUNNING, done=0, total=len(segments))
     ctx.store.save()
     segment_store = SegmentCheckpointStore.create(
@@ -300,8 +328,9 @@ def run_tts(
     mix_audio_path = ctx.paths.tts_dir / "mix.wav"
     synthesize_tone_wav(mix_audio_path, duration_ms)
     tts_segments = []
-    for segment in segments:
+    for index, segment in enumerate(segments, start=1):
         segment_id = str(segment["segment_id"])
+        logger.info("stage tts segment started segment=%s index=%s/%s", segment_id, index, len(segments))
         if ctx.provider_mode == "openai_compatible":
             row = asyncio.run(
                 produce_provider_tts_segment(
@@ -315,6 +344,7 @@ def run_tts(
         else:
             row = produce_mock_tts_segment(paths=ctx.paths, segment=segment)
         tts_segments.append(row)
+        logger.info("stage tts segment completed segment=%s index=%s/%s audio=%s", segment_id, index, len(segments), row["audio_path"])
         segment_store.mark(segment_id, StageStatus.COMPLETED, artifact=row["audio_path"])
         segment_store.save()
     publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
@@ -332,10 +362,12 @@ def run_tts(
         done=len(segments),
         total=len(segments),
     )
+    logger.info("stage tts completed segments=%s mix_audio=%s", len(segments), ctx.paths.to_relative(mix_audio_path))
     return mix_audio_path
 
 
 def run_mixing(ctx: StageContext, copied_input: Path, tts_audio: Path, duration_ms: int) -> Path:
+    logger.info("stage mixing started tts_audio=%s", tts_audio)
     ctx.store.mark_stage(StageName.MIXING, StageStatus.RUNNING)
     ctx.store.save()
     final_audio = ctx.paths.audio_dir / "final_mix.wav"
@@ -378,4 +410,5 @@ def run_mixing(ctx: StageContext, copied_input: Path, tts_audio: Path, duration_
         path=output_video,
         status=StageStatus.COMPLETED,
     )
+    logger.info("stage mixing completed output=%s qa=%s", output_video, qa_path)
     return output_video

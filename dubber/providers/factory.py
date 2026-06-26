@@ -44,17 +44,26 @@ def build_provider_bundle(config: DubberConfig) -> ProviderBundle:
             base_url=config.asr_service.base_url,
             api_key=config.asr_service.api_key,
             model=config.asr_service.model,
+            max_attempts=config.runtime.retry_max_attempts,
+            retry_delay_sec=config.runtime.retry_backoff_sec,
+            request_timeout_sec=config.runtime.request_timeout_sec,
         ),
         llm=OpenAICompatibleLLMProvider(
             base_url=config.llm_service.base_url,
             api_key=config.llm_service.api_key,
             model=config.llm_service.model,
+            max_attempts=config.runtime.retry_max_attempts,
+            retry_delay_sec=config.runtime.retry_backoff_sec,
+            request_timeout_sec=config.runtime.request_timeout_sec,
         ),
         tts=OpenAICompatibleTTSProvider(
             base_url=config.tts_service.base_url,
             api_key=config.tts_service.api_key,
             model=config.tts_service.model,
             voice=config.tts_service.voice,
+            max_attempts=config.runtime.retry_max_attempts,
+            retry_delay_sec=config.runtime.retry_backoff_sec,
+            request_timeout_sec=config.runtime.request_timeout_sec,
         ),
     )
 

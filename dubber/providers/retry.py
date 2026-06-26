@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class ProviderRequestError(RuntimeError):
@@ -33,7 +36,9 @@ async def request_with_retries(
         except (httpx.HTTPStatusError, httpx.TransportError) as exc:
             last_error = exc
             if attempt == max_attempts or not _is_retryable(exc):
+                logger.error("%s request failed attempt=%s/%s retryable=%s error=%s", provider, attempt, max_attempts, _is_retryable(exc), exc)
                 raise ProviderRequestError(provider=provider, attempts=attempt, cause=exc) from exc
+            logger.warning("%s request failed attempt=%s/%s; retrying in %ss: %s", provider, attempt, max_attempts, retry_delay_sec, exc)
             if retry_delay_sec > 0:
                 await asyncio.sleep(retry_delay_sec)
 
