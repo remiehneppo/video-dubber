@@ -14,6 +14,8 @@ from dubber.audio.vad import VadConfig, detect_segments
 from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.orchestrator.checkpoint_store import CheckpointStore
 from dubber.orchestrator.segment_checkpoint_store import SegmentCheckpointStore
+from dubber.pipeline.stage_context import StageContext
+from dubber.pipeline.stages import run_audio_extract, run_job_init, run_vad
 from dubber.providers.factory import ProviderBundle, build_provider_bundle
 from dubber.providers.ffmpeg import FFmpegAdapter
 from dubber.tts.aligner import apply_time_stretch
@@ -72,15 +74,23 @@ class JobManager:
         paths = WorkspacePaths.create(options.workspace_dir, job_id)
         store = CheckpointStore.create(paths.job_state_file, job_id=job_id, input_file=Path("input") / input_path.name)
         manifest = ArtifactManifest.create(job_id, paths.manifest_file)
+        ctx = StageContext(
+            paths=paths,
+            store=store,
+            manifest=manifest,
+            ffmpeg=self.ffmpeg,
+            provider_mode=self.provider_mode,
+            provider_bundle=self.provider_bundle,
+        )
 
         copied_input = paths.input_dir / input_path.name
         shutil.copy2(input_path, copied_input)
         self._write_resolved_config(paths, options, config.project.domain)
 
         try:
-            self._stage_job_init(copied_input, paths, store, manifest)
-            duration_ms = self._stage_audio_extract(copied_input, paths, store, manifest)
-            self._stage_vad(paths, store, manifest)
+            run_job_init(ctx, copied_input)
+            duration_ms = run_audio_extract(ctx, copied_input)
+            run_vad(ctx)
             self._stage_asr(paths, store, manifest)
             if self._stage_glossary(paths, store, manifest, glossary_review=options.glossary_review):
                 store.mark_job(JobStatus.WAITING_REVIEW)
