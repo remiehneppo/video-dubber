@@ -8,6 +8,7 @@ import httpx
 
 from dubber.providers.asr_openai_compatible import OpenAICompatibleASRProvider
 from dubber.providers.llm_openai_compatible import OpenAICompatibleLLMProvider
+from dubber.providers.retry import ProviderRequestError
 from dubber.providers.tts_openai_compatible import OpenAICompatibleTTSProvider
 
 
@@ -37,6 +38,61 @@ def test_openai_compatible_asr_posts_audio_and_normalizes_result(tmp_path: Path)
     assert result.text == "hello"
     assert result.confidence == 0.87
     assert result.language == "en"
+
+
+def test_openai_compatible_asr_retries_transient_server_errors(tmp_path: Path) -> None:
+    audio = tmp_path / "seg.wav"
+    audio.write_bytes(b"RIFFfake")
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 5:
+            return httpx.Response(500, json={"error": "temporary"})
+        return httpx.Response(200, json={"text": "hello", "confidence": 0.87, "language": "en"})
+
+    provider = OpenAICompatibleASRProvider(
+        base_url="https://api.example.test/v1",
+        api_key="secret",
+        model="whisper-1",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        retry_delay_sec=0,
+    )
+
+    result = asyncio.run(provider.transcribe(audio, language="en"))
+
+    assert attempts == 5
+    assert result.text == "hello"
+
+
+def test_openai_compatible_asr_reports_error_after_five_failed_attempts(tmp_path: Path) -> None:
+    audio = tmp_path / "seg.wav"
+    audio.write_bytes(b"RIFFfake")
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503, json={"error": "still unavailable"})
+
+    provider = OpenAICompatibleASRProvider(
+        base_url="https://api.example.test/v1",
+        api_key="secret",
+        model="whisper-1",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        retry_delay_sec=0,
+    )
+
+    try:
+        asyncio.run(provider.transcribe(audio, language="en"))
+    except ProviderRequestError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("Expected ProviderRequestError")
+
+    assert attempts == 5
+    assert "asr request failed after 5 attempts" in message
 
 
 def test_openai_compatible_llm_posts_chat_request_and_parses_json() -> None:
@@ -69,6 +125,33 @@ def test_openai_compatible_llm_posts_chat_request_and_parses_json() -> None:
     assert result == {"terms": [{"original": "eigenvector"}]}
 
 
+def test_openai_compatible_llm_retries_transient_server_errors() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 5:
+            return httpx.Response(503, json={"error": "busy"})
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"ok": true}'}}]},
+        )
+
+    provider = OpenAICompatibleLLMProvider(
+        base_url="https://api.example.test/v1",
+        api_key="secret",
+        model="gpt-test",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        retry_delay_sec=0,
+    )
+
+    result = asyncio.run(provider.complete_json("system", "user", schema={"type": "object"}))
+
+    assert attempts == 5
+    assert result == {"ok": True}
+
+
 def test_openai_compatible_tts_writes_audio_file(tmp_path: Path) -> None:
     output = tmp_path / "tts.wav"
     seen: dict[str, object] = {}
@@ -89,5 +172,31 @@ def test_openai_compatible_tts_writes_audio_file(tmp_path: Path) -> None:
 
     assert seen["url"] == "https://api.example.test/v1/audio/speech"
     assert seen["payload"] == {"model": "tts-1", "input": "xin chao", "voice": "nova"}
+    assert output.read_bytes() == b"WAVDATA"
+    assert result.audio_path == output
+
+
+def test_openai_compatible_tts_retries_transient_server_errors(tmp_path: Path) -> None:
+    output = tmp_path / "tts.wav"
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 5:
+            return httpx.Response(502, json={"error": "bad gateway"})
+        return httpx.Response(200, content=b"WAVDATA", headers={"content-type": "audio/wav"})
+
+    provider = OpenAICompatibleTTSProvider(
+        base_url="https://api.example.test/v1",
+        api_key="secret",
+        model="tts-1",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        retry_delay_sec=0,
+    )
+
+    result = asyncio.run(provider.synthesize("xin chao", voice="nova", output_path=output))
+
+    assert attempts == 5
     assert output.read_bytes() == b"WAVDATA"
     assert result.audio_path == output
