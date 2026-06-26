@@ -19,6 +19,14 @@ input:
   max_file_size_mb: 4096
   max_duration_minutes: 180
 
+vad:
+  frame_ms: 100
+  threshold_ratio: 0.15
+  min_duration_ms: 300
+  max_duration_ms: 25000
+  silence_merge_threshold_ms: 400
+  soft_split_allowed: true
+
 translation:
   glossary_review: true
 

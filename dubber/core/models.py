@@ -39,6 +39,16 @@ class InputConfig:
 
 
 @dataclass(frozen=True)
+class VadConfig:
+    frame_ms: int = 100
+    threshold_ratio: float = 0.15
+    min_duration_ms: int = 300
+    max_duration_ms: int = 25_000
+    silence_merge_threshold_ms: int = 400
+    soft_split_allowed: bool = True
+
+
+@dataclass(frozen=True)
 class TranslationConfig:
     glossary_review: bool = True
 
@@ -76,6 +86,7 @@ class DubberConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     input: InputConfig = field(default_factory=InputConfig)
     translation: TranslationConfig = field(default_factory=TranslationConfig)
+    vad: VadConfig = field(default_factory=VadConfig)
     asr_service: ASRServiceConfig = field(default_factory=ASRServiceConfig)
     llm_service: LLMServiceConfig = field(default_factory=LLMServiceConfig)
     tts_service: TTSServiceConfig = field(default_factory=TTSServiceConfig)

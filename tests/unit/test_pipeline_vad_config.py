@@ -1,0 +1,57 @@
+from __future__ import annotations
+
+import math
+import wave
+from pathlib import Path
+
+from dubber.core.models import DubberConfig, VadConfig
+from dubber.core.paths import WorkspacePaths
+from dubber.orchestrator.artifact_manifest import ArtifactManifest
+from dubber.orchestrator.checkpoint_store import CheckpointStore
+from dubber.pipeline.stage_context import StageContext
+from dubber.pipeline.stages import run_vad
+
+
+def test_run_vad_uses_configured_max_duration(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_vad")
+    _write_wav(paths.audio_dir / "vocals.wav", duration_ms=1200)
+    store = CheckpointStore.create(paths.job_state_file, job_id="job_vad", input_file=Path("input/video.mp4"))
+    manifest = ArtifactManifest.create("job_vad", paths.manifest_file)
+    ctx = StageContext(
+        paths=paths,
+        store=store,
+        manifest=manifest,
+        ffmpeg=None,
+        config=DubberConfig(
+            vad=VadConfig(
+                frame_ms=100,
+                threshold_ratio=0.2,
+                min_duration_ms=100,
+                max_duration_ms=500,
+                silence_merge_threshold_ms=100,
+            )
+        ),
+    )
+
+    run_vad(ctx)
+
+    segments = ctx.artifact_json("segments.v1.json")["segments"]
+    assert [(segment["start_ms"], segment["end_ms"]) for segment in segments] == [
+        (0, 500),
+        (500, 1000),
+        (1000, 1200),
+    ]
+
+
+def _write_wav(path: Path, *, duration_ms: int, sample_rate: int = 1000) -> None:
+    frames = bytearray()
+    sample_count = int(sample_rate * duration_ms / 1000)
+    for index in range(sample_count):
+        value = int(10000 * math.sin(2 * math.pi * 10 * index / sample_rate))
+        frames.extend(value.to_bytes(2, "little", signed=True))
+
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(bytes(frames))

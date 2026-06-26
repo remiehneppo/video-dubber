@@ -84,6 +84,7 @@ class JobManager:
             ffmpeg=self.ffmpeg,
             provider_mode=self.provider_mode,
             provider_bundle=self.provider_bundle,
+            config=config,
         )
 
         copied_input = paths.input_dir / input_path.name

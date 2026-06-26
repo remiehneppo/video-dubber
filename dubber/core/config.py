@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from dubber.core.models import ASRServiceConfig, DubberConfig, InputConfig, LLMServiceConfig, ProjectConfig, RuntimeConfig, TranslationConfig, TTSServiceConfig
+from dubber.core.models import ASRServiceConfig, DubberConfig, InputConfig, LLMServiceConfig, ProjectConfig, RuntimeConfig, TranslationConfig, TTSServiceConfig, VadConfig
 
 
 def load_config(path: Path | str) -> DubberConfig:
@@ -14,6 +14,7 @@ def load_config(path: Path | str) -> DubberConfig:
     runtime = raw.get("runtime", {})
     input_config = raw.get("input", {})
     translation = raw.get("translation", {})
+    vad = raw.get("vad", {})
     asr_service = raw.get("asr_service", {})
     llm_service = raw.get("llm_service", {})
     tts_service = raw.get("tts_service", {})
@@ -41,6 +42,14 @@ def load_config(path: Path | str) -> DubberConfig:
         ),
         translation=TranslationConfig(
             glossary_review=bool(translation.get("glossary_review", True)),
+        ),
+        vad=VadConfig(
+            frame_ms=int(vad.get("frame_ms", 100)),
+            threshold_ratio=float(vad.get("threshold_ratio", 0.15)),
+            min_duration_ms=int(vad.get("min_duration_ms", 300)),
+            max_duration_ms=int(vad.get("max_duration_ms", 25_000)),
+            silence_merge_threshold_ms=int(vad.get("silence_merge_threshold_ms", 400)),
+            soft_split_allowed=bool(vad.get("soft_split_allowed", True)),
         ),
         asr_service=ASRServiceConfig(
             provider=str(asr_service.get("provider", "openai_compatible")),
@@ -107,6 +116,10 @@ def _parse_scalar(value: str) -> Any:
         return ast.literal_eval(value)
     try:
         return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
     except ValueError:
         return value
 

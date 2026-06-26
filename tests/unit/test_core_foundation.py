@@ -22,6 +22,13 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
                 "  output_dir: ./out",
                 "runtime:",
                 "  asr_concurrency: 3",
+                "vad:",
+                "  frame_ms: 50",
+                "  threshold_ratio: 0.2",
+                "  min_duration_ms: 150",
+                "  max_duration_ms: 1200",
+                "  silence_merge_threshold_ms: 250",
+                "  soft_split_allowed: false",
                 "translation:",
                 "  glossary_review: false",
             ]
@@ -36,6 +43,12 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
     assert config.project.output_dir == Path("out")
     assert config.runtime.asr_concurrency == 3
     assert config.runtime.tts_concurrency == 4
+    assert config.vad.frame_ms == 50
+    assert config.vad.threshold_ratio == 0.2
+    assert config.vad.min_duration_ms == 150
+    assert config.vad.max_duration_ms == 1200
+    assert config.vad.silence_merge_threshold_ms == 250
+    assert config.vad.soft_split_allowed is False
     assert config.translation.glossary_review is False
     assert config.input.allowed_extensions == [".mp4", ".mkv", ".mov"]
 

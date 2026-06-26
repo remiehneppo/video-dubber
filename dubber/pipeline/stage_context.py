@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from dubber.core.io import read_json
+from dubber.core.models import DubberConfig
 from dubber.core.paths import WorkspacePaths
 from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.orchestrator.checkpoint_store import CheckpointStore
@@ -17,7 +18,8 @@ class StageContext:
     paths: WorkspacePaths
     store: CheckpointStore
     manifest: ArtifactManifest
-    ffmpeg: FFmpegAdapter
+    ffmpeg: FFmpegAdapter | None
+    config: DubberConfig = field(default_factory=DubberConfig)
     provider_mode: str = "mock"
     provider_bundle: ProviderBundle | None = None
 

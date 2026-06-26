@@ -4,7 +4,7 @@ import asyncio
 import shutil
 from pathlib import Path
 
-from dubber.audio.vad import VadConfig, detect_segments
+from dubber.audio.vad import VadConfig as AudioVadConfig, detect_segments
 from dubber.core.enums import StageName, StageStatus
 from dubber.core.io import write_json_atomic
 from dubber.orchestrator.segment_checkpoint_store import SegmentCheckpointStore
@@ -54,12 +54,16 @@ def run_audio_extract(ctx: StageContext, copied_input: Path) -> int:
 def run_vad(ctx: StageContext) -> None:
     ctx.store.mark_stage(StageName.VAD, StageStatus.RUNNING)
     ctx.store.save()
+    vad = ctx.config.vad
     segments = detect_segments(
         ctx.paths.audio_dir / "vocals.wav",
-        VadConfig(
-            min_duration_ms=300,
-            max_duration_ms=25_000,
-            silence_merge_threshold_ms=400,
+        AudioVadConfig(
+            frame_ms=vad.frame_ms,
+            threshold_ratio=vad.threshold_ratio,
+            min_duration_ms=vad.min_duration_ms,
+            max_duration_ms=vad.max_duration_ms,
+            silence_merge_threshold_ms=vad.silence_merge_threshold_ms,
+            soft_split_allowed=vad.soft_split_allowed,
         ),
     )
     StageArtifacts(ctx.paths, ctx.store, ctx.manifest).publish_json(
