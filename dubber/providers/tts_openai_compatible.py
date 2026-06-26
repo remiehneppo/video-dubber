@@ -15,6 +15,7 @@ class OpenAICompatibleTTSProvider:
         base_url: str,
         api_key: str,
         model: str,
+        voice: str = "default",
         client: httpx.AsyncClient | None = None,
         max_attempts: int = 5,
         retry_delay_sec: float = 0.5,
@@ -22,6 +23,7 @@ class OpenAICompatibleTTSProvider:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self.voice = voice
         self.client = client or httpx.AsyncClient(timeout=120)
         self.max_attempts = max_attempts
         self.retry_delay_sec = retry_delay_sec

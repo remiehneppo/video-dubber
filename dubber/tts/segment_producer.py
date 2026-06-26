@@ -37,7 +37,8 @@ async def produce_provider_tts_segment(
 ) -> dict[str, Any]:
     segment_id = str(segment["segment_id"])
     raw_audio_path = paths.tts_dir / f"{segment_id}.raw.wav"
-    tts_result = await provider_bundle.tts.synthesize(text, voice=voice, output_path=raw_audio_path)
+    tts_voice = voice if voice != "default" else getattr(provider_bundle.tts, "voice", voice)
+    tts_result = await provider_bundle.tts.synthesize(text, voice=tts_voice, output_path=raw_audio_path)
     tts_duration_ms = tts_result.duration_ms or ffmpeg.duration_ms(tts_result.audio_path)
     return _align_segment(
         paths=paths,

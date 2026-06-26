@@ -19,6 +19,7 @@ def test_build_provider_bundle_creates_openai_compatible_adapters() -> None:
     assert isinstance(bundle.asr, OpenAICompatibleASRProvider)
     assert isinstance(bundle.llm, OpenAICompatibleLLMProvider)
     assert isinstance(bundle.tts, OpenAICompatibleTTSProvider)
+    assert bundle.tts.voice == "nova"
 
 
 def test_validate_provider_config_reports_missing_secrets() -> None:

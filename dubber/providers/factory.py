@@ -54,6 +54,7 @@ def build_provider_bundle(config: DubberConfig) -> ProviderBundle:
             base_url=config.tts_service.base_url,
             api_key=config.tts_service.api_key,
             model=config.tts_service.model,
+            voice=config.tts_service.voice,
         ),
     )
 
