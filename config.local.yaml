@@ -1,0 +1,44 @@
+project:
+  name: video-dubber
+  output_format: mp4
+  domain: mathematics
+  output_dir: ./output
+  workspace_dir: ./workspace
+
+runtime:
+  max_parallel_jobs: 1
+  asr_concurrency: 4
+  llm_concurrency: 2
+  tts_concurrency: 4
+  retry_max_attempts: 5
+  retry_backoff_sec: 2
+  request_timeout_sec: 120
+
+input:
+  allowed_extensions: [".mp4", ".mkv", ".mov"]
+  max_file_size_mb: 4096
+  max_duration_minutes: 180
+
+translation:
+  glossary_review: true
+
+asr_service:
+  provider: openai_compatible
+  base_url: http://127.0.0.1:23334/v1
+  api_key: local-asr
+  model: Systran/faster-whisper-large-v3
+  language: en
+
+llm_service:
+  provider: openai_compatible
+  base_url: ${LLM_BASE_URL}
+  api_key: ${LLM_API_KEY}
+  model: ${LLM_MODEL}
+  temperature: 0.3
+
+tts_service:
+  provider: openai_compatible
+  base_url: http://127.0.0.1:23333/v1
+  api_key: local-tts
+  model: pnnbao-ump/VieNeu-TTS-v2
+  voice: "Trúc Ly"

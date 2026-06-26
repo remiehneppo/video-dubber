@@ -4,6 +4,14 @@ CLI-first Vietnamese commentary dubbing pipeline for educational videos, lecture
 
 The current implementation is a modular monolith with file-based jobs, manifest-tracked artifacts, checkpoint/resume, a mock provider mode for local end-to-end runs, OpenAI-compatible provider adapters, and a FastAPI monitor.
 
+## Architecture Notes
+
+- `JobManager` owns job lifecycle: create workspace, start, resume, rerun, and mark final job status.
+- `StageContext` carries stage dependencies without making each stage know how jobs are constructed.
+- Stage functions in `dubber/pipeline/stages.py` own stage behavior and artifact shapes.
+- `StageArtifacts` owns artifact publication: atomic write, manifest record, manifest save, checkpoint update.
+- TTS segment production lives in `dubber/tts/segment_producer.py` so full TTS runs and segment reruns share alignment behavior.
+
 ## Requirements
 
 - Python 3.11+

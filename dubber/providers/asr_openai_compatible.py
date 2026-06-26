@@ -5,24 +5,43 @@ from pathlib import Path
 import httpx
 
 from dubber.providers.base import ASRResult
+from dubber.providers.retry import request_with_retries
 
 
 class OpenAICompatibleASRProvider:
-    def __init__(self, *, base_url: str, api_key: str, model: str, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        client: httpx.AsyncClient | None = None,
+        max_attempts: int = 5,
+        retry_delay_sec: float = 0.5,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.client = client or httpx.AsyncClient(timeout=120)
+        self.max_attempts = max_attempts
+        self.retry_delay_sec = retry_delay_sec
 
     async def transcribe(self, audio_path: Path, language: str) -> ASRResult:
-        with audio_path.open("rb") as audio_file:
-            response = await self.client.post(
-                f"{self.base_url}/audio/transcriptions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                data={"model": self.model, "language": language},
-                files={"file": (audio_path.name, audio_file, "audio/wav")},
-            )
-        response.raise_for_status()
+        async def request() -> httpx.Response:
+            with audio_path.open("rb") as audio_file:
+                return await self.client.post(
+                    f"{self.base_url}/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    data={"model": self.model, "language": language},
+                    files={"file": (audio_path.name, audio_file, "audio/wav")},
+                )
+
+        response = await request_with_retries(
+            request,
+            provider="asr",
+            max_attempts=self.max_attempts,
+            retry_delay_sec=self.retry_delay_sec,
+        )
         payload = response.json()
         return ASRResult(
             text=str(payload.get("text", "")),
