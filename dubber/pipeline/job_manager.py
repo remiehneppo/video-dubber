@@ -30,6 +30,7 @@ from dubber.providers.ffmpeg import FFmpegAdapter
 from dubber.tts.aligner import apply_time_stretch
 from dubber.tts.duration_planner import plan_segment_duration
 from dubber.tts.mock import synthesize_tone_wav
+from dubber.tts.segment_producer import produce_mock_tts_segment
 from dubber.translation.compressor import compress_segment_translation
 from dubber.translation.validator import validate_translations
 
@@ -254,30 +255,16 @@ class JobManager:
         segment = matching[0]
 
         checkpoint = SegmentCheckpointStore.load(paths.artifact_path("tts_segments.v1.json"))
-        raw_audio_path = paths.tts_dir / f"{segment_id}.raw.wav"
-        audio_path = paths.tts_dir / f"{segment_id}.wav"
-        orig_ms = int(segment["duration_ms"])
-        mock_tts_ms = max(100, int(orig_ms * 1.1))
-        synthesize_tone_wav(raw_audio_path, mock_tts_ms)
-        timing_plan = plan_segment_duration(segment_id, orig_duration_ms=orig_ms, tts_duration_ms=mock_tts_ms)
-        if timing_plan.action == "time_stretch":
-            apply_time_stretch(raw_audio_path, audio_path, timing_plan.stretch_ratio)
-        else:
-            apply_time_stretch(raw_audio_path, audio_path, 1.0)
-        checkpoint.mark(segment_id, StageStatus.COMPLETED, artifact=paths.to_relative(audio_path))
+        row = produce_mock_tts_segment(paths=paths, segment=segment)
+        audio_path = paths.resolve_relative(row["audio_path"])
+        checkpoint.mark(segment_id, StageStatus.COMPLETED, artifact=row["audio_path"])
         checkpoint.save()
 
         tts_manifest_path = paths.artifact_path("tts_manifest.v1.json")
         tts_manifest = read_json(tts_manifest_path)
         for item in tts_manifest["segments"]:
             if str(item["segment_id"]) == segment_id:
-                item["tts_duration_ms"] = mock_tts_ms
-                item["alignment_action"] = timing_plan.action
-                item["stretch_ratio"] = timing_plan.stretch_ratio
-                item["overflow_ms"] = timing_plan.overflow_ms
-                item["raw_audio_path"] = paths.to_relative(raw_audio_path)
-                item["audio_path"] = paths.to_relative(audio_path)
-                item["warnings"] = timing_plan.warnings
+                item.update(row)
         write_json_atomic(tts_manifest_path, tts_manifest)
         manifest.record_artifact(name="tts_segments", version=1, path=checkpoint.path, created_by_stage=StageName.TTS, schema_version="1.0")
         manifest.record_artifact(name="tts_manifest", version=1, path=tts_manifest_path, created_by_stage=StageName.TTS, schema_version="1.0")
