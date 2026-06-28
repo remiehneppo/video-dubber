@@ -3,6 +3,8 @@ from __future__ import annotations
 import wave
 from pathlib import Path
 
+import pytest
+
 from dubber.core.paths import WorkspacePaths
 from dubber.providers.ffmpeg import FFmpegAdapter
 from dubber.tts.mock import synthesize_tone_wav
@@ -35,7 +37,7 @@ def test_assemble_commentary_track_delays_and_mixes_segments(tmp_path: Path) -> 
     assert 0.45 <= duration_sec <= 0.55
 
 
-def test_assemble_commentary_track_trims_overlap_before_next_segment(tmp_path: Path) -> None:
+def test_assemble_commentary_track_fits_overlap_within_max_speedup(tmp_path: Path) -> None:
     paths = WorkspacePaths.create(tmp_path, "job_test")
     ffmpeg = FFmpegAdapter()
     first = paths.tts_dir / "seg_000001.wav"
@@ -49,14 +51,40 @@ def test_assemble_commentary_track_trims_overlap_before_next_segment(tmp_path: P
         ffmpeg=ffmpeg,
         tts_segments=[
             {"segment_id": "seg_000001", "audio_path": "tts/seg_000001.wav", "target_start_ms": 0},
-            {"segment_id": "seg_000002", "audio_path": "tts/seg_000002.wav", "target_start_ms": 50},
+            {"segment_id": "seg_000002", "audio_path": "tts/seg_000002.wav", "target_start_ms": 100},
         ],
         output_audio=output,
+        max_speedup_ratio=1.3,
     )
 
+    assert (paths.tts_dir / "seg_000001.fit.wav").exists()
     with wave.open(str(output), "rb") as wav:
         duration_sec = wav.getnframes() / wav.getframerate()
-    assert 0.14 <= duration_sec <= 0.19
+    assert 0.20 <= duration_sec <= 0.25
+
+
+def test_assemble_commentary_track_rejects_overlap_above_max_speedup(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_test")
+    ffmpeg = FFmpegAdapter()
+    first = paths.tts_dir / "seg_000001.wav"
+    second = paths.tts_dir / "seg_000002.wav"
+    synthesize_tone_wav(first, 120)
+    synthesize_tone_wav(second, 120)
+
+    output = paths.tts_dir / "mix.wav"
+    with pytest.raises(ValueError, match="seg_000001.*tts_segment_exceeds_max_speedup"):
+        assemble_commentary_track(
+            paths=paths,
+            ffmpeg=ffmpeg,
+            tts_segments=[
+                {"segment_id": "seg_000001", "audio_path": "tts/seg_000001.wav", "target_start_ms": 0},
+                {"segment_id": "seg_000002", "audio_path": "tts/seg_000002.wav", "target_start_ms": 50},
+            ],
+            output_audio=output,
+            max_speedup_ratio=1.3,
+        )
+
+    assert not output.exists()
 
 
 def test_ffmpeg_assemble_commentary_track_disables_amix_normalization(tmp_path: Path, monkeypatch) -> None:

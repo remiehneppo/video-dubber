@@ -95,6 +95,14 @@ def load_config(path: Path | str) -> DubberConfig:
             api_key=str(tts_service.get("api_key", "")),
             model=str(tts_service.get("model", "tts-1")),
             voice=str(tts_service.get("voice", "nova")),
+            quality_retry_attempts=int(tts_service.get("quality_retry_attempts", 3)),
+            rephrase_attempts=int(tts_service.get("rephrase_attempts", 2)),
+            max_speedup_ratio=float(tts_service.get("max_speedup_ratio", 1.3)),
+            min_rms=float(tts_service.get("min_rms", 500)),
+            silence_rms_threshold=int(tts_service.get("silence_rms_threshold", 120)),
+            max_internal_silence_ms=int(tts_service.get("max_internal_silence_ms", 2500)),
+            clipping_peak_threshold=int(tts_service.get("clipping_peak_threshold", 32760)),
+            max_clipped_sample_ratio=float(tts_service.get("max_clipped_sample_ratio", 0.001)),
         ),
     )
 

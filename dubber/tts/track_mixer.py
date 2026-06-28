@@ -17,6 +17,7 @@ def assemble_commentary_track(
     ffmpeg: FFmpegAdapter,
     tts_segments: list[dict[str, Any]],
     output_audio: Path,
+    max_speedup_ratio: float = 1.3,
 ) -> None:
     if not tts_segments:
         raise ValueError("tts_segments must not be empty")
@@ -38,16 +39,25 @@ def assemble_commentary_track(
             slot_ms = max(1, next_start_ms - start_ms)
             if audio_duration_ms > slot_ms:
                 stretch_ratio = audio_duration_ms / slot_ms
+                if stretch_ratio > max_speedup_ratio:
+                    raise ValueError(
+                        f"{segment['segment_id']}: tts_segment_exceeds_max_speedup "
+                        f"audio_duration_ms={audio_duration_ms} slot_ms={slot_ms} "
+                        f"ratio={stretch_ratio:.3f} max_speedup_ratio={max_speedup_ratio:.3f} "
+                        f"audio_path={audio_path}"
+                    )
                 mixed_audio_path = paths.tts_dir / f"{segment['segment_id']}.fit.wav"
                 apply_time_stretch(audio_path, mixed_audio_path, stretch_ratio)
                 logger.warning(
-                    "stage tts commentary time_stretched segment=%s audio_duration_ms=%s slot_ms=%s stretch_ratio=%.3f start_ms=%s next_start_ms=%s",
+                    "stage tts commentary time_stretched segment=%s audio_duration_ms=%s slot_ms=%s stretch_ratio=%.3f start_ms=%s next_start_ms=%s audio=%s fitted_audio=%s",
                     segment["segment_id"],
                     audio_duration_ms,
                     slot_ms,
                     stretch_ratio,
                     start_ms,
                     next_start_ms,
+                    audio_path,
+                    mixed_audio_path,
                 )
         inputs.append((mixed_audio_path, start_ms))
     ffmpeg.assemble_commentary_track(inputs, output_audio)

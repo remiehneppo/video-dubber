@@ -754,6 +754,7 @@ def run_tts(
         if ctx.provider_mode == "openai_compatible":
             source_text = str(transcript_by_id.get(segment_id, {}).get("source_text", ""))
             translated_text = str(translations_by_id.get(segment_id, {}).get("vi_text", ""))
+            tts_config = ctx.config.tts_service
             row = asyncio.run(
                 produce_provider_tts_segment(
                     paths=ctx.paths,
@@ -761,6 +762,14 @@ def run_tts(
                     text="" if not source_text.strip() else translated_text,
                     provider_bundle=ctx.require_provider_bundle(),
                     ffmpeg=ctx.ffmpeg,
+                    quality_retry_attempts=tts_config.quality_retry_attempts,
+                    rephrase_attempts=tts_config.rephrase_attempts,
+                    max_speedup_ratio=tts_config.max_speedup_ratio,
+                    min_rms=tts_config.min_rms,
+                    silence_rms_threshold=tts_config.silence_rms_threshold,
+                    max_internal_silence_ms=tts_config.max_internal_silence_ms,
+                    clipping_peak_threshold=tts_config.clipping_peak_threshold,
+                    max_clipped_sample_ratio=tts_config.max_clipped_sample_ratio,
                 )
             )
         else:
@@ -775,6 +784,7 @@ def run_tts(
         ffmpeg=ctx.ffmpeg,
         tts_segments=tts_segments,
         output_audio=mix_audio_path,
+        max_speedup_ratio=ctx.config.tts_service.max_speedup_ratio,
     )
     logger.info("stage tts commentary track assembled audio=%s segments=%s", ctx.paths.to_relative(mix_audio_path), len(tts_segments))
 

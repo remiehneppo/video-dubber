@@ -36,6 +36,15 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
                 "  soft_split_allowed: false",
                 "translation:",
                 "  glossary_review: false",
+                "tts_service:",
+                "  quality_retry_attempts: 4",
+                "  rephrase_attempts: 1",
+                "  max_speedup_ratio: 1.25",
+                "  min_rms: 450",
+                "  silence_rms_threshold: 100",
+                "  max_internal_silence_ms: 2000",
+                "  clipping_peak_threshold: 32700",
+                "  max_clipped_sample_ratio: 0.002",
             ]
         ),
         encoding="utf-8",
@@ -59,6 +68,14 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
     assert config.vad.context_padding_ms == 300
     assert config.vad.soft_split_allowed is False
     assert config.translation.glossary_review is False
+    assert config.tts_service.quality_retry_attempts == 4
+    assert config.tts_service.rephrase_attempts == 1
+    assert config.tts_service.max_speedup_ratio == 1.25
+    assert config.tts_service.min_rms == 450
+    assert config.tts_service.silence_rms_threshold == 100
+    assert config.tts_service.max_internal_silence_ms == 2000
+    assert config.tts_service.clipping_peak_threshold == 32700
+    assert config.tts_service.max_clipped_sample_ratio == 0.002
     assert config.input.allowed_extensions == [".mp4", ".mkv", ".mov"]
 
 
@@ -183,3 +200,6 @@ def test_config_example_loads_provider_sections(monkeypatch: pytest.MonkeyPatch)
     assert config.asr_service.api_key == "asr-key"
     assert config.llm_service.model == "gpt-4o-mini"
     assert config.tts_service.voice == "nova"
+    assert config.tts_service.quality_retry_attempts == 3
+    assert config.tts_service.rephrase_attempts == 2
+    assert config.tts_service.max_speedup_ratio == 1.3

@@ -104,6 +104,14 @@ class TTSServiceConfig:
     api_key: str = ""
     model: str = "tts-1"
     voice: str = "nova"
+    quality_retry_attempts: int = 3
+    rephrase_attempts: int = 2
+    max_speedup_ratio: float = 1.3
+    min_rms: float = 500
+    silence_rms_threshold: int = 120
+    max_internal_silence_ms: int = 2500
+    clipping_peak_threshold: int = 32760
+    max_clipped_sample_ratio: float = 0.001
 
 
 @dataclass(frozen=True)
