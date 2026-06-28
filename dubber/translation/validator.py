@@ -35,10 +35,21 @@ def validate_translations(
     for translated in translated_segments:
         segment_id = str(translated["segment_id"])
         vi_text = str(translated.get("vi_text", "")).strip()
+        source_text = str(source_by_id[segment_id].get("source_text", ""))
+        if not source_text.strip():
+            if vi_text:
+                warnings.append(
+                    {
+                        "segment_id": segment_id,
+                        "warning": "empty_source_segment_translated",
+                        "length_ratio": 0.0,
+                        "max_length_ratio": max_length_ratio,
+                    }
+                )
+            continue
         if not vi_text:
             raise TranslationValidationError(f"vi_text is empty for {segment_id}")
 
-        source_text = str(source_by_id[segment_id].get("source_text", ""))
         ratio = _text_length_ratio(source_text, vi_text)
         if ratio > max_length_ratio:
             warnings.append(

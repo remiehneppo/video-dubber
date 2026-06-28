@@ -58,7 +58,46 @@ class FFmpegAdapter:
             stderr=subprocess.DEVNULL,
         )
 
-    def mix_commentary_audio(self, original_audio: Path, tts_audio: Path, output_audio: Path) -> None:
+    def extract_audio_segment(self, input_audio: Path, output_wav: Path, *, start_ms: int, duration_ms: int) -> None:
+        if start_ms < 0:
+            raise ValueError("start_ms must be non-negative")
+        if duration_ms <= 0:
+            raise ValueError("duration_ms must be positive")
+        output_wav.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                f"{start_ms / 1000:.3f}",
+                "-i",
+                str(input_audio),
+                "-t",
+                f"{duration_ms / 1000:.3f}",
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                str(output_wav),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def mix_commentary_audio(
+        self,
+        original_audio: Path,
+        tts_audio: Path,
+        output_audio: Path,
+        *,
+        original_ducking_db: float = -22.0,
+        tts_boost_db: float = 8.0,
+        final_loudness_normalization: bool = True,
+    ) -> None:
         output_audio.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             [
@@ -69,13 +108,55 @@ class FFmpegAdapter:
                 "-i",
                 str(tts_audio),
                 "-filter_complex",
-                build_commentary_filter(original_ducking_db=-22, final_loudness_normalization=True),
+                build_commentary_filter(
+                    original_ducking_db=original_ducking_db,
+                    tts_boost_db=tts_boost_db,
+                    final_loudness_normalization=final_loudness_normalization,
+                ),
                 "-map",
                 "[out]",
                 "-c:a",
                 "pcm_s16le",
                 str(output_audio),
             ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def assemble_commentary_track(self, segments: list[tuple[Path, int]], output_audio: Path) -> None:
+        if not segments:
+            raise ValueError("segments must not be empty")
+        output_audio.parent.mkdir(parents=True, exist_ok=True)
+        command: list[str] = ["ffmpeg", "-y"]
+        for audio_path, _ in segments:
+            command.extend(["-i", str(audio_path)])
+        filter_parts: list[str] = []
+        delayed_labels: list[str] = []
+        for index, (_, start_ms) in enumerate(segments):
+            label = f"seg{index}"
+            filter_parts.append(f"[{index}:a]asetpts=PTS-STARTPTS,adelay={start_ms}|{start_ms}[{label}]")
+            delayed_labels.append(f"[{label}]")
+        filter_parts.append(
+            f"{''.join(delayed_labels)}amix=inputs={len(segments)}:duration=longest:dropout_transition=0:normalize=0[mixed]"
+        )
+        command.extend(
+            [
+                "-filter_complex",
+                ";".join(filter_parts),
+                "-map",
+                "[mixed]",
+                "-ac",
+                "1",
+                "-ar",
+                "44100",
+                "-c:a",
+                "pcm_s16le",
+                str(output_audio),
+            ]
+        )
+        subprocess.run(
+            command,
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

@@ -58,4 +58,4 @@ def test_build_provider_bundle_applies_runtime_retry_and_timeout() -> None:
     for provider in (bundle.asr, bundle.llm, bundle.tts):
         assert provider.max_attempts == 7
         assert provider.retry_delay_sec == 3
-        assert provider.client.timeout.read == 600
+        assert provider.request_timeout_sec == 600

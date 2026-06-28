@@ -90,3 +90,13 @@ def test_validate_translations_warns_when_translation_is_too_long() -> None:
 
     assert report.warning_count == 1
     assert report.warnings[0]["warning"] == "length_ratio_exceeded"
+
+
+def test_validate_translations_allows_empty_source_segments() -> None:
+    report = validate_translations(
+        [{"segment_id": "seg_000001", "source_text": "   "}],
+        [{"segment_id": "seg_000001", "vi_text": ""}],
+        [],
+    )
+
+    assert report.warning_count == 0

@@ -8,7 +8,7 @@ from dubber.providers.factory import ProviderBundle
 from dubber.providers.ffmpeg import FFmpegAdapter
 from dubber.tts.aligner import apply_time_stretch
 from dubber.tts.duration_planner import plan_segment_duration
-from dubber.tts.mock import synthesize_tone_wav
+from dubber.tts.mock import synthesize_silence_wav, synthesize_tone_wav
 
 
 def produce_mock_tts_segment(*, paths: WorkspacePaths, segment: dict[str, Any]) -> dict[str, Any]:
@@ -37,6 +37,17 @@ async def produce_provider_tts_segment(
 ) -> dict[str, Any]:
     segment_id = str(segment["segment_id"])
     raw_audio_path = paths.tts_dir / f"{segment_id}.raw.wav"
+    if not text.strip():
+        tts_duration_ms = int(segment["duration_ms"])
+        synthesize_silence_wav(raw_audio_path, tts_duration_ms)
+        return _align_segment(
+            paths=paths,
+            segment=segment,
+            raw_audio_path=raw_audio_path,
+            tts_duration_ms=tts_duration_ms,
+            provider_metadata={"content_type": "audio/wav", "generated_silence": True},
+        )
+
     tts_voice = voice if voice != "default" else getattr(provider_bundle.tts, "voice", voice)
     tts_result = await provider_bundle.tts.synthesize(text, voice=tts_voice, output_path=raw_audio_path)
     tts_duration_ms = tts_result.duration_ms or ffmpeg.duration_ms(tts_result.audio_path)

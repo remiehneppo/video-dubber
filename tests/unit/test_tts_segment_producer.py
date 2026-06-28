@@ -7,6 +7,7 @@ from pathlib import Path
 from dubber.core.paths import WorkspacePaths
 from dubber.providers.base import TTSResult
 from dubber.providers.factory import ProviderBundle
+from dubber.tts.mock import synthesize_tone_wav
 from dubber.tts.segment_producer import produce_mock_tts_segment, produce_provider_tts_segment
 
 
@@ -39,7 +40,7 @@ class FakeProviderTTS:
 
     async def synthesize(self, text: str, voice: str, output_path: Path) -> TTSResult:
         self.seen_voice = voice
-        output_path.write_bytes(b"fake audio")
+        synthesize_tone_wav(output_path, 900)
         return TTSResult(audio_path=output_path, duration_ms=900, provider_metadata={"voice": voice})
 
 
@@ -71,3 +72,36 @@ def test_produce_provider_tts_segment_uses_provider_voice(tmp_path: Path) -> Non
 
     assert tts.seen_voice == "Trúc Ly"
     assert row["provider_metadata"] == {"voice": "Trúc Ly"}
+    assert row["alignment_action"] == "time_stretch"
+    assert row["stretch_ratio"] == 0.9
+    with wave.open(str(paths.root / row["audio_path"]), "rb") as wav:
+        duration_ms = int(wav.getnframes() * 1000 / wav.getframerate())
+    assert 950 <= duration_ms <= 1050
+
+
+def test_produce_provider_tts_segment_with_empty_text_generates_silence(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_test")
+    segment = {
+        "segment_id": "seg_000001",
+        "start_ms": 1000,
+        "end_ms": 2000,
+        "duration_ms": 1000,
+    }
+    tts = FakeProviderTTS()
+    providers = ProviderBundle(asr=None, llm=None, tts=tts)
+
+    row = asyncio.run(
+        produce_provider_tts_segment(
+            paths=paths,
+            segment=segment,
+            text="   ",
+            provider_bundle=providers,
+            ffmpeg=FakeFFmpeg(),
+        )
+    )
+
+    assert tts.seen_voice == ""
+    assert row["provider_metadata"]["generated_silence"] is True
+    assert row["tts_duration_ms"] == 1000
+    assert row["alignment_action"] == "pad_silence"
+    assert (paths.root / row["audio_path"]).exists()

@@ -4,6 +4,7 @@ import logging
 import shutil
 import uuid
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 
 from dubber.core.config import load_config
@@ -27,6 +28,7 @@ from dubber.pipeline.stages import (
 from dubber.providers.factory import ProviderBundle, build_provider_bundle
 from dubber.providers.ffmpeg import FFmpegAdapter
 from dubber.tts.segment_producer import produce_mock_tts_segment
+from dubber.tts.track_mixer import assemble_commentary_track
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,8 @@ class JobManager:
 
     def run(self, options: RunOptions) -> RunSummary:
         config = load_config(options.config_path or Path("config.example.yaml"))
+        effective_domain = options.domain or config.project.domain
+        config = replace(config, project=replace(config.project, domain=effective_domain))
         if options.provider_mode not in {"mock", "openai_compatible"}:
             raise ValueError(f"Unsupported provider-mode: {options.provider_mode}")
         self.provider_mode = options.provider_mode
@@ -148,6 +152,8 @@ class JobManager:
         paths = WorkspacePaths.create(workspace_dir, job_id)
         store = CheckpointStore.load(paths.job_state_file)
         manifest = ArtifactManifest.load(paths.manifest_file)
+        config = self._load_resolved_config(paths)
+        self._restore_provider_context(paths, config)
         ctx = StageContext(
             paths=paths,
             store=store,
@@ -155,6 +161,7 @@ class JobManager:
             ffmpeg=self.ffmpeg,
             provider_mode=self.provider_mode,
             provider_bundle=self.provider_bundle,
+            config=config,
         )
         if store.state.status in {JobStatus.FAILED, JobStatus.RUNNING} and store.state.current_stage == StageName.TTS:
             copied_input = paths.resolve_relative(store.state.input_file)
@@ -212,6 +219,8 @@ class JobManager:
         paths = WorkspacePaths.create(workspace_dir, job_id)
         store = CheckpointStore.load(paths.job_state_file)
         manifest = ArtifactManifest.load(paths.manifest_file)
+        config = self._load_resolved_config(paths)
+        self._restore_provider_context(paths, config)
         ctx = StageContext(
             paths=paths,
             store=store,
@@ -219,6 +228,7 @@ class JobManager:
             ffmpeg=self.ffmpeg,
             provider_mode=self.provider_mode,
             provider_bundle=self.provider_bundle,
+            config=config,
         )
         copied_input = paths.resolve_relative(store.state.input_file)
         duration_ms = self.ffmpeg.duration_ms(copied_input)
@@ -234,8 +244,14 @@ class JobManager:
             output_video = run_mixing(ctx, copied_input, tts_audio, duration_ms)
         elif stage == StageName.MIXING:
             tts_manifest = read_json(paths.artifact_path("tts_manifest.v1.json"))
-            first_audio = paths.resolve_relative(tts_manifest["segments"][0]["audio_path"])
-            output_video = run_mixing(ctx, copied_input, first_audio, duration_ms)
+            tts_audio = paths.tts_dir / "mix.wav"
+            assemble_commentary_track(
+                paths=paths,
+                ffmpeg=self.ffmpeg,
+                tts_segments=list(tts_manifest["segments"]),
+                output_audio=tts_audio,
+            )
+            output_video = run_mixing(ctx, copied_input, tts_audio, duration_ms)
         else:
             raise ValueError(f"Rerun is not supported for stage: {stage.value}")
 
@@ -255,6 +271,8 @@ class JobManager:
         paths = WorkspacePaths.create(workspace_dir, job_id)
         store = CheckpointStore.load(paths.job_state_file)
         manifest = ArtifactManifest.load(paths.manifest_file)
+        config = self._load_resolved_config(paths)
+        self._restore_provider_context(paths, config)
         ctx = StageContext(
             paths=paths,
             store=store,
@@ -262,6 +280,7 @@ class JobManager:
             ffmpeg=self.ffmpeg,
             provider_mode=self.provider_mode,
             provider_bundle=self.provider_bundle,
+            config=config,
         )
         copied_input = paths.resolve_relative(store.state.input_file)
         duration_ms = self.ffmpeg.duration_ms(copied_input)
@@ -272,8 +291,28 @@ class JobManager:
         segment = matching[0]
 
         checkpoint = SegmentCheckpointStore.load(paths.artifact_path("tts_segments.v1.json"))
-        row = produce_mock_tts_segment(paths=paths, segment=segment)
-        audio_path = paths.resolve_relative(row["audio_path"])
+        if ctx.provider_mode == "openai_compatible":
+            transcript_by_id = {
+                str(item["segment_id"]): item
+                for item in read_json(paths.artifact_path("transcript.v1.json"))["segments"]
+            }
+            translations_by_id = {
+                str(item["segment_id"]): item
+                for item in read_json(paths.artifact_path("translated.v1.json"))["segments"]
+            }
+            source_text = str(transcript_by_id.get(segment_id, {}).get("source_text", ""))
+            translated_text = str(translations_by_id.get(segment_id, {}).get("vi_text", ""))
+            row = asyncio.run(
+                produce_provider_tts_segment(
+                    paths=paths,
+                    segment=segment,
+                    text="" if not source_text.strip() else translated_text,
+                    provider_bundle=ctx.require_provider_bundle(),
+                    ffmpeg=self.ffmpeg,
+                )
+            )
+        else:
+            row = produce_mock_tts_segment(paths=paths, segment=segment)
         checkpoint.mark(segment_id, StageStatus.COMPLETED, artifact=row["audio_path"])
         checkpoint.save()
 
@@ -283,9 +322,16 @@ class JobManager:
             if str(item["segment_id"]) == segment_id:
                 item.update(row)
         write_json_atomic(tts_manifest_path, tts_manifest)
+        tts_audio = paths.tts_dir / "mix.wav"
+        assemble_commentary_track(
+            paths=paths,
+            ffmpeg=self.ffmpeg,
+            tts_segments=list(tts_manifest["segments"]),
+            output_audio=tts_audio,
+        )
         manifest.record_artifact(name="tts_segments", version=1, path=checkpoint.path, created_by_stage=StageName.TTS, schema_version="1.0")
         manifest.record_artifact(name="tts_manifest", version=1, path=tts_manifest_path, created_by_stage=StageName.TTS, schema_version="1.0")
-        output_video = run_mixing(ctx, copied_input, audio_path, duration_ms)
+        output_video = run_mixing(ctx, copied_input, tts_audio, duration_ms)
         store.mark_stage(StageName.TTS, StageStatus.COMPLETED, artifact=paths.to_relative(tts_manifest_path), done=checkpoint.done_count, total=checkpoint.total_count)
         store.mark_job(JobStatus.COMPLETED)
         store.save()
@@ -303,11 +349,32 @@ class JobManager:
             raise ValueError("Input video has no audio stream")
 
     def _write_resolved_config(self, paths: WorkspacePaths, options: RunOptions, default_domain: str) -> None:
+        config_path = options.config_path.expanduser().resolve() if options.config_path is not None else None
         write_json_atomic(
             paths.root / "config.resolved.json",
             {
                 "provider_mode": options.provider_mode,
                 "domain": options.domain or default_domain,
                 "glossary_review": options.glossary_review,
+                "config_path": str(config_path) if config_path is not None else None,
             },
         )
+
+    def _load_resolved_config(self, paths: WorkspacePaths):
+        resolved_path = paths.root / "config.resolved.json"
+        if not resolved_path.exists():
+            return load_config(Path("config.example.yaml"))
+        resolved = read_json(resolved_path)
+        config_path_value = resolved.get("config_path")
+        config_path = Path(str(config_path_value)) if config_path_value else Path("config.example.yaml")
+        config = load_config(config_path)
+        domain = str(resolved.get("domain", config.project.domain))
+        return replace(config, project=replace(config.project, domain=domain))
+
+    def _restore_provider_context(self, paths: WorkspacePaths, config) -> None:
+        resolved_path = paths.root / "config.resolved.json"
+        if resolved_path.exists():
+            resolved = read_json(resolved_path)
+            self.provider_mode = str(resolved.get("provider_mode", self.provider_mode))
+        if self.provider_mode == "openai_compatible" and self.provider_bundle is None:
+            self.provider_bundle = build_provider_bundle(config)

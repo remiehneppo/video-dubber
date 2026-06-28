@@ -9,3 +9,5 @@
 - **Commentary Mode**: Output mode where Vietnamese speech overlays ducked original speech while background audio remains.
 - **Glossary review**: Human pause where extracted terms are edited and locked before translation.
 - **Provider mode**: Runtime selection between mock local behavior and OpenAI-compatible ASR, LLM, and TTS adapters.
+- **ASR chunk**: Longer audio interval sent to ASR for recognition context. It is not final dubbing timing.
+- **Transcript segment**: Final timeline interval with source text derived from ASR timestamps and used by glossary, translation, TTS, and mixing.

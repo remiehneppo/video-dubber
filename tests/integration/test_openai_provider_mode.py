@@ -16,7 +16,16 @@ class FakeASRProvider:
             text="Let's talk about eigenvectors.",
             confidence=0.91,
             language=language,
-            raw={"fake": True},
+            raw={
+                "fake": True,
+                "text": "Let's talk about eigenvectors.",
+                "words": [
+                    {"word": "Let's", "start": 0.0, "end": 0.3},
+                    {"word": "talk", "start": 0.4, "end": 0.7},
+                    {"word": "about", "start": 0.8, "end": 1.0},
+                    {"word": "eigenvectors.", "start": 1.1, "end": 1.6},
+                ],
+            },
         )
 
 
@@ -69,6 +78,7 @@ def test_openai_compatible_provider_mode_runs_with_injected_providers(tmp_path: 
             workspace_dir=workspace,
             provider_mode="openai_compatible",
             glossary_review=False,
+            domain="seo",
         )
     )
 
@@ -76,11 +86,14 @@ def test_openai_compatible_provider_mode_runs_with_injected_providers(tmp_path: 
     transcript = json.loads((job_dir / "artifacts" / "transcript.v1.json").read_text(encoding="utf-8"))
     translated = json.loads((job_dir / "artifacts" / "translated.v1.json").read_text(encoding="utf-8"))
     glossary = json.loads((job_dir / "artifacts" / "glossary.locked.json").read_text(encoding="utf-8"))
+    resolved = json.loads((job_dir / "config.resolved.json").read_text(encoding="utf-8"))
 
     assert summary.status == "completed"
     assert transcript["provider"]["type"] == "openai_compatible"
     assert transcript["segments"][0]["source_text"] == "Let's talk about eigenvectors."
     assert glossary["terms"][0]["vietnamese"] == "vectơ riêng"
+    assert resolved["domain"] == "seo"
+    assert resolved["provider_mode"] == "openai_compatible"
     assert translated["segments"][0]["vi_text"] == "Hãy nói về vectơ riêng."
     assert (job_dir / summary.output_video).exists()
 
@@ -98,6 +111,7 @@ def test_provider_failure_marks_job_failed_and_saves_state(tmp_path: Path) -> No
                 workspace_dir=workspace,
                 provider_mode="openai_compatible",
                 glossary_review=False,
+                domain="seo",
             )
         )
     except RuntimeError as exc:

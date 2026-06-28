@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from dubber.core.models import ASRServiceConfig, DubberConfig, InputConfig, LLMServiceConfig, ProjectConfig, RuntimeConfig, TranslationConfig, TTSServiceConfig, VadConfig
+from dubber.core.models import ASRServiceConfig, DubberConfig, InputConfig, LLMServiceConfig, MixingConfig, ProjectConfig, RuntimeConfig, TranslationConfig, TranscriptSegmentationConfig, TTSServiceConfig, VadConfig
 
 
 def load_config(path: Path | str) -> DubberConfig:
@@ -14,8 +14,10 @@ def load_config(path: Path | str) -> DubberConfig:
     runtime = raw.get("runtime", {})
     input_config = raw.get("input", {})
     translation = raw.get("translation", {})
+    mixing = raw.get("mixing", {})
     vad = raw.get("vad", {})
     asr_service = raw.get("asr_service", {})
+    transcript_segmentation = raw.get("transcript_segmentation", {})
     llm_service = raw.get("llm_service", {})
     tts_service = raw.get("tts_service", {})
     return DubberConfig(
@@ -43,12 +45,23 @@ def load_config(path: Path | str) -> DubberConfig:
         translation=TranslationConfig(
             glossary_review=bool(translation.get("glossary_review", True)),
         ),
+        mixing=MixingConfig(
+            original_ducking_db=float(mixing.get("original_ducking_db", -22.0)),
+            tts_boost_db=float(mixing.get("tts_boost_db", 8.0)),
+            final_loudness_normalization=bool(mixing.get("final_loudness_normalization", True)),
+        ),
         vad=VadConfig(
+            mode=str(vad.get("mode", "asr_context_chunks")),
             frame_ms=int(vad.get("frame_ms", 100)),
-            threshold_ratio=float(vad.get("threshold_ratio", 0.15)),
-            min_duration_ms=int(vad.get("min_duration_ms", 300)),
-            max_duration_ms=int(vad.get("max_duration_ms", 25_000)),
-            silence_merge_threshold_ms=int(vad.get("silence_merge_threshold_ms", 400)),
+            threshold_ratio=float(vad.get("threshold_ratio", 0.08)),
+            min_duration_ms=int(vad.get("min_duration_ms", vad.get("min_speech_duration_ms", 900))),
+            max_duration_ms=int(vad.get("max_duration_ms", vad.get("hard_max_chunk_ms", 60_000))),
+            min_speech_duration_ms=int(vad.get("min_speech_duration_ms", vad.get("min_duration_ms", 700))),
+            target_min_chunk_ms=int(vad.get("target_min_chunk_ms", 20_000)),
+            preferred_max_chunk_ms=int(vad.get("preferred_max_chunk_ms", vad.get("max_duration_ms", 45_000))),
+            hard_max_chunk_ms=int(vad.get("hard_max_chunk_ms", vad.get("max_duration_ms", 90_000))),
+            silence_merge_threshold_ms=int(vad.get("silence_merge_threshold_ms", 2_500)),
+            context_padding_ms=int(vad.get("context_padding_ms", 1_500)),
             soft_split_allowed=bool(vad.get("soft_split_allowed", True)),
         ),
         asr_service=ASRServiceConfig(
@@ -57,6 +70,17 @@ def load_config(path: Path | str) -> DubberConfig:
             api_key=str(asr_service.get("api_key", "")),
             model=str(asr_service.get("model", "whisper-1")),
             language=str(asr_service.get("language", "en")),
+            timestamp_mode=str(asr_service.get("timestamp_mode", "prefer_word")),
+            require_timestamps=bool(asr_service.get("require_timestamps", True)),
+            allow_chunk_text_fallback=bool(asr_service.get("allow_chunk_text_fallback", False)),
+            vad_filter=bool(asr_service.get("vad_filter", False)),
+        ),
+        transcript_segmentation=TranscriptSegmentationConfig(
+            target_min_segment_ms=int(transcript_segmentation.get("target_min_segment_ms", 8_000)),
+            preferred_max_segment_ms=int(transcript_segmentation.get("preferred_max_segment_ms", 25_000)),
+            max_segment_ms=int(transcript_segmentation.get("max_segment_ms", 45_000)),
+            min_pause_split_ms=int(transcript_segmentation.get("min_pause_split_ms", 600)),
+            prefer_punctuation_split=bool(transcript_segmentation.get("prefer_punctuation_split", True)),
         ),
         llm_service=LLMServiceConfig(
             provider=str(llm_service.get("provider", "openai_compatible")),

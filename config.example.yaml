@@ -20,17 +20,33 @@ input:
   max_duration_minutes: 180
 
 vad:
+  mode: asr_context_chunks
   frame_ms: 100
-  threshold_ratio: 0.15
-  min_duration_ms: 300
-  max_duration_ms: 25000
-  silence_merge_threshold_ms: 400
+  threshold_ratio: 0.08
+  min_duration_ms: 900
+  max_duration_ms: 90000
+  min_speech_duration_ms: 700
+  target_min_chunk_ms: 20000
+  preferred_max_chunk_ms: 45000
+  hard_max_chunk_ms: 90000
+  silence_merge_threshold_ms: 2500
+  context_padding_ms: 1500
   soft_split_allowed: true
 
 translation:
   glossary_review: true
 
+transcript_segmentation:
+  target_min_segment_ms: 8000
+  preferred_max_segment_ms: 25000
+  max_segment_ms: 45000
+  min_pause_split_ms: 600
+  prefer_punctuation_split: true
 
+mixing:
+  original_ducking_db: -22
+  tts_boost_db: 8.0
+  final_loudness_normalization: true
 
 asr_service:
   provider: openai_compatible
@@ -38,6 +54,10 @@ asr_service:
   api_key: ${ASR_API_KEY}
   model: whisper-1
   language: en
+  timestamp_mode: prefer_word
+  require_timestamps: true
+  allow_chunk_text_fallback: false
+  vad_filter: false
 
 llm_service:
   provider: openai_compatible

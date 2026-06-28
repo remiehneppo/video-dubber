@@ -47,6 +47,8 @@ def build_provider_bundle(config: DubberConfig) -> ProviderBundle:
             max_attempts=config.runtime.retry_max_attempts,
             retry_delay_sec=config.runtime.retry_backoff_sec,
             request_timeout_sec=config.runtime.request_timeout_sec,
+            timestamp_mode=config.asr_service.timestamp_mode,
+            vad_filter=config.asr_service.vad_filter,
         ),
         llm=OpenAICompatibleLLMProvider(
             base_url=config.llm_service.base_url,

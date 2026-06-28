@@ -28,7 +28,15 @@ def plan_segment_duration(
         raise ValueError("tts_duration_ms must be positive")
 
     ratio = round(tts_duration_ms / orig_duration_ms, 4)
-    if ratio <= 1.0:
+    if ratio < 1.0:
+        return SegmentDurationPlan(
+            segment_id=segment_id,
+            action="time_stretch",
+            stretch_ratio=ratio,
+            overflow_ms=0,
+            warnings=["tts_duration_stretched_to_original"],
+        )
+    if ratio == 1.0:
         return SegmentDurationPlan(
             segment_id=segment_id,
             action="pad_silence",

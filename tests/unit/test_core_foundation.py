@@ -22,12 +22,17 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
                 "  output_dir: ./out",
                 "runtime:",
                 "  asr_concurrency: 3",
+                "mixing:",
+                "  original_ducking_db: -18",
+                "  tts_boost_db: 8.0",
+                "  final_loudness_normalization: false",
                 "vad:",
                 "  frame_ms: 50",
                 "  threshold_ratio: 0.2",
                 "  min_duration_ms: 150",
                 "  max_duration_ms: 1200",
                 "  silence_merge_threshold_ms: 250",
+                "  context_padding_ms: 300",
                 "  soft_split_allowed: false",
                 "translation:",
                 "  glossary_review: false",
@@ -43,14 +48,63 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
     assert config.project.output_dir == Path("out")
     assert config.runtime.asr_concurrency == 3
     assert config.runtime.tts_concurrency == 4
+    assert config.mixing.original_ducking_db == -18.0
+    assert config.mixing.tts_boost_db == 8.0
+    assert config.mixing.final_loudness_normalization is False
     assert config.vad.frame_ms == 50
     assert config.vad.threshold_ratio == 0.2
     assert config.vad.min_duration_ms == 150
     assert config.vad.max_duration_ms == 1200
     assert config.vad.silence_merge_threshold_ms == 250
+    assert config.vad.context_padding_ms == 300
     assert config.vad.soft_split_allowed is False
     assert config.translation.glossary_review is False
     assert config.input.allowed_extensions == [".mp4", ".mkv", ".mov"]
+
+
+def test_load_config_applies_asr_driven_segmentation_settings(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "\n".join(
+            [
+                "vad:",
+                "  mode: asr_context_chunks",
+                "  min_speech_duration_ms: 700",
+                "  target_min_chunk_ms: 20000",
+                "  preferred_max_chunk_ms: 45000",
+                "  hard_max_chunk_ms: 90000",
+                "asr_service:",
+                "  timestamp_mode: prefer_word",
+                "  require_timestamps: true",
+                "  allow_chunk_text_fallback: false",
+                "  vad_filter: false",
+                "transcript_segmentation:",
+                "  target_min_segment_ms: 8000",
+                "  preferred_max_segment_ms: 25000",
+                "  max_segment_ms: 45000",
+                "  min_pause_split_ms: 600",
+                "  prefer_punctuation_split: true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_file)
+
+    assert config.vad.mode == "asr_context_chunks"
+    assert config.vad.min_speech_duration_ms == 700
+    assert config.vad.target_min_chunk_ms == 20_000
+    assert config.vad.preferred_max_chunk_ms == 45_000
+    assert config.vad.hard_max_chunk_ms == 90_000
+    assert config.asr_service.timestamp_mode == "prefer_word"
+    assert config.asr_service.require_timestamps is True
+    assert config.asr_service.allow_chunk_text_fallback is False
+    assert config.asr_service.vad_filter is False
+    assert config.transcript_segmentation.target_min_segment_ms == 8_000
+    assert config.transcript_segmentation.preferred_max_segment_ms == 25_000
+    assert config.transcript_segmentation.max_segment_ms == 45_000
+    assert config.transcript_segmentation.min_pause_split_ms == 600
+    assert config.transcript_segmentation.prefer_punctuation_split is True
 
 
 def test_workspace_paths_create_expected_layout_and_reject_traversal(tmp_path: Path) -> None:

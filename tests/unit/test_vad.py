@@ -66,6 +66,34 @@ def test_detect_segments_merges_short_silence_gap(tmp_path: Path) -> None:
     assert segments[0].end_ms == 700
 
 
+def test_detect_segments_applies_context_padding_and_merges_segments(tmp_path: Path) -> None:
+    wav_path = tmp_path / "padded.wav"
+    _write_wav(
+        wav_path,
+        [
+            ("tone", 200),
+            ("silence", 200),
+            ("tone", 200),
+        ],
+    )
+
+    segments = detect_segments(
+        wav_path,
+        VadConfig(
+            frame_ms=50,
+            threshold_ratio=0.2,
+            min_duration_ms=100,
+            max_duration_ms=2000,
+            silence_merge_threshold_ms=100,
+            context_padding_ms=150,
+        ),
+    )
+
+    assert len(segments) == 1
+    assert segments[0].start_ms == 0
+    assert segments[0].end_ms == 600
+
+
 def test_detect_segments_splits_long_interval(tmp_path: Path) -> None:
     wav_path = tmp_path / "long.wav"
     _write_wav(wav_path, [("tone", 1200)])
@@ -99,6 +127,73 @@ def test_detect_segments_falls_back_to_full_audio_when_no_speech(tmp_path: Path)
     assert segments[0].start_ms == 0
     assert segments[0].end_ms == 600
     assert segments[0].risk_flags == ["no_speech_detected"]
+
+
+def test_asr_context_chunks_merge_until_target_minimum(tmp_path: Path) -> None:
+    wav_path = tmp_path / "target_min_chunks.wav"
+    _write_wav(
+        wav_path,
+        [
+            ("tone", 1000),
+            ("silence", 3000),
+            ("tone", 1000),
+            ("silence", 3000),
+            ("tone", 1000),
+        ],
+    )
+
+    segments = detect_segments(
+        wav_path,
+        VadConfig(
+            mode="asr_context_chunks",
+            frame_ms=100,
+            threshold_ratio=0.2,
+            min_speech_duration_ms=500,
+            target_min_chunk_ms=5000,
+            preferred_max_chunk_ms=9000,
+            hard_max_chunk_ms=12000,
+            max_duration_ms=12000,
+            silence_merge_threshold_ms=500,
+            context_padding_ms=0,
+        ),
+    )
+
+    assert [(segment.start_ms, segment.end_ms) for segment in segments] == [(0, 5000), (8000, 9000)]
+    assert segments[0].split_reason == "vad_context_merge"
+
+
+def test_asr_context_chunks_split_at_silence_before_hard_max(tmp_path: Path) -> None:
+    wav_path = tmp_path / "silence_split.wav"
+    _write_wav(
+        wav_path,
+        [
+            ("tone", 4000),
+            ("silence", 1000),
+            ("tone", 4000),
+            ("silence", 1000),
+            ("tone", 4000),
+        ],
+    )
+
+    segments = detect_segments(
+        wav_path,
+        VadConfig(
+            mode="asr_context_chunks",
+            frame_ms=100,
+            threshold_ratio=0.2,
+            min_speech_duration_ms=500,
+            target_min_chunk_ms=4000,
+            preferred_max_chunk_ms=7000,
+            hard_max_chunk_ms=9500,
+            max_duration_ms=9500,
+            silence_merge_threshold_ms=5000,
+            context_padding_ms=0,
+        ),
+    )
+
+    assert [(segment.start_ms, segment.end_ms) for segment in segments] == [(0, 5000), (5000, 10000), (10000, 14000)]
+    assert segments[0].split_reason == "vad_silence_split"
+    assert "hard_split" not in segments[0].risk_flags
 
 
 def _write_wav(path: Path, chunks: list[tuple[str, int]], sample_rate: int = 1000) -> None:

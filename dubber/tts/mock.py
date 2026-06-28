@@ -19,3 +19,13 @@ def synthesize_tone_wav(output_path: Path, duration_ms: int, *, sample_rate: int
             value = int(amplitude * math.sin(2 * math.pi * frequency * index / sample_rate))
             frames.extend(value.to_bytes(2, byteorder="little", signed=True))
         wav.writeframes(bytes(frames))
+
+
+def synthesize_silence_wav(output_path: Path, duration_ms: int, *, sample_rate: int = 44100) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    frame_count = max(1, int(sample_rate * max(duration_ms, 100) / 1000))
+    with wave.open(str(output_path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"\x00\x00" * frame_count)

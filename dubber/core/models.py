@@ -40,12 +40,25 @@ class InputConfig:
 
 @dataclass(frozen=True)
 class VadConfig:
+    mode: str = "asr_context_chunks"
     frame_ms: int = 100
-    threshold_ratio: float = 0.15
-    min_duration_ms: int = 300
-    max_duration_ms: int = 25_000
-    silence_merge_threshold_ms: int = 400
+    threshold_ratio: float = 0.08
+    min_duration_ms: int = 900
+    max_duration_ms: int = 60_000
+    min_speech_duration_ms: int = 700
+    target_min_chunk_ms: int = 20_000
+    preferred_max_chunk_ms: int = 45_000
+    hard_max_chunk_ms: int = 90_000
+    silence_merge_threshold_ms: int = 2_500
+    context_padding_ms: int = 1_500
     soft_split_allowed: bool = True
+
+
+@dataclass(frozen=True)
+class MixingConfig:
+    original_ducking_db: float = -22.0
+    tts_boost_db: float = 8.0
+    final_loudness_normalization: bool = True
 
 
 @dataclass(frozen=True)
@@ -60,6 +73,19 @@ class ASRServiceConfig:
     api_key: str = ""
     model: str = "whisper-1"
     language: str = "en"
+    timestamp_mode: str = "prefer_word"
+    require_timestamps: bool = True
+    allow_chunk_text_fallback: bool = False
+    vad_filter: bool = False
+
+
+@dataclass(frozen=True)
+class TranscriptSegmentationConfig:
+    target_min_segment_ms: int = 8_000
+    preferred_max_segment_ms: int = 25_000
+    max_segment_ms: int = 45_000
+    min_pause_split_ms: int = 600
+    prefer_punctuation_split: bool = True
 
 
 @dataclass(frozen=True)
@@ -86,8 +112,10 @@ class DubberConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     input: InputConfig = field(default_factory=InputConfig)
     translation: TranslationConfig = field(default_factory=TranslationConfig)
+    mixing: MixingConfig = field(default_factory=MixingConfig)
     vad: VadConfig = field(default_factory=VadConfig)
     asr_service: ASRServiceConfig = field(default_factory=ASRServiceConfig)
+    transcript_segmentation: TranscriptSegmentationConfig = field(default_factory=TranscriptSegmentationConfig)
     llm_service: LLMServiceConfig = field(default_factory=LLMServiceConfig)
     tts_service: TTSServiceConfig = field(default_factory=TTSServiceConfig)
 

@@ -3,13 +3,20 @@ from __future__ import annotations
 from dubber.tts.duration_planner import plan_segment_duration
 
 
-def test_duration_planner_pads_when_tts_is_shorter() -> None:
+def test_duration_planner_slows_down_when_tts_is_shorter() -> None:
     plan = plan_segment_duration("seg_000001", orig_duration_ms=1000, tts_duration_ms=800)
+
+    assert plan.action == "time_stretch"
+    assert plan.stretch_ratio == 0.8
+    assert plan.overflow_ms == 0
+    assert plan.warnings == ["tts_duration_stretched_to_original"]
+
+
+def test_duration_planner_pads_when_tts_matches_original_duration() -> None:
+    plan = plan_segment_duration("seg_000001", orig_duration_ms=1000, tts_duration_ms=1000)
 
     assert plan.action == "pad_silence"
     assert plan.stretch_ratio == 1.0
-    assert plan.overflow_ms == 0
-    assert plan.warnings == []
 
 
 def test_duration_planner_stretches_slightly_long_audio() -> None:

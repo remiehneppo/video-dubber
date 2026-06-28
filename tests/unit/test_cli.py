@@ -7,8 +7,10 @@ import pytest
 
 from cli import main
 from dubber.core.enums import StageName, StageStatus
+from dubber.core.io import write_json_atomic
 from dubber.core.paths import WorkspacePaths
 from dubber.orchestrator.checkpoint_store import CheckpointStore
+from dubber.pipeline.job_manager import JobManager
 
 
 def test_jobs_lists_existing_job_ids(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -62,3 +64,38 @@ def test_run_openai_compatible_mode_reports_missing_provider_config(capsys: pyte
     assert main(["run", "--input", "video.mp4", "--provider-mode", "openai_compatible"]) == 1
     out = capsys.readouterr().out
     assert "provider config invalid" in out or "Input video does not exist" in out
+
+
+def test_job_manager_loads_resolved_config_path_for_resume(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.create(workspace, "job_config")
+    config_path = tmp_path / "custom.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "project:",
+                "  domain: coding",
+                "mixing:",
+                "  original_ducking_db: -31",
+                "  tts_boost_db: 11",
+                "  final_loudness_normalization: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    write_json_atomic(
+        paths.root / "config.resolved.json",
+        {
+            "provider_mode": "mock",
+            "domain": "ai",
+            "glossary_review": False,
+            "config_path": str(config_path),
+        },
+    )
+
+    config = JobManager()._load_resolved_config(paths)
+
+    assert config.project.domain == "ai"
+    assert config.mixing.original_ducking_db == -31.0
+    assert config.mixing.tts_boost_db == 11.0
+    assert config.mixing.final_loudness_normalization is False
