@@ -3,7 +3,7 @@ from __future__ import annotations
 import wave
 from pathlib import Path
 
-from dubber.tts.audio_quality import analyze_tts_wav
+from dubber.tts.audio_quality import analyze_tts_wav, compact_excessive_internal_silence, trim_edge_silence
 from dubber.tts.mock import synthesize_silence_wav, synthesize_tone_wav
 
 
@@ -47,6 +47,59 @@ def test_internal_silence_fails_quality_gate(tmp_path: Path) -> None:
     assert report.ok is False
     assert report.max_internal_silence_ms == 3000
     assert "tts_audio_internal_silence" in report.warnings
+
+
+def test_leading_silence_fails_quality_gate(tmp_path: Path) -> None:
+    audio = tmp_path / "leading_silence.wav"
+    _write_samples(audio, [0] * 1500 + [3000] * 500, sample_rate=1000)
+
+    report = analyze_tts_wav(audio, max_edge_silence_ms=1200, silence_rms_threshold=120)
+
+    assert report.ok is False
+    assert report.leading_silence_ms == 1500
+    assert "tts_audio_leading_silence" in report.warnings
+
+
+def test_trim_edge_silence_retains_short_natural_edges(tmp_path: Path) -> None:
+    audio = tmp_path / "trim_edges.wav"
+    _write_samples(audio, [0] * 1500 + [3000] * 500 + [0] * 900, sample_rate=1000)
+
+    changed = trim_edge_silence(audio, silence_rms_threshold=120, retained_edge_silence_ms=200)
+    report = analyze_tts_wav(audio, max_edge_silence_ms=1200, silence_rms_threshold=120)
+
+    assert changed is True
+    assert report.ok is True
+    assert 880 <= report.duration_ms <= 920
+    assert report.leading_silence_ms == 200
+    assert report.trailing_silence_ms == 200
+
+
+def test_internal_silence_detection_adapts_to_low_noise_floor(tmp_path: Path) -> None:
+    audio = tmp_path / "noisy_internal_silence.wav"
+    _write_samples(audio, [3000] * 200 + [180] * 3000 + [3000] * 200, sample_rate=1000)
+
+    report = analyze_tts_wav(audio, max_internal_silence_ms=2500, silence_rms_threshold=120)
+
+    assert report.ok is False
+    assert report.max_internal_silence_ms == 3000
+    assert "tts_audio_internal_silence" in report.warnings
+
+
+def test_compacts_only_excessive_internal_silence(tmp_path: Path) -> None:
+    audio = tmp_path / "long_pause.wav"
+    _write_samples(audio, [3000] * 200 + [180] * 3000 + [3000] * 200, sample_rate=1000)
+
+    changed = compact_excessive_internal_silence(
+        audio,
+        silence_rms_threshold=120,
+        max_internal_silence_ms=2500,
+        retained_silence_ms=500,
+    )
+    report = analyze_tts_wav(audio, max_internal_silence_ms=2500, silence_rms_threshold=120)
+
+    assert changed is True
+    assert 880 <= report.duration_ms <= 920
+    assert report.ok is True
 
 
 def test_clipping_fails_quality_gate(tmp_path: Path) -> None:

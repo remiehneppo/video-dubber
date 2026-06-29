@@ -6,10 +6,10 @@ from dubber.tts.duration_planner import plan_segment_duration
 def test_duration_planner_slows_down_when_tts_is_shorter() -> None:
     plan = plan_segment_duration("seg_000001", orig_duration_ms=1000, tts_duration_ms=800)
 
-    assert plan.action == "time_stretch"
-    assert plan.stretch_ratio == 0.8
+    assert plan.action == "pad_silence"
+    assert plan.stretch_ratio == 1.0
     assert plan.overflow_ms == 0
-    assert plan.warnings == ["tts_duration_stretched_to_original"]
+    assert plan.warnings == ["tts_duration_shorter_than_source"]
 
 
 def test_duration_planner_pads_when_tts_matches_original_duration() -> None:
@@ -54,4 +54,32 @@ def test_duration_planner_allows_controlled_overflow_after_rephrase_failure() ->
 
     assert plan.action == "overflow"
     assert plan.overflow_ms == 500
-    assert plan.warnings == ["tts_duration_overflow"]
+    assert plan.warnings == ["tts_duration_overflow_into_source_silence"]
+
+
+def test_duration_planner_allows_overflow_after_rephrase_when_gap_before_next_segment_allows_it() -> None:
+    plan = plan_segment_duration(
+        "seg_000001",
+        orig_duration_ms=1000,
+        tts_duration_ms=1800,
+        rephrase_already_attempted=True,
+        max_overflow_ms=900,
+    )
+
+    assert plan.action == "overflow"
+    assert plan.overflow_ms == 800
+    assert plan.warnings == ["tts_duration_overflow_into_source_silence"]
+
+
+def test_duration_planner_prefers_overflow_into_available_source_silence_over_speedup() -> None:
+    plan = plan_segment_duration(
+        "seg_000001",
+        orig_duration_ms=1000,
+        tts_duration_ms=1150,
+        max_overflow_ms=200,
+    )
+
+    assert plan.action == "overflow"
+    assert plan.stretch_ratio == 1.0
+    assert plan.overflow_ms == 150
+    assert plan.warnings == ["tts_duration_overflow_into_source_silence"]

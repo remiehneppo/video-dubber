@@ -42,9 +42,11 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
                 "  max_speedup_ratio: 1.25",
                 "  min_rms: 450",
                 "  silence_rms_threshold: 100",
+                "  max_edge_silence_ms: 1500",
                 "  max_internal_silence_ms: 2000",
                 "  clipping_peak_threshold: 32700",
                 "  max_clipped_sample_ratio: 0.002",
+                "  clause_pause_threshold_ms: 850",
             ]
         ),
         encoding="utf-8",
@@ -73,9 +75,11 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
     assert config.tts_service.max_speedup_ratio == 1.25
     assert config.tts_service.min_rms == 450
     assert config.tts_service.silence_rms_threshold == 100
+    assert config.tts_service.max_edge_silence_ms == 1500
     assert config.tts_service.max_internal_silence_ms == 2000
     assert config.tts_service.clipping_peak_threshold == 32700
     assert config.tts_service.max_clipped_sample_ratio == 0.002
+    assert config.tts_service.clause_pause_threshold_ms == 850
     assert config.input.allowed_extensions == [".mp4", ".mkv", ".mov"]
 
 

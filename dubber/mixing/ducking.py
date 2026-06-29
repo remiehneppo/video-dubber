@@ -11,12 +11,12 @@ def build_commentary_filter(
     tts_boost_db: float = 8.0,
     final_loudness_normalization: bool = True,
 ) -> str:
-    duck_gain = db_to_linear(original_ducking_db)
     tts_gain = db_to_linear(tts_boost_db)
     mixed_label = "mixed"
+    threshold = max(0.001, min(0.25, db_to_linear(original_ducking_db)))
     graph = (
-        f"[0:a]volume={duck_gain:.6f}[ducked];"
-        f"[1:a]volume={tts_gain:.6f}[tts];"
+        f"[1:a]volume={tts_gain:.6f},asplit=2[tts][sidechain];"
+        f"[0:a][sidechain]sidechaincompress=threshold={threshold:.6f}:ratio=10:attack=20:release=350:makeup=1[ducked];"
         f"[ducked][tts]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[{mixed_label}]"
     )
     if final_loudness_normalization:

@@ -18,15 +18,16 @@ class FakeLLMProvider:
 
     async def complete_json(self, system_prompt: str, user_prompt: str, schema: dict) -> dict:
         payload = json.loads(user_prompt)
-        record = {
-            "system_prompt": system_prompt,
-            "domain": payload["domain"],
-            "segment_count": len(payload["segments"]),
-            "segment_ids": [segment["segment_id"] for segment in payload["segments"]],
-        }
-        self.calls.append(record)
         assert payload["domain"] == "seo"
         if system_prompt.startswith("Extract glossary"):
+            segment_ids = [segment["segment_id"] for segment in payload["segments"]]
+            record = {
+                "system_prompt": system_prompt,
+                "domain": payload["domain"],
+                "segment_count": len(payload["segments"]),
+                "segment_ids": segment_ids,
+            }
+            self.calls.append(record)
             return {
                 "terms": [
                     {
@@ -35,13 +36,32 @@ class FakeLLMProvider:
                         "vietnamese": "trí tuệ nhân tạo",
                         "category": "topic",
                         "confidence": 0.98,
-                        "source_segments": record["segment_ids"],
+                        "source_segments": segment_ids,
                         "notes": "",
                     }
                 ]
             }
+        target_ids = [segment["segment_id"] for segment in payload["target_segments"]]
+        context_ids = [segment["segment_id"] for segment in payload["context_before"] + payload["context_after"]]
+        record = {
+            "system_prompt": system_prompt,
+            "domain": payload["domain"],
+            "segment_count": len(payload["target_segments"]),
+            "segment_ids": target_ids,
+            "context_ids": context_ids,
+        }
+        self.calls.append(record)
+        context_echo = [
+            {
+                "segment_id": context_ids[0],
+                "vi_text": "context-only",
+                "used_terms": [],
+                "length_ratio": 1.0,
+                "translation_warnings": [],
+            }
+        ] if context_ids else []
         return {
-            "segments": [
+            "segments": context_echo + [
                 {
                     "segment_id": segment["segment_id"],
                     "vi_text": f"seo::{segment['segment_id']}",
@@ -49,7 +69,7 @@ class FakeLLMProvider:
                     "length_ratio": 1.0,
                     "translation_warnings": [],
                 }
-                for segment in payload["segments"]
+                for segment in payload["target_segments"]
             ]
         }
 
@@ -114,14 +134,81 @@ def test_translation_uses_blocks_and_domain_context(tmp_path: Path) -> None:
     glossary = json.loads((paths.artifact_path("glossary.locked.json")).read_text(encoding="utf-8"))
     translated = json.loads((paths.artifact_path("translated.v1.json")).read_text(encoding="utf-8"))
 
-    assert [call["segment_count"] for call in llm.calls[:2]] == [8, 2]
-    assert [call["segment_count"] for call in llm.calls[2:]] == [6, 4]
+    assert [call["segment_count"] for call in llm.calls[:2]] == [9, 9]
+    assert [call["segment_count"] for call in llm.calls[2:]] == [6, 3]
+    assert llm.calls[3]["context_ids"] == [
+        "seg_000001",
+        "seg_000002",
+        "seg_000003",
+        "seg_000004",
+        "seg_000005",
+        "seg_000006",
+    ]
     assert all(call["domain"] == "seo" for call in llm.calls)
     assert glossary["domain"] == "seo"
     assert len(glossary["terms"]) == 1
     assert len(translated["segments"]) == 9
     assert translated["segments"][0]["vi_text"] == "seo::seg_000001"
     assert translated["segments"][-1]["vi_text"] == "seo::seg_000009"
+
+
+class OmitsSecondBlockOnceLLMProvider:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    async def complete_json(self, system_prompt: str, user_prompt: str, schema: dict) -> dict:
+        payload = json.loads(user_prompt)
+        target_segments = payload["target_segments"]
+        target_ids = [segment["segment_id"] for segment in target_segments]
+        self.calls.append(target_ids)
+        if len(self.calls) == 2:
+            return {"segments": []}
+        return {
+            "segments": [
+                {
+                    "segment_id": segment["segment_id"],
+                    "vi_text": f"retry::{segment['segment_id']}",
+                    "used_terms": [],
+                    "length_ratio": 1.0,
+                    "translation_warnings": [],
+                }
+                for segment in target_segments
+            ]
+        }
+
+
+def test_translation_retries_block_when_target_segments_are_missing(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_retry_missing")
+    segments = [
+        {"segment_id": f"seg_{index:06d}", "start_ms": (index - 1) * 1000, "end_ms": index * 1000}
+        for index in range(1, 10)
+    ]
+    _write_segments(paths, segments)
+    _write_transcript(paths, segments)
+    paths.artifact_path("glossary.locked.json").write_text(
+        json.dumps({"schema_version": "1.0", "domain": "seo", "status": "locked", "terms": []}),
+        encoding="utf-8",
+    )
+    store = CheckpointStore.create(paths.job_state_file, job_id="job_retry_missing", input_file=Path("input/video.mp4"))
+    manifest = ArtifactManifest.create("job_retry_missing", paths.manifest_file)
+    llm = OmitsSecondBlockOnceLLMProvider()
+    ctx = StageContext(
+        paths=paths,
+        store=store,
+        manifest=manifest,
+        ffmpeg=None,
+        provider_mode="openai_compatible",
+        provider_bundle=ProviderBundle(asr=object(), llm=llm, tts=object()),
+        config=DubberConfig(project=ProjectConfig(domain="seo")),
+    )
+
+    run_translation(ctx)
+
+    translated = json.loads((paths.artifact_path("translated.v1.json")).read_text(encoding="utf-8"))
+    retry_target_ids = ["seg_000007", "seg_000008", "seg_000009"]
+    assert llm.calls.count(retry_target_ids) == 2
+    assert [segment["segment_id"] for segment in translated["segments"]] == [segment["segment_id"] for segment in segments]
+    assert translated["segments"][-1]["vi_text"] == "retry::seg_000009"
 
 
 def _write_segments(paths: WorkspacePaths, segments: list[dict[str, object]]) -> None:

@@ -73,7 +73,7 @@ def _build_segment(
     units: list[TimestampUnit],
     index: int,
 ) -> dict[str, object]:
-    return {
+    segment = {
         "segment_id": f"seg_{index:06d}",
         "start_ms": units[0].start_ms,
         "end_ms": units[-1].end_ms,
@@ -87,6 +87,9 @@ def _build_segment(
         "raw_response_path": str(chunk.get("raw_response_path", "")),
         "source_chunk_id": str(chunk.get("chunk_id", "")),
     }
+    if timestamps.source == "word":
+        segment["words"] = [_timestamp_unit_to_dict(unit) for unit in units]
+    return segment
 
 
 def _merge_segment_units(segment: dict[str, object], units: list[TimestampUnit]) -> dict[str, object]:
@@ -94,6 +97,8 @@ def _merge_segment_units(segment: dict[str, object], units: list[TimestampUnit])
     merged["end_ms"] = units[-1].end_ms
     merged["duration_ms"] = int(merged["end_ms"]) - int(merged["start_ms"])
     merged["source_text"] = f"{segment['source_text']} {_join_text(units)}".strip()
+    if "words" in merged:
+        merged["words"] = [*list(merged["words"]), *[_timestamp_unit_to_dict(unit) for unit in units]]
     risk_flags = list(merged.get("risk_flags", []))
     if "merged_short_tail" not in risk_flags:
         risk_flags.append("merged_short_tail")
@@ -110,3 +115,7 @@ def _duration(units: list[TimestampUnit]) -> int:
 
 def _join_text(units: list[TimestampUnit]) -> str:
     return " ".join(unit.text.strip() for unit in units if unit.text.strip()).strip()
+
+
+def _timestamp_unit_to_dict(unit: TimestampUnit) -> dict[str, object]:
+    return {"text": unit.text.strip(), "start_ms": unit.start_ms, "end_ms": unit.end_ms}

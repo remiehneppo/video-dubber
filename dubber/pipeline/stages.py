@@ -16,19 +16,26 @@ from dubber.orchestrator.segment_checkpoint_store import SegmentCheckpointStore
 from dubber.orchestrator.stage_artifacts import StageArtifacts
 from dubber.pipeline.stage_context import StageContext
 from dubber.providers.llm_openai_compatible import LLMStructuredOutputError
-from dubber.tts.segment_producer import produce_mock_tts_segment, produce_provider_tts_segment
+from dubber.tts.clause_builder import TTSWorkItem, build_tts_work_items
+from dubber.tts.segment_producer import produce_mock_tts_segment, produce_provider_tts_rows
 from dubber.tts.track_mixer import assemble_commentary_track
 from dubber.transcript.segmentation import build_transcript_segments
-from dubber.translation.block_builder import build_translation_blocks
+from dubber.translation.block_builder import TranslationContextBlock, build_translation_context_blocks
 from dubber.translation.compressor import compress_segment_translation
 from dubber.translation.validator import validate_translations
 
 logger = logging.getLogger(__name__)
 
-_TRANSLATION_BLOCK_SIZE = 6
-_TRANSLATION_BLOCK_OVERLAP = 1
-_GLOSSARY_BLOCK_SIZE = 8
-_GLOSSARY_BLOCK_OVERLAP = 1
+
+def _translation_blocks(ctx: StageContext, segments: list[dict[str, object]]) -> list[TranslationContextBlock]:
+    config = ctx.config.translation
+    return build_translation_context_blocks(
+        segments,
+        min_context_words=config.min_context_words,
+        max_context_words=config.max_context_words,
+        context_overlap_words=config.context_overlap_words,
+        target_segment_count=config.target_segment_count,
+    )
 
 
 def _glossary_response_schema() -> dict[str, object]:
@@ -314,6 +321,14 @@ def run_vad(ctx: StageContext) -> None:
             silence_merge_threshold_ms=vad.silence_merge_threshold_ms,
             context_padding_ms=vad.context_padding_ms,
             soft_split_allowed=vad.soft_split_allowed,
+            silero_model_path=vad.silero_model_path,
+            silero_model_url=vad.silero_model_url,
+            silero_auto_download=vad.silero_auto_download,
+            silero_threshold=vad.silero_threshold,
+            min_silence_duration_ms=vad.min_silence_duration_ms,
+            speech_padding_ms=vad.speech_padding_ms,
+            max_vad_chunk_ms=vad.max_vad_chunk_ms,
+            merge_gap_ms=vad.merge_gap_ms,
         ),
     )
     StageArtifacts(ctx.paths, ctx.store, ctx.manifest).publish_json(
@@ -513,12 +528,13 @@ def run_glossary(ctx: StageContext, *, glossary_review: bool) -> bool:
     source_segments = [segment["segment_id"] for segment in ctx.artifact_json("segments.v1.json")["segments"]]
     if ctx.provider_mode == "openai_compatible":
         transcript = ctx.artifact_json("transcript.v1.json")
-        blocks = build_translation_blocks(transcript["segments"], block_size=_GLOSSARY_BLOCK_SIZE, overlap=_GLOSSARY_BLOCK_OVERLAP)
+        blocks = _translation_blocks(ctx, transcript["segments"])
         logger.info("stage glossary llm request started blocks=%s segments=%s domain=%s", len(blocks), len(transcript["segments"]), domain)
         terms: list[dict[str, object]] = []
         for block_index, block in enumerate(blocks, start=1):
-            block_segment_ids = [str(segment["segment_id"]) for segment in block]
-            logger.info("stage glossary block started block=%s/%s segments=%s segment_ids=%s", block_index, len(blocks), len(block), ",".join(block_segment_ids))
+            block_segments = block.all_segments
+            block_segment_ids = [str(segment["segment_id"]) for segment in block_segments]
+            logger.info("stage glossary block started block=%s/%s segments=%s segment_ids=%s", block_index, len(blocks), len(block_segments), ",".join(block_segment_ids))
             try:
                 glossary_result = asyncio.run(
                     _request_structured_json(
@@ -531,10 +547,10 @@ def run_glossary(ctx: StageContext, *, glossary_review: bool) -> bool:
                                 "segment_window": {
                                     "first_segment_id": block_segment_ids[0] if block_segment_ids else None,
                                     "last_segment_id": block_segment_ids[-1] if block_segment_ids else None,
-                                    "segment_count": len(block),
-                                    "overlap_segments": _GLOSSARY_BLOCK_OVERLAP,
+                                    "segment_count": len(block_segments),
+                                    "context_overlap_words": ctx.config.translation.context_overlap_words,
                                 },
-                                "segments": block,
+                                "segments": block_segments,
                                 "required_output_example": {
                                     "terms": [
                                         {
@@ -629,43 +645,67 @@ def run_translation(ctx: StageContext) -> None:
     ctx.store.save()
     translated_segments: list[dict[str, object]] = []
     provider_translations: dict[str, dict] = {}
-    blocks = build_translation_blocks(transcript["segments"], block_size=_TRANSLATION_BLOCK_SIZE, overlap=_TRANSLATION_BLOCK_OVERLAP)
+    blocks = _translation_blocks(ctx, transcript["segments"])
     if ctx.provider_mode == "openai_compatible":
         logger.info("stage translation llm request started blocks=%s segments=%s domain=%s", len(blocks), len(transcript["segments"]), domain)
         for block_index, block in enumerate(blocks, start=1):
-            block_segment_ids = [str(segment["segment_id"]) for segment in block]
-            logger.info("stage translation block started block=%s/%s segments=%s segment_ids=%s", block_index, len(blocks), len(block), ",".join(block_segment_ids))
-            translation_result = asyncio.run(
-                _request_structured_json(
-                    ctx.require_provider_bundle().llm,
-                    f"Translate a {domain} video transcript block to Vietnamese. Preserve the meaning of the {domain} terminology in the glossary and keep the context consistent across overlapping segments. Return raw JSON only.",
-                    json.dumps(
-                        {
-                            "instruction": "Return only a JSON object with a segments array. Do not write prose, markdown, headings, or bullets.",
-                            "domain": domain,
-                            "segment_window": {
-                                "first_segment_id": block_segment_ids[0] if block_segment_ids else None,
-                                "last_segment_id": block_segment_ids[-1] if block_segment_ids else None,
-                                "segment_count": len(block),
-                                "overlap_segments": _TRANSLATION_BLOCK_OVERLAP,
-                            },
-                            "segments": block,
-                            "glossary": glossary["terms"],
-                        },
-                        ensure_ascii=False,
-                    ),
-                    _translation_response_schema(),
-                    response_name="translation_output",
-                    response_description="Vietnamese translation segments in structured JSON format.",
-                )
-            )
+            target_segment_ids = [str(segment["segment_id"]) for segment in block.target_segments]
+            logger.info("stage translation block started block=%s/%s target_segments=%s segment_ids=%s", block_index, len(blocks), len(block.target_segments), ",".join(target_segment_ids))
             block_translations = 0
-            for segment in translation_result.get("segments", []):
-                segment_id = segment.get("segment_id")
-                if segment_id is None:
-                    continue
-                provider_translations[str(segment_id)] = segment
-                block_translations += 1
+            for attempt in range(1, 3):
+                retry_instruction = (
+                    " You previously omitted one or more target segment IDs. Return exactly one segment object for each target_segment_id: "
+                    + ", ".join(target_segment_ids)
+                    if attempt > 1
+                    else ""
+                )
+                translation_result = asyncio.run(
+                    _request_structured_json(
+                        ctx.require_provider_bundle().llm,
+                        f"Translate the target_segments of a {domain} video transcript block to Vietnamese. Use context_before and context_after only for continuity; do not translate context-only segments. Preserve glossary terminology. Return raw JSON only.{retry_instruction}",
+                        json.dumps(
+                            {
+                                "instruction": "Return only a JSON object with a segments array. The array must contain exactly one object for every target segment_id and no context-only segment IDs. Do not write prose, markdown, headings, or bullets.",
+                                "required_target_segment_ids": target_segment_ids,
+                                "domain": domain,
+                                "segment_window": {
+                                    "first_target_segment_id": target_segment_ids[0] if target_segment_ids else None,
+                                    "last_target_segment_id": target_segment_ids[-1] if target_segment_ids else None,
+                                    "target_segment_count": len(block.target_segments),
+                                    "context_overlap_words": ctx.config.translation.context_overlap_words,
+                                },
+                                "target_segments": block.target_segments,
+                                "context_before": block.context_before,
+                                "context_after": block.context_after,
+                                "glossary": glossary["terms"],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        _translation_response_schema(),
+                        response_name="translation_output",
+                        response_description="Vietnamese translation segments in structured JSON format.",
+                    )
+                )
+                block_translations = 0
+                for segment in translation_result.get("segments", []):
+                    segment_id = segment.get("segment_id")
+                    if segment_id is None or str(segment_id) not in target_segment_ids:
+                        continue
+                    provider_translations[str(segment_id)] = segment
+                    block_translations += 1
+                missing_in_block = [segment_id for segment_id in target_segment_ids if segment_id not in provider_translations]
+                if not missing_in_block:
+                    break
+                logger.warning(
+                    "stage translation block missing target ids block=%s/%s attempt=%s missing_segment_ids=%s",
+                    block_index,
+                    len(blocks),
+                    attempt,
+                    ",".join(missing_in_block),
+                )
+                for segment_id in target_segment_ids:
+                    if segment_id in missing_in_block:
+                        provider_translations.pop(segment_id, None)
             logger.info("stage translation block completed block=%s/%s translations=%s", block_index, len(blocks), block_translations)
         missing_segments = [str(source["segment_id"]) for source in transcript["segments"] if str(source["segment_id"]) not in provider_translations]
         if missing_segments:
@@ -748,18 +788,36 @@ def run_tts(
     }
     mix_audio_path = ctx.paths.tts_dir / "mix.wav"
     tts_segments = []
-    for index, segment in enumerate(segments, start=1):
-        segment_id = str(segment["segment_id"])
-        logger.info("stage tts segment started segment=%s index=%s/%s", segment_id, index, len(segments))
+    if ctx.provider_mode == "openai_compatible":
+        work_items = build_tts_work_items(segments, translations_by_id)
+    else:
+        work_items = [
+            TTSWorkItem(
+                segment=segment,
+                translated_text="",
+                parent_segment_ids=(str(segment["segment_id"]),),
+            )
+            for segment in segments
+        ]
+    for index, work_item in enumerate(work_items, start=1):
+        segment = work_item.segment
+        parent_segment_ids = work_item.parent_segment_ids
+        segment_id = "+".join(parent_segment_ids)
+        logger.info(
+            "stage tts segment started segment=%s index=%s/%s parent_segments=%s",
+            segment_id,
+            index,
+            len(work_items),
+            len(parent_segment_ids),
+        )
         if ctx.provider_mode == "openai_compatible":
-            source_text = str(transcript_by_id.get(segment_id, {}).get("source_text", ""))
-            translated_text = str(translations_by_id.get(segment_id, {}).get("vi_text", ""))
+            source_text = str(segment.get("source_text", ""))
             tts_config = ctx.config.tts_service
-            row = asyncio.run(
-                produce_provider_tts_segment(
+            rows = asyncio.run(
+                produce_provider_tts_rows(
                     paths=ctx.paths,
                     segment=segment,
-                    text="" if not source_text.strip() else translated_text,
+                    text="" if not source_text.strip() else work_item.translated_text,
                     provider_bundle=ctx.require_provider_bundle(),
                     ffmpeg=ctx.ffmpeg,
                     quality_retry_attempts=tts_config.quality_retry_attempts,
@@ -767,16 +825,33 @@ def run_tts(
                     max_speedup_ratio=tts_config.max_speedup_ratio,
                     min_rms=tts_config.min_rms,
                     silence_rms_threshold=tts_config.silence_rms_threshold,
+                    max_edge_silence_ms=tts_config.max_edge_silence_ms,
                     max_internal_silence_ms=tts_config.max_internal_silence_ms,
                     clipping_peak_threshold=tts_config.clipping_peak_threshold,
                     max_clipped_sample_ratio=tts_config.max_clipped_sample_ratio,
+                    clause_pause_threshold_ms=tts_config.clause_pause_threshold_ms,
+                    next_segment_start_ms=(
+                        int(work_items[index].segment["start_ms"]) + 500
+                        if index < len(work_items)
+                        else duration_ms
+                    ),
                 )
             )
         else:
-            row = produce_mock_tts_segment(paths=ctx.paths, segment=segment)
-        tts_segments.append(row)
-        logger.info("stage tts segment completed segment=%s index=%s/%s audio=%s", segment_id, index, len(segments), row["audio_path"])
-        segment_store.mark(segment_id, StageStatus.COMPLETED, artifact=row["audio_path"])
+            rows = [produce_mock_tts_segment(paths=ctx.paths, segment=segment)]
+        for row in rows:
+            row["parent_segment_ids"] = list(parent_segment_ids)
+        tts_segments.extend(rows)
+        logger.info(
+            "stage tts segment completed segment=%s index=%s/%s clauses=%s audio=%s",
+            segment_id,
+            index,
+            len(work_items),
+            len(rows),
+            ",".join(str(row["audio_path"]) for row in rows),
+        )
+        for parent_segment_id in parent_segment_ids:
+            segment_store.mark(parent_segment_id, StageStatus.COMPLETED, artifact=rows[0]["audio_path"])
         segment_store.save()
     publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
     assemble_commentary_track(

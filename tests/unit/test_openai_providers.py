@@ -7,7 +7,7 @@ from pathlib import Path
 import httpx
 
 from dubber.providers.asr_openai_compatible import OpenAICompatibleASRProvider
-from dubber.providers.llm_openai_compatible import OpenAICompatibleLLMProvider
+from dubber.providers.llm_openai_compatible import LLMStructuredOutputError, OpenAICompatibleLLMProvider
 from dubber.providers.retry import ProviderRequestError
 from dubber.providers.tts_openai_compatible import OpenAICompatibleTTSProvider
 
@@ -307,6 +307,75 @@ def test_openai_compatible_llm_parses_message_parsed_payload() -> None:
     result = asyncio.run(provider.complete_json("system", "user", schema={"type": "object"}))
 
     assert result == {"ok": True}
+
+
+def test_openai_compatible_llm_wraps_top_level_array_for_single_array_property_schema() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '[{"segment_id": "seg_000001", "vi_text": "Xin chào"}]',
+                        }
+                    }
+                ]
+            },
+            request=request,
+        )
+
+    provider = OpenAICompatibleLLMProvider(
+        base_url="https://api.example.test/v1",
+        api_key="secret",
+        model="gpt-test",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    result = asyncio.run(
+        provider.complete_structured_json(
+            "system",
+            "user",
+            schema={
+                "type": "object",
+                "properties": {
+                    "segments": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    }
+                },
+                "required": ["segments"],
+            },
+            response_name="translation_output",
+            response_description="Translation output",
+        )
+    )
+
+    assert result == {"segments": [{"segment_id": "seg_000001", "vi_text": "Xin chào"}]}
+
+
+def test_openai_compatible_llm_reports_non_object_json_with_context() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '["unexpected"]'}}]},
+            request=request,
+        )
+
+    provider = OpenAICompatibleLLMProvider(
+        base_url="https://api.example.test/v1",
+        api_key="secret",
+        model="gpt-test",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    try:
+        asyncio.run(provider.complete_json("system", "user", schema={"type": "object"}))
+    except LLMStructuredOutputError as exc:
+        assert "LLM JSON response must be an object" in str(exc)
+        assert exc.content == '["unexpected"]'
+    else:
+        raise AssertionError("expected LLMStructuredOutputError")
 
 
 def test_openai_compatible_llm_parses_content_parts() -> None:

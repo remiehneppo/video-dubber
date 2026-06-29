@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from dubber.translation.block_builder import build_translation_blocks
+from dubber.translation.block_builder import build_translation_blocks, build_translation_context_blocks
 from dubber.translation.validator import TranslationValidationError, validate_translations
 
 
@@ -24,6 +24,49 @@ def test_build_translation_blocks_uses_overlap_without_losing_segments() -> None
 def test_build_translation_blocks_rejects_invalid_overlap() -> None:
     with pytest.raises(ValueError, match="overlap must be smaller"):
         build_translation_blocks([{"segment_id": "seg_000001"}], block_size=3, overlap=3)
+
+
+def test_build_translation_context_blocks_uses_word_windows_with_context() -> None:
+    segments = [
+        {"segment_id": f"seg_{index:06d}", "source_text": "word " * words}
+        for index, words in enumerate([30, 35, 40, 45, 50, 55, 60], start=1)
+    ]
+
+    blocks = build_translation_context_blocks(
+        segments,
+        min_context_words=100,
+        max_context_words=150,
+        context_overlap_words=40,
+        target_segment_count=3,
+    )
+
+    assert [[segment["segment_id"] for segment in block.target_segments] for block in blocks] == [
+        ["seg_000001", "seg_000002", "seg_000003"],
+        ["seg_000004", "seg_000005", "seg_000006"],
+        ["seg_000007"],
+    ]
+    assert [segment["segment_id"] for segment in blocks[1].context_before] == ["seg_000003"]
+    assert [segment["segment_id"] for segment in blocks[1].context_after] == ["seg_000007"]
+
+
+def test_build_translation_context_blocks_allows_single_oversized_segment() -> None:
+    segments = [
+        {"segment_id": "seg_000001", "source_text": "word " * 500},
+        {"segment_id": "seg_000002", "source_text": "short text"},
+    ]
+
+    blocks = build_translation_context_blocks(
+        segments,
+        min_context_words=120,
+        max_context_words=350,
+        context_overlap_words=40,
+        target_segment_count=6,
+    )
+
+    assert [[segment["segment_id"] for segment in block.target_segments] for block in blocks] == [
+        ["seg_000001"],
+        ["seg_000002"],
+    ]
 
 
 def test_validate_translations_accepts_matching_segments_and_glossary() -> None:

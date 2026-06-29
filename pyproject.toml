@@ -9,6 +9,12 @@ dependencies = [
   "uvicorn",
 ]
 
+[project.optional-dependencies]
+silero = [
+  "onnxruntime",
+  "numpy",
+]
+
 [project.scripts]
 dubber = "cli:main"
 

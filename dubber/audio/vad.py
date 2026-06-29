@@ -6,6 +6,8 @@ import wave
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from dubber.audio.silero_vad import SileroVadUnavailable, detect_silero_segments
+
 
 @dataclass(frozen=True)
 class VadConfig:
@@ -21,6 +23,14 @@ class VadConfig:
     silence_merge_threshold_ms: int = 2_500
     context_padding_ms: int = 0
     soft_split_allowed: bool = True
+    silero_model_path: Path = Path("models/silero_vad.onnx")
+    silero_model_url: str = "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx"
+    silero_auto_download: bool = True
+    silero_threshold: float = 0.5
+    min_silence_duration_ms: int = 500
+    speech_padding_ms: int = 250
+    max_vad_chunk_ms: int = 30_000
+    merge_gap_ms: int = 300
 
 
 @dataclass(frozen=True)
@@ -66,6 +76,30 @@ class _Interval:
 
 def detect_segments(wav_path: Path, config: VadConfig | None = None) -> list[VadSegment]:
     config = config or VadConfig()
+    if config.mode == "silero_vad":
+        try:
+            silero_segments = detect_silero_segments(wav_path, config)
+        except SileroVadUnavailable as exc:
+            raise RuntimeError(str(exc)) from exc
+        return [
+            VadSegment(
+                segment_id=f"seg_{index:06d}",
+                start_ms=segment.start_ms,
+                end_ms=segment.end_ms,
+                duration_ms=segment.end_ms - segment.start_ms,
+                silence_before_ms=segment.start_ms - silero_segments[index - 2].end_ms if index > 1 else segment.start_ms,
+                silence_after_ms=(
+                    silero_segments[index].start_ms - segment.end_ms
+                    if index < len(silero_segments)
+                    else 0
+                ),
+                speech_probability=segment.speech_probability,
+                split_reason=segment.split_reason,
+                risk_flags=segment.risk_flags,
+            )
+            for index, segment in enumerate(silero_segments, start=1)
+        ]
+
     frames, duration_ms = _read_frames(wav_path, config.frame_ms)
     if not frames:
         raise ValueError(f"WAV contains no audio frames: {wav_path}")

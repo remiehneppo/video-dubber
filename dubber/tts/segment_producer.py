@@ -7,7 +7,8 @@ from dubber.core.paths import WorkspacePaths
 from dubber.providers.factory import ProviderBundle
 from dubber.providers.ffmpeg import FFmpegAdapter
 from dubber.tts.aligner import apply_time_stretch
-from dubber.tts.audio_quality import TTSQualityReport, analyze_tts_wav
+from dubber.tts.audio_quality import TTSQualityReport, analyze_tts_wav, compact_excessive_internal_silence, trim_edge_silence
+from dubber.tts.clause_builder import build_tts_clauses
 from dubber.tts.duration_planner import plan_segment_duration
 from dubber.tts.mock import synthesize_silence_wav, synthesize_tone_wav
 from dubber.tts.rephrase import rephrase_tts_text
@@ -28,6 +29,39 @@ def produce_mock_tts_segment(*, paths: WorkspacePaths, segment: dict[str, Any]) 
     )
 
 
+async def produce_provider_tts_rows(
+    *,
+    paths: WorkspacePaths,
+    segment: dict[str, Any],
+    text: str,
+    provider_bundle: ProviderBundle,
+    ffmpeg: FFmpegAdapter,
+    next_segment_start_ms: int | None,
+    clause_pause_threshold_ms: int = 700,
+    **tts_options: Any,
+) -> list[dict[str, Any]]:
+    clauses = build_tts_clauses(segment, text, min_pause_ms=clause_pause_threshold_ms)
+    rows: list[dict[str, Any]] = []
+    for index, clause in enumerate(clauses):
+        is_last_clause = index == len(clauses) - 1
+        clause_next_start_ms = next_segment_start_ms if is_last_clause else clause.end_ms + 500
+        row = await produce_provider_tts_segment(
+            paths=paths,
+            segment=clause.to_segment(),
+            text=clause.translated_text,
+            provider_bundle=provider_bundle,
+            ffmpeg=ffmpeg,
+            next_segment_start_ms=clause_next_start_ms,
+            **tts_options,
+        )
+        row["parent_segment_id"] = clause.parent_segment_id
+        row["clause_index"] = index + 1
+        row["clause_count"] = len(clauses)
+        row["source_clause_text"] = clause.source_text
+        rows.append(row)
+    return rows
+
+
 async def produce_provider_tts_segment(
     *,
     paths: WorkspacePaths,
@@ -41,9 +75,11 @@ async def produce_provider_tts_segment(
     max_speedup_ratio: float = 1.3,
     min_rms: float = 500,
     silence_rms_threshold: int = 120,
+    max_edge_silence_ms: int = 1200,
     max_internal_silence_ms: int = 2500,
     clipping_peak_threshold: int = 32760,
     max_clipped_sample_ratio: float = 0.001,
+    next_segment_start_ms: int | None = None,
 ) -> dict[str, Any]:
     segment_id = str(segment["segment_id"])
     raw_audio_path = paths.tts_dir / f"{segment_id}.raw.wav"
@@ -72,6 +108,7 @@ async def produce_provider_tts_segment(
     provider_metadata: dict[str, Any] = {}
     last_report: TTSQualityReport | None = None
     orig_ms = int(segment["duration_ms"])
+    overflow_budget_ms = _overflow_budget_ms(segment, next_segment_start_ms)
 
     while True:
         for _ in range(max(1, quality_retry_attempts)):
@@ -83,12 +120,60 @@ async def produce_provider_tts_segment(
                 tts_result.audio_path,
                 min_rms=min_rms,
                 silence_rms_threshold=silence_rms_threshold,
+                max_edge_silence_ms=max_edge_silence_ms,
                 max_internal_silence_ms=max_internal_silence_ms,
                 clipping_peak_threshold=clipping_peak_threshold,
                 max_clipped_sample_ratio=max_clipped_sample_ratio,
             )
             tts_duration_ms = last_report.duration_ms or tts_duration_ms
             quality_attempts.append(last_report.to_dict())
+            if any(warning in last_report.warnings for warning in ("tts_audio_leading_silence", "tts_audio_trailing_silence")):
+                duration_before_trim_ms = tts_duration_ms
+                if trim_edge_silence(
+                    tts_result.audio_path,
+                    silence_rms_threshold=silence_rms_threshold,
+                ):
+                    last_report = analyze_tts_wav(
+                        tts_result.audio_path,
+                        min_rms=min_rms,
+                        silence_rms_threshold=silence_rms_threshold,
+                        max_edge_silence_ms=max_edge_silence_ms,
+                        max_internal_silence_ms=max_internal_silence_ms,
+                        clipping_peak_threshold=clipping_peak_threshold,
+                        max_clipped_sample_ratio=max_clipped_sample_ratio,
+                    )
+                    tts_duration_ms = last_report.duration_ms or tts_duration_ms
+                    quality_attempts.append(last_report.to_dict())
+                    provider_metadata = {
+                        **provider_metadata,
+                        "edge_silence_trimmed": True,
+                        "duration_before_edge_trim_ms": duration_before_trim_ms,
+                        "duration_after_edge_trim_ms": tts_duration_ms,
+                    }
+            if "tts_audio_internal_silence" in last_report.warnings:
+                duration_before_compaction_ms = tts_duration_ms
+                if compact_excessive_internal_silence(
+                    tts_result.audio_path,
+                    silence_rms_threshold=silence_rms_threshold,
+                    max_internal_silence_ms=max_internal_silence_ms,
+                ):
+                    last_report = analyze_tts_wav(
+                        tts_result.audio_path,
+                        min_rms=min_rms,
+                        silence_rms_threshold=silence_rms_threshold,
+                        max_edge_silence_ms=max_edge_silence_ms,
+                        max_internal_silence_ms=max_internal_silence_ms,
+                        clipping_peak_threshold=clipping_peak_threshold,
+                        max_clipped_sample_ratio=max_clipped_sample_ratio,
+                    )
+                    tts_duration_ms = last_report.duration_ms or tts_duration_ms
+                    quality_attempts.append(last_report.to_dict())
+                    provider_metadata = {
+                        **provider_metadata,
+                        "internal_silence_compacted": True,
+                        "duration_before_compaction_ms": duration_before_compaction_ms,
+                        "duration_after_compaction_ms": tts_duration_ms,
+                    }
             if last_report.ok:
                 break
         else:
@@ -116,6 +201,27 @@ async def produce_provider_tts_segment(
                 final_text=current_text,
                 source_text=source_text,
                 max_speedup_ratio=max_speedup_ratio,
+                rephrase_already_attempted=rephrase_count > 0,
+                max_overflow_ms=overflow_budget_ms,
+            )
+
+        overflow_ms = tts_duration_ms - orig_ms
+        if rephrase_count > 0 and overflow_ms <= overflow_budget_ms:
+            return _align_segment(
+                paths=paths,
+                segment=segment,
+                raw_audio_path=raw_audio_path,
+                tts_duration_ms=tts_duration_ms,
+                provider_metadata=provider_metadata,
+                quality_report=last_report,
+                quality_attempts=quality_attempts,
+                synthesis_attempts=synthesis_attempts,
+                rephrase_attempts=rephrase_count,
+                final_text=current_text,
+                source_text=source_text,
+                max_speedup_ratio=max_speedup_ratio,
+                rephrase_already_attempted=True,
+                max_overflow_ms=overflow_budget_ms,
             )
 
         if rephrase_count >= rephrase_attempts:
@@ -151,6 +257,8 @@ def _align_segment(
     final_text: str | None = None,
     source_text: str | None = None,
     max_speedup_ratio: float = 1.3,
+    rephrase_already_attempted: bool = False,
+    max_overflow_ms: int = 0,
 ) -> dict[str, Any]:
     segment_id = str(segment["segment_id"])
     orig_ms = int(segment["duration_ms"])
@@ -160,6 +268,8 @@ def _align_segment(
         orig_duration_ms=orig_ms,
         tts_duration_ms=tts_duration_ms,
         speedup_hard_limit=max_speedup_ratio,
+        rephrase_already_attempted=rephrase_already_attempted,
+        max_overflow_ms=max_overflow_ms,
     )
     apply_time_stretch(
         raw_audio_path,
@@ -169,7 +279,7 @@ def _align_segment(
     row = {
         "segment_id": segment["segment_id"],
         "target_start_ms": int(segment["start_ms"]) + 500,
-        "target_end_ms": int(segment["end_ms"]),
+        "target_end_ms": _target_end_ms(segment, timing_plan.action, tts_duration_ms),
         "original_start_ms": int(segment["start_ms"]),
         "original_end_ms": int(segment["end_ms"]),
         "commentary_delay_ms": 500,
@@ -194,6 +304,21 @@ def _align_segment(
     if source_text is not None:
         row["source_text_chars"] = len(source_text)
     return row
+
+
+def _overflow_budget_ms(segment: dict[str, Any], next_segment_start_ms: int | None) -> int:
+    if next_segment_start_ms is None:
+        return 0
+    target_start_ms = int(segment["start_ms"]) + 500
+    orig_ms = int(segment["duration_ms"])
+    available_ms = max(0, next_segment_start_ms - target_start_ms)
+    return max(0, available_ms - orig_ms)
+
+
+def _target_end_ms(segment: dict[str, Any], action: str, tts_duration_ms: int) -> int:
+    if action == "overflow":
+        return int(segment["start_ms"]) + 500 + tts_duration_ms
+    return int(segment["end_ms"])
 
 
 def _tts_quality_error(

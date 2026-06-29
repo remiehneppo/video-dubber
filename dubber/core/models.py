@@ -52,6 +52,14 @@ class VadConfig:
     silence_merge_threshold_ms: int = 2_500
     context_padding_ms: int = 1_500
     soft_split_allowed: bool = True
+    silero_model_path: Path = Path("models/silero_vad.onnx")
+    silero_model_url: str = "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx"
+    silero_auto_download: bool = True
+    silero_threshold: float = 0.5
+    min_silence_duration_ms: int = 500
+    speech_padding_ms: int = 250
+    max_vad_chunk_ms: int = 30_000
+    merge_gap_ms: int = 300
 
 
 @dataclass(frozen=True)
@@ -64,6 +72,10 @@ class MixingConfig:
 @dataclass(frozen=True)
 class TranslationConfig:
     glossary_review: bool = True
+    min_context_words: int = 120
+    max_context_words: int = 350
+    context_overlap_words: int = 40
+    target_segment_count: int = 6
 
 
 @dataclass(frozen=True)
@@ -109,9 +121,11 @@ class TTSServiceConfig:
     max_speedup_ratio: float = 1.3
     min_rms: float = 500
     silence_rms_threshold: int = 120
+    max_edge_silence_ms: int = 1200
     max_internal_silence_ms: int = 2500
     clipping_peak_threshold: int = 32760
     max_clipped_sample_ratio: float = 0.001
+    clause_pause_threshold_ms: int = 700
 
 
 @dataclass(frozen=True)
@@ -218,4 +232,3 @@ class JobState:
             created_at=str(data["created_at"]),
             updated_at=str(data["updated_at"]),
         )
-

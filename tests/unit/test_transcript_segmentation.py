@@ -41,6 +41,11 @@ def test_build_transcript_segments_splits_on_punctuation_after_target_minimum() 
     assert [segment["segment_id"] for segment in segments] == ["seg_000001", "seg_000002"]
     assert segments[0]["timestamp_source"] == "word"
     assert segments[0]["timestamp_quality"] == "word"
+    assert segments[0]["words"] == [
+        {"text": "This", "start_ms": 0, "end_ms": 500},
+        {"text": "is", "start_ms": 600, "end_ms": 900},
+        {"text": "first.", "start_ms": 1000, "end_ms": 2500},
+    ]
 
 
 def test_build_transcript_segments_splits_long_segment_on_pause() -> None:

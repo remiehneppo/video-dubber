@@ -4,6 +4,9 @@ import math
 import wave
 from pathlib import Path
 
+import pytest
+
+from dubber.audio.silero_vad import _run_model, ensure_silero_model, post_process_speech_intervals
 from dubber.audio.vad import VadConfig, detect_segments
 
 
@@ -194,6 +197,116 @@ def test_asr_context_chunks_split_at_silence_before_hard_max(tmp_path: Path) -> 
     assert [(segment.start_ms, segment.end_ms) for segment in segments] == [(0, 5000), (5000, 10000), (10000, 14000)]
     assert segments[0].split_reason == "vad_silence_split"
     assert "hard_split" not in segments[0].risk_flags
+
+
+
+
+
+
+def test_silero_run_model_includes_context_buffer() -> None:
+    np = pytest.importorskip("numpy")
+
+    class Input:
+        def __init__(self, name: str, shape: list[object]) -> None:
+            self.name = name
+            self.shape = shape
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.input_shapes: list[tuple[int, ...]] = []
+
+        def get_inputs(self) -> list[Input]:
+            return [Input("input", [None, None]), Input("state", [2, None, 128]), Input("sr", [])]
+
+        def run(self, output_names, inputs):
+            self.input_shapes.append(inputs["input"].shape)
+            return [inputs["input"][:, -1:].mean(axis=1, keepdims=True), inputs["state"]]
+
+    fake_session = FakeSession()
+    _run_model(fake_session, np.arange(1024, dtype=np.float32), np)
+
+    assert fake_session.input_shapes == [(1, 576), (1, 576)]
+
+
+def test_silero_model_downloads_when_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    model_path = tmp_path / "models" / "silero_vad.onnx"
+    requested = {}
+
+    def fake_urlretrieve(url: str, filename: str) -> tuple[str, object]:
+        requested["url"] = url
+        Path(filename).write_bytes(b"onnx")
+        return filename, None
+
+    monkeypatch.setattr("dubber.audio.silero_vad.urlretrieve", fake_urlretrieve)
+
+    ensure_silero_model(
+        model_path,
+        model_url="https://example.test/silero_vad.onnx",
+        auto_download=True,
+    )
+
+    assert requested["url"] == "https://example.test/silero_vad.onnx"
+    assert model_path.read_bytes() == b"onnx"
+
+
+def test_silero_model_missing_without_auto_download_fails(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="silero_vad_unavailable"):
+        ensure_silero_model(
+            tmp_path / "missing.onnx",
+            model_url="https://example.test/silero_vad.onnx",
+            auto_download=False,
+        )
+
+
+def test_silero_vad_requires_available_runtime_or_model(tmp_path: Path) -> None:
+    wav_path = tmp_path / "audio.wav"
+    _write_wav(wav_path, [("tone", 300)])
+
+    with pytest.raises(RuntimeError, match="silero_vad_unavailable"):
+        detect_segments(
+            wav_path,
+            VadConfig(
+                mode="silero_vad",
+                silero_model_path=tmp_path / "missing.onnx",
+                silero_auto_download=False,
+            ),
+        )
+
+
+def test_silero_post_processing_merges_pads_filters_and_splits() -> None:
+    segments = post_process_speech_intervals(
+        [(100, 240), (500, 1200), (1350, 5200)],
+        audio_duration_ms=6000,
+        min_speech_duration_ms=250,
+        min_silence_duration_ms=500,
+        speech_padding_ms=200,
+        target_min_chunk_ms=0,
+        preferred_max_chunk_ms=2000,
+        hard_max_chunk_ms=2000,
+        merge_gap_ms=300,
+    )
+
+    assert [(segment.start_ms, segment.end_ms, segment.split_reason) for segment in segments] == [
+        (300, 2300, "vad_silero"),
+        (2300, 4300, "vad_silero_hard_split"),
+        (4300, 5400, "vad_silero_hard_split"),
+    ]
+
+
+def test_silero_post_processing_merges_short_padded_islands_for_asr_context() -> None:
+    segments = post_process_speech_intervals(
+        [(1000, 2200), (3600, 4700), (8000, 9300)],
+        audio_duration_ms=12000,
+        min_speech_duration_ms=250,
+        min_silence_duration_ms=500,
+        speech_padding_ms=300,
+        target_min_chunk_ms=5000,
+        preferred_max_chunk_ms=7000,
+        hard_max_chunk_ms=7000,
+        merge_gap_ms=300,
+    )
+
+    assert [(segment.start_ms, segment.end_ms) for segment in segments] == [(700, 5000), (7700, 9600)]
 
 
 def _write_wav(path: Path, chunks: list[tuple[str, int]], sample_rate: int = 1000) -> None:

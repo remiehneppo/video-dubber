@@ -109,9 +109,49 @@ class OpenAICompatibleLLMProvider:
                 content=content,
                 body=response.text,
             ) from exc
-        if not isinstance(parsed, dict):
-            raise ValueError("LLM JSON response must be an object")
-        return parsed
+        normalized = self._normalize_structured_json(parsed, schema=schema)
+        if normalized is None:
+            preview = self._preview(content)
+            body_preview = self._preview(response.text)
+            logger.error(
+                "llm json response was not an object type=%s content_preview=%r body_preview=%r",
+                type(parsed).__name__,
+                preview,
+                body_preview,
+            )
+            raise LLMStructuredOutputError(
+                f"LLM JSON response must be an object: {preview}",
+                content=content,
+                body=response.text,
+            )
+        return normalized
+
+    def _normalize_structured_json(self, parsed: Any, *, schema: dict[str, Any]) -> dict[str, Any] | None:
+        if isinstance(parsed, dict):
+            return parsed
+        array_property = self._single_required_array_property(schema)
+        if isinstance(parsed, list) and array_property is not None:
+            logger.warning(
+                "llm returned a top-level JSON array; wrapping it in schema property %s",
+                array_property,
+            )
+            return {array_property: parsed}
+        return None
+
+    def _single_required_array_property(self, schema: dict[str, Any]) -> str | None:
+        if schema.get("type") != "object":
+            return None
+        required = schema.get("required")
+        properties = schema.get("properties")
+        if not isinstance(required, list) or len(required) != 1 or not isinstance(properties, dict):
+            return None
+        property_name = required[0]
+        if not isinstance(property_name, str):
+            return None
+        property_schema = properties.get(property_name)
+        if not isinstance(property_schema, dict) or property_schema.get("type") != "array":
+            return None
+        return property_name
 
     async def close(self) -> None:
         if self.client is not None:

@@ -20,7 +20,7 @@ def plan_segment_duration(
     speedup_soft_limit: float = 1.2,
     speedup_hard_limit: float = 1.3,
     rephrase_already_attempted: bool = False,
-    max_overflow_ms: int = 800,
+    max_overflow_ms: int = 0,
 ) -> SegmentDurationPlan:
     if orig_duration_ms <= 0:
         raise ValueError("orig_duration_ms must be positive")
@@ -31,10 +31,10 @@ def plan_segment_duration(
     if ratio < 1.0:
         return SegmentDurationPlan(
             segment_id=segment_id,
-            action="time_stretch",
-            stretch_ratio=ratio,
+            action="pad_silence",
+            stretch_ratio=1.0,
             overflow_ms=0,
-            warnings=["tts_duration_stretched_to_original"],
+            warnings=["tts_duration_shorter_than_source"],
         )
     if ratio == 1.0:
         return SegmentDurationPlan(
@@ -44,6 +44,16 @@ def plan_segment_duration(
             overflow_ms=0,
             warnings=[],
         )
+    overflow_ms = tts_duration_ms - orig_duration_ms
+    if overflow_ms <= max_overflow_ms:
+        return SegmentDurationPlan(
+            segment_id=segment_id,
+            action="overflow",
+            stretch_ratio=1.0,
+            overflow_ms=overflow_ms,
+            warnings=["tts_duration_overflow_into_source_silence"] if overflow_ms > 0 else [],
+        )
+
     if ratio <= speedup_soft_limit:
         return SegmentDurationPlan(
             segment_id=segment_id,
@@ -61,7 +71,6 @@ def plan_segment_duration(
             warnings=["tts_duration_near_hard_limit"],
         )
 
-    overflow_ms = tts_duration_ms - orig_duration_ms
     if rephrase_already_attempted and overflow_ms <= max_overflow_ms:
         return SegmentDurationPlan(
             segment_id=segment_id,
