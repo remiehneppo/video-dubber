@@ -84,9 +84,17 @@ async def produce_provider_tts_segment(
     clipping_peak_threshold: int = 32760,
     max_clipped_sample_ratio: float = 0.001,
     next_segment_start_ms: int | None = None,
+    max_overflow_ms: int = 6_000,
+    overflow_reserve_ms: int = 120,
 ) -> dict[str, Any]:
     segment_id = str(segment["segment_id"])
     raw_audio_path = paths.tts_dir / f"{segment_id}.raw.wav"
+    overflow_budget_ms = _overflow_budget_ms(
+        segment,
+        next_segment_start_ms,
+        max_overflow_ms=max_overflow_ms,
+        overflow_reserve_ms=overflow_reserve_ms,
+    )
     if not text.strip():
         tts_duration_ms = int(segment["duration_ms"])
         synthesize_silence_wav(raw_audio_path, tts_duration_ms)
@@ -101,6 +109,7 @@ async def produce_provider_tts_segment(
             final_text="",
             source_text=text,
             max_speedup_ratio=max_speedup_ratio,
+            max_overflow_ms=overflow_budget_ms,
         )
 
     tts_voice = voice if voice != "default" else getattr(provider_bundle.tts, "voice", voice)
@@ -112,7 +121,6 @@ async def produce_provider_tts_segment(
     provider_metadata: dict[str, Any] = {}
     last_report: TTSQualityReport | None = None
     orig_ms = int(segment["duration_ms"])
-    overflow_budget_ms = _overflow_budget_ms(segment, next_segment_start_ms)
 
     while True:
         for _ in range(max(1, quality_retry_attempts)):
@@ -213,7 +221,8 @@ async def produce_provider_tts_segment(
         if rephrase_count >= rephrase_attempts:
             raise ValueError(
                 f"{segment_id}: tts_duration_exceeds_max_speedup "
-                f"duration_ms={tts_duration_ms} target_ms={orig_ms} available_ms={available_ms} "
+                f"duration_ms={tts_duration_ms} source_window_ms={orig_ms} "
+                f"available_overflow_ms={overflow_budget_ms} target_window_ms={available_ms} "
                 f"required_speedup_ratio={required_speedup_ratio:.3f} "
                 f"max_speedup_ratio={max_speedup_ratio:.3f} rms={last_report.rms} "
                 f"max_internal_silence_ms={last_report.max_internal_silence_ms} "
@@ -280,6 +289,8 @@ def _align_segment(
         "alignment_action": timing_plan.action,
         "stretch_ratio": timing_plan.stretch_ratio,
         "overflow_ms": timing_plan.overflow_ms,
+        "available_overflow_ms": max_overflow_ms,
+        "target_window_ms": orig_ms + max_overflow_ms,
         "raw_audio_path": paths.to_relative(raw_audio_path),
         "audio_path": paths.to_relative(aligned_audio_path),
         "warnings": timing_plan.warnings,
@@ -298,13 +309,19 @@ def _align_segment(
     return row
 
 
-def _overflow_budget_ms(segment: dict[str, Any], next_segment_start_ms: int | None) -> int:
+def _overflow_budget_ms(
+    segment: dict[str, Any],
+    next_segment_start_ms: int | None,
+    *,
+    max_overflow_ms: int,
+    overflow_reserve_ms: int,
+) -> int:
     if next_segment_start_ms is None:
         return 0
     target_start_ms = int(segment["start_ms"]) + 500
     orig_ms = int(segment["duration_ms"])
-    available_ms = max(0, next_segment_start_ms - target_start_ms)
-    return max(0, available_ms - orig_ms)
+    available_ms = max(0, next_segment_start_ms - target_start_ms - max(0, overflow_reserve_ms))
+    return min(max(0, max_overflow_ms), max(0, available_ms - orig_ms))
 
 
 def _target_end_ms(
@@ -317,7 +334,7 @@ def _target_end_ms(
         return int(segment["start_ms"]) + 500 + tts_duration_ms
     if action == "time_stretch_overflow":
         return int(segment["start_ms"]) + 500 + int(segment["duration_ms"]) + overflow_ms
-    return int(segment["end_ms"])
+    return int(segment["start_ms"]) + 500 + int(segment["duration_ms"])
 
 
 def _tts_quality_error(

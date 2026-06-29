@@ -61,6 +61,8 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
                 "  clipping_peak_threshold: 32700",
                 "  max_clipped_sample_ratio: 0.002",
                 "  clause_pause_threshold_ms: 850",
+                "  max_overflow_ms: 4200",
+                "  overflow_reserve_ms: 180",
             ]
         ),
         encoding="utf-8",
@@ -107,6 +109,8 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
     assert config.tts_service.clipping_peak_threshold == 32700
     assert config.tts_service.max_clipped_sample_ratio == 0.002
     assert config.tts_service.clause_pause_threshold_ms == 850
+    assert config.tts_service.max_overflow_ms == 4200
+    assert config.tts_service.overflow_reserve_ms == 180
     assert config.input.allowed_extensions == [".mp4", ".mkv", ".mov"]
 
 

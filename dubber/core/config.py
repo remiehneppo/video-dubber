@@ -133,6 +133,8 @@ def load_config(path: Path | str) -> DubberConfig:
             clipping_peak_threshold=int(tts_service.get("clipping_peak_threshold", 32760)),
             max_clipped_sample_ratio=float(tts_service.get("max_clipped_sample_ratio", 0.001)),
             clause_pause_threshold_ms=int(tts_service.get("clause_pause_threshold_ms", 700)),
+            max_overflow_ms=int(tts_service.get("max_overflow_ms", 6_000)),
+            overflow_reserve_ms=int(tts_service.get("overflow_reserve_ms", 120)),
         ),
     )
 

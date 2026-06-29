@@ -373,6 +373,14 @@ class JobManager:
             }
             source_text = str(transcript_by_id.get(segment_id, {}).get("source_text", ""))
             translated_text = str(translations_by_id.get(segment_id, {}).get("vi_text", ""))
+            ordered_segments = sorted(segments, key=lambda item: int(item["start_ms"]))
+            segment_index = ordered_segments.index(segment)
+            next_segment_start_ms = (
+                int(ordered_segments[segment_index + 1]["start_ms"]) + 500
+                if segment_index + 1 < len(ordered_segments)
+                else duration_ms
+            )
+            tts_config = config.tts_service
             row = asyncio.run(
                 produce_provider_tts_segment(
                     paths=paths,
@@ -380,6 +388,18 @@ class JobManager:
                     text="" if not source_text.strip() else translated_text,
                     provider_bundle=ctx.require_provider_bundle(),
                     ffmpeg=self.ffmpeg,
+                    quality_retry_attempts=tts_config.quality_retry_attempts,
+                    rephrase_attempts=tts_config.rephrase_attempts,
+                    max_speedup_ratio=tts_config.max_speedup_ratio,
+                    min_rms=tts_config.min_rms,
+                    silence_rms_threshold=tts_config.silence_rms_threshold,
+                    max_edge_silence_ms=tts_config.max_edge_silence_ms,
+                    max_internal_silence_ms=tts_config.max_internal_silence_ms,
+                    clipping_peak_threshold=tts_config.clipping_peak_threshold,
+                    max_clipped_sample_ratio=tts_config.max_clipped_sample_ratio,
+                    next_segment_start_ms=next_segment_start_ms,
+                    max_overflow_ms=tts_config.max_overflow_ms,
+                    overflow_reserve_ms=tts_config.overflow_reserve_ms,
                 )
             )
         else:

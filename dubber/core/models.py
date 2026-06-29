@@ -143,6 +143,8 @@ class TTSServiceConfig:
     clipping_peak_threshold: int = 32760
     max_clipped_sample_ratio: float = 0.001
     clause_pause_threshold_ms: int = 700
+    max_overflow_ms: int = 6_000
+    overflow_reserve_ms: int = 120
 
 
 @dataclass(frozen=True)

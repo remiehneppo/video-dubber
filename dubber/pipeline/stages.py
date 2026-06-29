@@ -813,6 +813,8 @@ def run_tts(
                     clipping_peak_threshold=tts_config.clipping_peak_threshold,
                     max_clipped_sample_ratio=tts_config.max_clipped_sample_ratio,
                     clause_pause_threshold_ms=tts_config.clause_pause_threshold_ms,
+                    max_overflow_ms=tts_config.max_overflow_ms,
+                    overflow_reserve_ms=tts_config.overflow_reserve_ms,
                     next_segment_start_ms=(
                         int(work_items[index].segment["start_ms"]) + 500
                         if index < len(work_items) else duration_ms
@@ -907,6 +909,10 @@ def run_mixing(ctx: StageContext, copied_input: Path, tts_audio: Path, duration_
         )
         ctx.ffmpeg.burn_in_subtitles(muxed_video, subtitle_ass_path, output_video)
     qa_path = ctx.paths.output_dir / f"{copied_input.stem}_vi.qa.json"
+    tts_manifest_path = ctx.paths.artifact_path("tts_manifest.v1.json")
+    tts_manifest = read_json(tts_manifest_path) if tts_manifest_path.exists() else {"segments": []}
+    tts_segments = list(tts_manifest.get("segments", []))
+    overflow_values = [int(segment.get("overflow_ms", 0)) for segment in tts_segments]
     write_json_atomic(
         qa_path,
         {
@@ -917,8 +923,8 @@ def run_mixing(ctx: StageContext, copied_input: Path, tts_audio: Path, duration_
             "segments_total": len(ctx.artifact_json("segments.v1.json")["segments"]),
             "low_confidence_segments": 0,
             "glossary_terms": 1,
-            "tts_overflow_segments": 0,
-            "max_overflow_ms": 0,
+            "tts_overflow_segments": sum(1 for value in overflow_values if value > 0),
+            "max_overflow_ms": max(overflow_values, default=0),
             "sync_drift_p95_ms": 0,
             "warnings": [],
         },

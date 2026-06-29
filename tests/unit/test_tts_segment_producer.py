@@ -333,11 +333,45 @@ def test_produce_provider_tts_segment_uses_silence_and_mild_speedup_before_rephr
     )
 
     assert row["alignment_action"] == "time_stretch_overflow"
-    assert row["stretch_ratio"] == 1.134
-    assert row["overflow_ms"] == 500
+    assert row["stretch_ratio"] == 1.232
+    assert row["overflow_ms"] == 380
     assert row["target_start_ms"] == 1500
-    assert row["target_end_ms"] == 3000
+    assert row["target_end_ms"] == 2880
     assert row["rephrase_attempts"] == 0
+    assert providers.llm.calls == []
+
+
+def test_produce_provider_tts_segment_respects_overflow_cap_and_reserve(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_overflow_cap")
+    segment = {
+        "segment_id": "seg_000001",
+        "start_ms": 1000,
+        "end_ms": 2000,
+        "duration_ms": 1000,
+    }
+    tts = SequenceProviderTTS([1400])
+    providers = ProviderBundle(asr=None, llm=FakeLLM("Không được gọi."), tts=tts)
+
+    row = asyncio.run(
+        produce_provider_tts_segment(
+            paths=paths,
+            segment=segment,
+            text="Nội dung vừa đủ dài.",
+            provider_bundle=providers,
+            ffmpeg=FakeFFmpeg(),
+            next_segment_start_ms=3000,
+            max_overflow_ms=250,
+            overflow_reserve_ms=200,
+            max_speedup_ratio=1.3,
+        )
+    )
+
+    assert row["available_overflow_ms"] == 250
+    assert row["target_window_ms"] == 1250
+    assert row["alignment_action"] == "time_stretch_overflow"
+    assert row["overflow_ms"] == 250
+    assert row["target_end_ms"] == 2750
+    assert row["stretch_ratio"] == 1.12
     assert providers.llm.calls == []
 
 
@@ -467,9 +501,11 @@ def test_provider_tts_uses_trailing_silence_then_only_required_speedup(tmp_path:
     assert llm.calls == []
     assert tts.texts == ["Về cuối, xe chậm lại nên đường cong thoải dần."]
     assert row["alignment_action"] == "time_stretch_overflow"
-    assert row["stretch_ratio"] == 1.051
-    assert row["overflow_ms"] == 3840
-    assert row["target_end_ms"] == 8560
+    assert row["stretch_ratio"] == 1.07
+    assert row["available_overflow_ms"] == 3720
+    assert row["target_window_ms"] == 6940
+    assert row["overflow_ms"] == 3720
+    assert row["target_end_ms"] == 8440
     with wave.open(str(paths.root / row["audio_path"]), "rb") as wav:
         aligned_duration_ms = int(wav.getnframes() * 1000 / wav.getframerate())
-    assert 7000 <= aligned_duration_ms <= 7100
+    assert 6900 <= aligned_duration_ms <= 7000

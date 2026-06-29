@@ -194,6 +194,12 @@ tts_service:
   # 3) time-stretch chỉ phần còn vượt trên cửa sổ kết hợp;
   # 4) rephrase nếu tỷ lệ cần thiết vẫn vượt giới hạn này.
   max_speedup_ratio: 1.3
+  # Lượng silence tối đa sau voice gốc mà TTS được phép dùng trước khi phải
+  # time-stretch/rephrase. Giá trị này ngăn một câu kéo quá xa vào khoảng nghỉ dài.
+  max_overflow_ms: 6000
+  # Khoảng đệm giữ lại trước target_start của TTS kế tiếp để tránh overlap/click
+  # khi provider hoặc FFmpeg đo duration lệch vài frame.
+  overflow_reserve_ms: 120
 
   # RMS tối thiểu để không coi audio là gần-im-lặng (PCM16 scale).
   min_rms: 500
