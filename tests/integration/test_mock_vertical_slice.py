@@ -208,6 +208,66 @@ def test_resume_recovers_from_tts_crash_injection(tmp_path: Path, capsys) -> Non
     assert main(["validate", "--workspace", str(workspace), "--job", job_id]) == 0
 
 
+def test_resume_repairs_earliest_invalid_artifact_and_completed_resume_is_noop(tmp_path: Path, capsys) -> None:
+    input_video = tmp_path / "auto-resume.mp4"
+    workspace = tmp_path / "workspace"
+    _make_sample_video(input_video)
+    assert main(["run", "--input", str(input_video), "--workspace", str(workspace), "--provider-mode", "mock", "--no-glossary-review"]) == 0
+    initial = json.loads(capsys.readouterr().out)
+    job_dir = workspace / initial["job_id"]
+    translated = job_dir / "artifacts" / "translated.v1.json"
+    translated.write_text("{}", encoding="utf-8")
+
+    assert main(["resume", "--workspace", str(workspace), "--job", initial["job_id"]]) == 0
+    repaired = json.loads(capsys.readouterr().out)
+    assert repaired["status"] == "completed"
+    before = (job_dir / "job_state.json").read_text(encoding="utf-8")
+    assert main(["resume", "--workspace", str(workspace), "--job", initial["job_id"]]) == 0
+    capsys.readouterr()
+    assert (job_dir / "job_state.json").read_text(encoding="utf-8") == before
+
+
+def test_batch_run_processes_two_videos_with_shared_glossary(tmp_path: Path, capsys) -> None:
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir()
+    _make_sample_video(input_dir / "b.mp4")
+    _make_sample_video(input_dir / "a.mp4")
+    workspace = tmp_path / "workspace"
+
+    assert main(["batch", "run", "--input-dir", str(input_dir), "--workspace", str(workspace), "--provider-mode", "mock", "--no-glossary-review"]) == 0
+    summary = json.loads(capsys.readouterr().out)
+
+    assert summary["status"] == "completed"
+    assert [job["input_name"] for job in summary["jobs"]] == ["a.mp4", "b.mp4"]
+    for job in summary["jobs"]:
+        output = Path(summary["workspace"]) / "jobs" / job["job_id"] / job["output_video"]
+        assert output.exists()
+        assert _has_audio_stream(output)
+    assert (Path(summary["workspace"]) / "artifacts" / "glossary.locked.json").exists()
+    assert main(["batch", "validate", "--workspace", str(workspace), "--batch", summary["batch_id"]]) == 0
+
+
+def test_batch_review_resume_uses_locked_shared_glossary(tmp_path: Path, capsys) -> None:
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir()
+    _make_sample_video(input_dir / "review.mp4")
+    workspace = tmp_path / "workspace"
+
+    assert main(["batch", "run", "--input-dir", str(input_dir), "--workspace", str(workspace), "--provider-mode", "mock", "--glossary-review"]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    root = Path(summary["workspace"])
+    assert summary["status"] == "waiting_review"
+    draft = json.loads((root / "artifacts" / "glossary.draft.json").read_text(encoding="utf-8"))
+    draft["status"] = "locked"
+    for term in draft["terms"]:
+        term["locked"] = True
+    (root / "artifacts" / "glossary.locked.json").write_text(json.dumps(draft), encoding="utf-8")
+
+    assert main(["batch", "resume", "--workspace", str(workspace), "--batch", summary["batch_id"]]) == 0
+    resumed = json.loads(capsys.readouterr().out)
+    assert resumed["status"] == "completed"
+
+
 def _make_sample_video(path: Path) -> None:
     subprocess.run(
         [

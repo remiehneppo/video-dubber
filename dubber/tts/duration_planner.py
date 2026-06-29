@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,21 @@ def plan_segment_duration(
             overflow_ms=overflow_ms,
             warnings=["tts_duration_overflow_into_source_silence"] if overflow_ms > 0 else [],
         )
+
+    available_ms = orig_duration_ms + max_overflow_ms
+    if max_overflow_ms > 0:
+        combined_ratio = round(tts_duration_ms / available_ms, 4)
+        if combined_ratio <= speedup_hard_limit:
+            warnings = ["tts_duration_uses_source_silence_and_time_stretch"]
+            if combined_ratio > speedup_soft_limit:
+                warnings.append("tts_duration_near_hard_limit")
+            return SegmentDurationPlan(
+                segment_id=segment_id,
+                action="time_stretch_overflow",
+                stretch_ratio=ceil(combined_ratio * 1000) / 1000,
+                overflow_ms=max_overflow_ms,
+                warnings=warnings,
+            )
 
     if ratio <= speedup_soft_limit:
         return SegmentDurationPlan(

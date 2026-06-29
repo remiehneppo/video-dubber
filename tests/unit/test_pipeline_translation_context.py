@@ -211,6 +211,65 @@ def test_translation_retries_block_when_target_segments_are_missing(tmp_path: Pa
     assert translated["segments"][-1]["vi_text"] == "retry::seg_000009"
 
 
+
+class PartialTranslationLLMProvider:
+    def __init__(self) -> None:
+        self.target_ids_by_call: list[list[str]] = []
+
+    async def complete_json(self, system_prompt: str, user_prompt: str, schema: dict) -> dict:
+        payload = json.loads(user_prompt)
+        target_ids = [str(item["segment_id"]) for item in payload["target_segments"]]
+        self.target_ids_by_call.append(target_ids)
+        returned = target_ids[:2] if len(self.target_ids_by_call) == 1 else target_ids
+        return {
+            "segments": [
+                {
+                    "segment_id": segment_id,
+                    "vi_text": f"partial::{segment_id}",
+                    "used_terms": [],
+                    "length_ratio": 1.0,
+                    "translation_warnings": [],
+                }
+                for segment_id in returned
+            ]
+        }
+
+
+def test_translation_retries_only_missing_segments_and_merges_partial_result(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_partial_retry")
+    segments = [
+        {"segment_id": f"seg_{index:06d}", "start_ms": (index - 1) * 1000, "end_ms": index * 1000}
+        for index in range(1, 5)
+    ]
+    _write_segments(paths, segments)
+    _write_transcript(paths, segments)
+    paths.artifact_path("glossary.locked.json").write_text(
+        json.dumps({"schema_version": "1.0", "domain": "seo", "status": "locked", "terms": []}),
+        encoding="utf-8",
+    )
+    store = CheckpointStore.create(paths.job_state_file, job_id="job_partial_retry", input_file=Path("input/video.mp4"))
+    manifest = ArtifactManifest.create("job_partial_retry", paths.manifest_file)
+    llm = PartialTranslationLLMProvider()
+    ctx = StageContext(
+        paths=paths,
+        store=store,
+        manifest=manifest,
+        ffmpeg=None,
+        provider_mode="openai_compatible",
+        provider_bundle=ProviderBundle(asr=object(), llm=llm, tts=object()),
+        config=DubberConfig(project=ProjectConfig(domain="seo")),
+    )
+
+    run_translation(ctx)
+
+    assert llm.target_ids_by_call == [
+        ["seg_000001", "seg_000002", "seg_000003", "seg_000004"],
+        ["seg_000003", "seg_000004"],
+    ]
+    translated = json.loads(paths.artifact_path("translated.v1.json").read_text(encoding="utf-8"))
+    assert [item["segment_id"] for item in translated["segments"]] == [item["segment_id"] for item in segments]
+
+
 def _write_segments(paths: WorkspacePaths, segments: list[dict[str, object]]) -> None:
     paths.artifact_path("segments.v1.json").write_text(
         json.dumps(

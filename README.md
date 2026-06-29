@@ -79,6 +79,57 @@ python3 cli.py rerun --job <job_id> --stage translation
 python3 cli.py rerun-segment --job <job_id> --stage tts --segment seg_000001
 ```
 
+## Batch Processing
+
+Process every supported video directly inside one directory (non-recursive):
+
+```bash
+dubber batch run --input-dir ./videos --workspace workspace --provider-mode mock --no-glossary-review
+```
+
+A batch is stored at `workspace/batch_<id>/` with `batch_state.json`,
+`batch_manifest.json`, shared glossary files under `artifacts/`, and independent
+job workspaces under `jobs/`. Inputs are sorted by filename and copied into each
+job, so later resume operations do not depend on the source directory.
+
+`runtime.max_parallel_jobs` controls the number of videos processed at once and
+defaults to `1`. Each worker creates its own job manager and provider context.
+One failed video does not stop the remaining videos; the final batch status is
+`partial_failed` when completed and failed jobs coexist.
+
+For a reviewed shared glossary:
+
+```bash
+dubber batch run --input-dir ./videos --glossary-review
+# Review artifacts/glossary.draft.json and save artifacts/glossary.locked.json
+dubber batch resume --batch batch_<id>
+```
+
+Inspect or validate a batch with:
+
+```bash
+dubber batch status --batch batch_<id>
+dubber batch validate --batch batch_<id>
+```
+
+Use repeated `--job` options to resume selected jobs. With no `--job`, resume
+selects every unfinished job. `--from-stage` forces invalidation of that stage
+and all downstream job artifacts; without `--job` it applies to the whole
+batch. Re-running ASR or an earlier stage never rebuilds the already locked
+batch glossary.
+
+## Checkpoints And Resume
+
+`dubber resume --job <id>` finds the earliest incomplete stage or the first
+stage whose manifest checksum is invalid. A completed, valid job is a no-op.
+Use `--from-stage asr` (or another stage) to explicitly reset that stage and all
+downstream artifacts while retaining valid upstream work.
+
+ASR and TTS persist per-segment checkpoints. Glossary and translation persist a
+checkpoint and response artifact after every provider block. Resume loads these
+files, discards completed units whose referenced artifact is missing, and only
+calls providers for the remaining units.
+
 ## Web Monitor
 
 ```bash
@@ -88,6 +139,8 @@ dubber web --workspace workspace --host 127.0.0.1 --port 8080
 
 API endpoints:
 
+- `GET /api/batches`
+- `GET /api/batches/{batch_id}`
 - `GET /api/jobs`
 - `GET /api/jobs/{job_id}`
 - `GET /api/jobs/{job_id}/qa`

@@ -49,5 +49,22 @@ class CheckpointStore:
             updated_at=utc_now_iso(),
         )
 
+    def reset_from(self, stage: StageName) -> None:
+        reset = False
+        stages = dict(self.state.stages)
+        for candidate in StageName:
+            if candidate == stage:
+                reset = True
+            if reset:
+                stages[candidate] = StageProgress()
+        self.state = replace(
+            self.state,
+            status=JobStatus.RUNNING,
+            current_stage=stage,
+            stages=stages,
+            last_error=None,
+            updated_at=utc_now_iso(),
+        )
+
     def save(self) -> None:
         write_json_atomic(self.state_path, self.state.to_dict())

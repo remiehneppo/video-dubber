@@ -1,113 +1,211 @@
+# Video Dubber - cấu hình mẫu đầy đủ
+#
+# Quy ước:
+# - Các giá trị *_ms dùng mili-giây; *_sec dùng giây; *_mb dùng MiB gần đúng.
+# - Biến môi trường dạng ${NAME} được thay thế trước khi parse YAML.
+# - CLI --workspace, --domain và --glossary-review/--no-glossary-review có thể
+#   ghi đè một số giá trị bên dưới cho lần chạy hiện tại.
+# - provider-mode=mock không cần các API endpoint. provider-mode=openai_compatible
+#   yêu cầu base_url và api_key cho cả ASR, LLM và TTS.
+
 project:
+  # Tên logic của dự án; được giữ trong config để nhận diện deployment.
   name: video-dubber
+  # Container đầu ra mong muốn. Pipeline hiện mux video thành MP4.
   output_format: mp4
+  # Chủ đề dùng trong prompt glossary và translation.
   domain: mathematics
+  # Giá trị mặc định mang tính mô tả; job hiện ghi output bên trong workspace job.
   output_dir: ./output
+  # Workspace mặc định. CLI --workspace là nguồn quyết định khi chạy lệnh.
   workspace_dir: ./workspace
 
 runtime:
+  # Số video tối đa chạy đồng thời trong một batch. Mỗi worker có JobManager và
+  # provider context riêng. Đặt 1 để chạy tuần tự và giảm tải GPU/API.
   max_parallel_jobs: 1
+  # Giới hạn concurrency dự kiến theo provider. Pipeline hiện checkpoint và gọi
+  # tuần tự trong mỗi job; các field này dành cho executor song song nội bộ sau này.
   asr_concurrency: 4
   llm_concurrency: 2
   tts_concurrency: 4
+  # Số lần thử tối đa cho lỗi transport, HTTP 429/5xx; translation cũng dùng giá
+  # trị này khi model trả thiếu segment ID.
   retry_max_attempts: 3
+  # Thời gian chờ cố định giữa các lần retry provider.
   retry_backoff_sec: 2
+  # Timeout cho mỗi HTTP request ASR/LLM/TTS.
   request_timeout_sec: 120
 
 input:
+  # Chỉ batch-scan file trực tiếp trong thư mục, không quét đệ quy.
   allowed_extensions: [".mp4", ".mkv", ".mov"]
+  # Từ chối input lớn hơn giới hạn này trước khi tạo job.
   max_file_size_mb: 4096
+  # Giới hạn thời lượng khai báo. Hiện loader đọc field này nhưng validation thời
+  # lượng chưa được áp dụng; không nên dựa vào nó như một hard limit.
   max_duration_minutes: 180
 
 vad:
+  # asr_context_chunks: detector biên độ nhẹ, không cần model ngoài.
+  # silero_vad: dùng ONNX Silero, cần onnxruntime và model bên dưới.
   mode: asr_context_chunks
+  # Kích thước frame phân tích cho detector biên độ.
   frame_ms: 100
+  # Ngưỡng năng lượng tương đối của detector asr_context_chunks.
   threshold_ratio: 0.08
+  # Alias/giới hạn duration cũ, vẫn được loader hỗ trợ để tương thích config.
   min_duration_ms: 900
   max_duration_ms: 90000
+  # Speech ngắn hơn ngưỡng này có thể bị loại hoặc ghép.
   min_speech_duration_ms: 700
+  # Mục tiêu kích thước ASR chunk: ưu tiên ít nhất target_min, cố giữ dưới
+  # preferred_max và tuyệt đối không vượt hard_max nếu có điểm cắt hợp lệ.
   target_min_chunk_ms: 20000
   preferred_max_chunk_ms: 45000
   hard_max_chunk_ms: 90000
+  # Khoảng im lặng dùng để quyết định ghép/cắt chunk ASR.
   silence_merge_threshold_ms: 2500
+  # Audio context thêm quanh speech chunk để tránh cắt mất âm đầu/cuối.
   context_padding_ms: 1500
+  # Cho phép cắt mềm tại vị trí không hoàn hảo khi chunk sắp vượt hard max.
   soft_split_allowed: true
-  # Optional Silero backend. Keep mode as asr_context_chunks unless onnxruntime
-  # is installed. The ONNX model downloads automatically on first use.
+
+  # Đường dẫn và nguồn tải model Silero ONNX.
   silero_model_path: models/silero_vad.onnx
   silero_model_url: https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx
+  # Tự tải model khi mode=silero_vad và file chưa tồn tại.
   silero_auto_download: true
+  # Xác suất speech tối thiểu từ Silero.
   silero_threshold: 0.5
+  # Silence tối thiểu để đóng một vùng speech Silero.
   min_silence_duration_ms: 500
+  # Padding trước/sau vùng speech Silero.
   speech_padding_ms: 250
+  # Giới hạn một chunk do backend Silero tạo.
   max_vad_chunk_ms: 30000
+  # Ghép hai vùng speech nếu khoảng cách không vượt giá trị này.
   merge_gap_ms: 300
 
 translation:
+  # true: dừng ở glossary.draft.json chờ người dùng tạo glossary.locked.json.
+  # CLI có thể ghi đè bằng --glossary-review hoặc --no-glossary-review.
   glossary_review: true
-  min_context_words: 120
-  max_context_words: 350
-  context_overlap_words: 40
-  target_segment_count: 6
+  # Block translation tích lũy ít nhất số từ này nếu chưa chạm giới hạn segment.
+  min_context_words: 128
+  # Không thêm target segment mới nếu tổng block vượt gần ngưỡng này.
+  max_context_words: 256
+  # Số từ context-only lấy từ trước/sau block để giữ mạch văn. Các segment context
+  # không được dịch lại và không xuất hiện trong output của block.
+  context_overlap_words: 32
+  # Số target segment tối đa mong muốn trong một request LLM.
+  target_segment_count: 16
 
 transcript_segmentation:
-  target_min_segment_ms: 8000
-  preferred_max_segment_ms: 25000
-  max_segment_ms: 45000
+  # Thời lượng mục tiêu tối thiểu. Short tail vẫn có thể ngắn hơn tại cuối ASR
+  # chunk hoặc ranh giới câu tự nhiên; TTS sẽ tận dụng silence kế tiếp.
+  target_min_segment_ms: 16000
+  # Sau ngưỡng này, ưu tiên tách tại pause đủ dài.
+  preferred_max_segment_ms: 32000
+  # Hard limit; segment được tách khi đạt ngưỡng kể cả không có punctuation đẹp.
+  max_segment_ms: 64000
+  # Pause tối thiểu được xem là điểm tách tốt.
   min_pause_split_ms: 600
+  # true: ưu tiên kết thúc segment tại '.', '?' hoặc '!' sau target minimum.
   prefer_punctuation_split: true
 
 mixing:
-  original_ducking_db: -22
+  # Mức giảm âm lượng audio gốc khi trộn commentary; số âm giảm mạnh hơn.
+  original_ducking_db: -20
+  # Gain cộng cho track TTS trước khi mux.
   tts_boost_db: 8.0
+  # Chuẩn hóa loudness ở final mix để giảm chênh lệch âm lượng.
   final_loudness_normalization: true
 
 subtitles:
+  # Bật render subtitle từ transcript + translation.
   enabled: false
+  # Hiện chỉ hỗ trợ burn_in.
   mode: burn_in
+  # Giữ file .ass như artifact bên cạnh video output.
   output_sidecar: true
+  # Chiều cao subtitle tối đa theo tỷ lệ chiều cao video.
   max_height_ratio: 0.10
+  # Opacity nền subtitle, từ 0.0 đến 1.0.
   background_opacity: 0.50
+  # Font phải tồn tại trong môi trường FFmpeg/libass.
   font_family: Arial
+  # Kích thước font và lề dưới theo tỷ lệ kích thước video.
   font_size_ratio: 0.026
   bottom_margin_ratio: 0.035
+  # Cho phép hiển thị source/translation trong cue được render.
   source_enabled: true
   translation_enabled: true
+  # Cue dài hơn sẽ được chia; cue ngắn hơn được kéo tới minimum khi an toàn.
   max_cue_duration_ms: 4000
   min_cue_duration_ms: 700
+  # Mục tiêu wrap mỗi dòng subtitle.
   max_chars_per_line: 48
 
 asr_service:
+  # Chỉ openai_compatible được hỗ trợ trong provider-mode thật.
   provider: openai_compatible
+  # Endpoint gốc; adapter gọi POST {base_url}/audio/transcriptions.
   base_url: ${ASR_BASE_URL}
   api_key: ${ASR_API_KEY}
   model: whisper-1
+  # Ngôn ngữ gửi cho ASR. Pipeline hiện gọi English cho video nguồn.
   language: en
+  # prefer_word yêu cầu verbose_json + word timestamps khi provider hỗ trợ.
   timestamp_mode: prefer_word
+  # true: thiếu timestamp hợp lệ làm stage ASR lỗi.
   require_timestamps: true
+  # true: cho phép dùng toàn text chunk làm một timestamp unit khi provider không
+  # trả timestamps. Đặt false để tránh sync giả.
   allow_chunk_text_fallback: false
+  # Gửi vad_filter tới server ASR. Nên false khi pipeline đã tự VAD/chunk audio.
   vad_filter: false
 
 llm_service:
   provider: openai_compatible
+  # Endpoint gốc; adapter gọi POST {base_url}/chat/completions.
   base_url: ${LLM_BASE_URL}
   api_key: ${LLM_API_KEY}
   model: gpt-4o-mini
+  # Độ ngẫu nhiên mong muốn. Field hiện được load nhưng factory chưa forward tới
+  # adapter; model đang dùng behavior mặc định của endpoint.
   temperature: 0.3
 
 tts_service:
   provider: openai_compatible
+  # Endpoint gốc; adapter gọi POST {base_url}/audio/speech.
   base_url: ${TTS_BASE_URL}
   api_key: ${TTS_API_KEY}
   model: tts-1
+  # Tên voice gửi nguyên văn tới provider.
   voice: nova
+
+  # Số lần synthesize lại cùng text khi audio vi phạm quality gate.
   quality_retry_attempts: 3
+  # Số lần nhờ LLM rút gọn nếu audio vẫn không vừa toàn bộ cửa sổ khả dụng.
   rephrase_attempts: 2
+  # Tốc độ tăng tối đa. Scheduler ưu tiên theo thứ tự:
+  # 1) dùng duration câu gốc; 2) tràn vào silence trước TTS kế tiếp;
+  # 3) time-stretch chỉ phần còn vượt trên cửa sổ kết hợp;
+  # 4) rephrase nếu tỷ lệ cần thiết vẫn vượt giới hạn này.
   max_speedup_ratio: 1.3
+
+  # RMS tối thiểu để không coi audio là gần-im-lặng (PCM16 scale).
   min_rms: 500
+  # Sample/window RMS dưới ngưỡng này được xem là silence.
   silence_rms_threshold: 120
+  # Leading/trailing silence dài hơn ngưỡng sẽ được trim, giữ một mép nhỏ.
   max_edge_silence_ms: 1200
+  # Internal silence dài hơn ngưỡng sẽ được compact trước timing alignment.
   max_internal_silence_ms: 2500
+  # Ngưỡng biên độ PCM16 và tỷ lệ sample tối đa để phát hiện clipping.
   clipping_peak_threshold: 32760
   max_clipped_sample_ratio: 0.001
+  # Với word timestamps, pause dài hơn ngưỡng có thể tách một transcript segment
+  # thành nhiều TTS clause. Mỗi clause cũng được dùng silence trước clause kế tiếp.
   clause_pause_threshold_ms: 700

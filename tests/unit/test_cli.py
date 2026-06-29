@@ -10,7 +10,7 @@ from dubber.core.enums import StageName, StageStatus
 from dubber.core.io import write_json_atomic
 from dubber.core.paths import WorkspacePaths
 from dubber.orchestrator.checkpoint_store import CheckpointStore
-from dubber.pipeline.job_manager import JobManager
+from dubber.pipeline.job_manager import BatchManager, JobManager
 
 
 def test_jobs_lists_existing_job_ids(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -99,3 +99,17 @@ def test_job_manager_loads_resolved_config_path_for_resume(tmp_path: Path) -> No
     assert config.mixing.original_ducking_db == -31.0
     assert config.mixing.tts_boost_db == 11.0
     assert config.mixing.final_loudness_normalization is False
+
+
+
+def test_batch_scan_filters_non_video_and_sorts_stably(tmp_path: Path) -> None:
+    (tmp_path / "b.MP4").write_bytes(b"b")
+    (tmp_path / "A.mov").write_bytes(b"a")
+    (tmp_path / "notes.txt").write_text("ignore", encoding="utf-8")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "hidden.mp4").write_bytes(b"nested")
+
+    inputs = BatchManager().scan_inputs(tmp_path, [".mp4", ".mov"])
+
+    assert [path.name for path in inputs] == ["A.mov", "b.MP4"]

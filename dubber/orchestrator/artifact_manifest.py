@@ -104,6 +104,27 @@ class ArtifactManifest:
         path = self.manifest_path.parent / artifact.path
         return path.exists() and sha256_file(path) == artifact.sha256
 
+    def remove_from_stage(
+        self,
+        stage: StageName,
+        *,
+        delete_files: bool = True,
+        preserve_names: set[str] | None = None,
+    ) -> None:
+        stages = list(StageName)
+        affected = set(stages[stages.index(stage):])
+        retained: list[ArtifactEntry] = []
+        preserve_names = preserve_names or set()
+        for artifact in self.artifacts:
+            if artifact.name in preserve_names or artifact.created_by_stage not in affected:
+                retained.append(artifact)
+                continue
+            if delete_files:
+                path = self.manifest_path.parent / artifact.path
+                if path.is_file():
+                    path.unlink()
+        self.artifacts = retained
+
     def save(self) -> None:
         write_json_atomic(
             self.manifest_path,

@@ -83,3 +83,19 @@ def test_duration_planner_prefers_overflow_into_available_source_silence_over_sp
     assert plan.stretch_ratio == 1.0
     assert plan.overflow_ms == 150
     assert plan.warnings == ["tts_duration_overflow_into_source_silence"]
+
+
+
+def test_duration_planner_combines_source_duration_and_trailing_silence_before_speedup() -> None:
+    plan = plan_segment_duration(
+        "seg_000010",
+        orig_duration_ms=3220,
+        tts_duration_ms=7420,
+        speedup_hard_limit=1.3,
+        max_overflow_ms=3840,
+    )
+
+    assert plan.action == "time_stretch_overflow"
+    assert plan.stretch_ratio == 1.051
+    assert plan.overflow_ms == 3840
+    assert plan.warnings == ["tts_duration_uses_source_silence_and_time_stretch"]

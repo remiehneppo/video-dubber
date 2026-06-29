@@ -5,13 +5,12 @@ import json
 import logging
 import shutil
 from collections.abc import Awaitable
-from time import perf_counter
 from pathlib import Path
 
 from dubber.asr.timestamps import NormalizedASRTimestamps, TimestampUnit, normalize_asr_timestamps
 from dubber.audio.vad import VadConfig as AudioVadConfig, detect_segments
 from dubber.core.enums import StageName, StageStatus
-from dubber.core.io import write_json_atomic
+from dubber.core.io import read_json, write_json_atomic
 from dubber.orchestrator.segment_checkpoint_store import SegmentCheckpointStore
 from dubber.orchestrator.stage_artifacts import StageArtifacts
 from dubber.pipeline.stage_context import StageContext
@@ -349,150 +348,106 @@ def run_vad(ctx: StageContext) -> None:
 
 def run_asr(ctx: StageContext) -> None:
     segments = ctx.artifact_json("segments.v1.json")["segments"]
-    logger.info(
-        "stage asr started segments=%s provider_mode=%s source_audio=%s",
-        len(segments),
-        ctx.provider_mode,
-        ctx.paths.to_relative(ctx.paths.audio_dir / "vocals.wav"),
-    )
     publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
-    ctx.store.mark_stage(StageName.ASR, StageStatus.RUNNING, done=0, total=len(segments))
-    ctx.store.save()
-    segment_store = SegmentCheckpointStore.create(
-        ctx.paths.artifact_path("asr_segments.v1.json"),
-        stage=StageName.ASR.value,
-        segment_ids=[str(segment["segment_id"]) for segment in segments],
+    checkpoint_path = ctx.paths.artifact_path("asr_segments.v1.json")
+    segment_ids = [str(segment["segment_id"]) for segment in segments]
+    segment_store = SegmentCheckpointStore.load_or_create(
+        checkpoint_path, stage=StageName.ASR.value, segment_ids=segment_ids
     )
-    transcript_path = ctx.paths.artifact_path("transcript.v1.json")
-    transcript_segments: list[dict[str, object]] = []
-    asr_chunks: list[dict[str, object]] = []
+    segment_store.invalidate_missing_artifacts(ctx.paths.root)
+    segment_store.save()
+    ctx.store.mark_stage(
+        StageName.ASR,
+        StageStatus.RUNNING,
+        done=segment_store.done_count,
+        total=len(segments),
+    )
+    ctx.store.save()
     source_audio = ctx.paths.audio_dir / "vocals.wav"
     provider_bundle = ctx.require_provider_bundle() if ctx.provider_mode == "openai_compatible" else None
-    stage_started = perf_counter()
+
     for index, segment in enumerate(segments, start=1):
         segment_id = str(segment["segment_id"])
+        checkpoint = segment_store.segments[segment_id]
         raw_path = ctx.paths.raw_dir / "asr" / f"{segment_id}.json"
+        if checkpoint.status == StageStatus.COMPLETED and raw_path.exists():
+            continue
+        try:
+            if ctx.provider_mode == "openai_compatible":
+                assert provider_bundle is not None
+                clip_path = ctx.paths.audio_dir / "asr" / f"{segment_id}.wav"
+                start_ms = int(segment["start_ms"])
+                end_ms = int(segment["end_ms"])
+                ctx.ffmpeg.extract_audio_segment(
+                    source_audio,
+                    clip_path,
+                    start_ms=start_ms,
+                    duration_ms=end_ms - start_ms,
+                )
+                result = asyncio.run(provider_bundle.asr.transcribe(clip_path, language="en"))
+                raw_payload = dict(result.raw)
+                if result.confidence is not None:
+                    raw_payload.setdefault("confidence", result.confidence)
+                write_json_atomic(raw_path, raw_payload)
+            else:
+                text = f"Mock transcript segment {index} for vertical slice."
+                write_json_atomic(raw_path, {"text": text, "confidence": 1.0})
+            segment_store.mark(
+                segment_id,
+                StageStatus.COMPLETED,
+                artifact=ctx.paths.to_relative(raw_path),
+            )
+            segment_store.save()
+            logger.info(
+                "stage asr segment completed segment=%s index=%s/%s progress=%.1f%% eta_ms=0",
+                segment_id,
+                index,
+                len(segments),
+                (segment_store.done_count / len(segments)) * 100 if segments else 100.0,
+            )
+            ctx.store.mark_stage(
+                StageName.ASR,
+                StageStatus.RUNNING,
+                done=segment_store.done_count,
+                total=len(segments),
+            )
+            ctx.store.save()
+        except Exception as exc:
+            segment_store.mark(segment_id, StageStatus.FAILED, error=str(exc))
+            segment_store.save()
+            raise
+
+    asr_chunks: list[dict[str, object]] = []
+    for segment in segments:
+        segment_id = str(segment["segment_id"])
+        raw_path = ctx.paths.raw_dir / "asr" / f"{segment_id}.json"
+        raw = read_json(raw_path)
+        confidence = float(raw.get("confidence", 1.0))
         if ctx.provider_mode == "openai_compatible":
-            assert provider_bundle is not None
-            clip_path = ctx.paths.audio_dir / "asr" / f"{segment_id}.wav"
-            start_ms = int(segment["start_ms"])
-            end_ms = int(segment["end_ms"])
-            duration_ms = end_ms - start_ms
-            logger.info(
-                "stage asr clip prepare segment=%s index=%s/%s start_ms=%s end_ms=%s duration_ms=%s output=%s",
-                segment_id,
-                index,
-                len(segments),
-                start_ms,
-                end_ms,
-                duration_ms,
-                ctx.paths.to_relative(clip_path),
-            )
-            ctx.ffmpeg.extract_audio_segment(
-                source_audio,
-                clip_path,
-                start_ms=start_ms,
-                duration_ms=duration_ms,
-            )
-            clip_size = clip_path.stat().st_size if clip_path.exists() else -1
-            logger.info(
-                "stage asr request start segment=%s index=%s/%s clip=%s clip_ms=%s clip_bytes=%s provider=%s model=%s",
-                segment_id,
-                index,
-                len(segments),
-                ctx.paths.to_relative(clip_path),
-                duration_ms,
-                clip_size,
-                ctx.provider_mode,
-                getattr(provider_bundle.asr, "model", "unknown") if provider_bundle is not None else "mock-asr",
-            )
-            request_started = perf_counter()
-            logger.info("stage asr provider call started segment=%s index=%s/%s", segment_id, index, len(segments))
-            try:
-                asr_result = asyncio.run(
-                    provider_bundle.asr.transcribe(
-                        clip_path,
-                        language="en",
-                    )
-                )
-            except Exception:
-                logger.exception(
-                    "stage asr provider call failed segment=%s index=%s/%s clip=%s clip_ms=%s raw=%s",
-                    segment_id,
-                    index,
-                    len(segments),
-                    ctx.paths.to_relative(clip_path),
-                    duration_ms,
-                    ctx.paths.to_relative(raw_path),
-                )
-                raise
-            request_duration_ms = int((perf_counter() - request_started) * 1000)
-            text = asr_result.text
-            confidence = asr_result.confidence if asr_result.confidence is not None else 1.0
-            write_json_atomic(raw_path, asr_result.raw)
-            normalized_timestamps = normalize_asr_timestamps(
-                asr_result.raw,
-                chunk_start_ms=start_ms,
-                chunk_end_ms=end_ms,
+            normalized = normalize_asr_timestamps(
+                raw,
+                chunk_start_ms=int(segment["start_ms"]),
+                chunk_end_ms=int(segment["end_ms"]),
                 require_timestamps=ctx.config.asr_service.require_timestamps,
                 allow_chunk_text_fallback=ctx.config.asr_service.allow_chunk_text_fallback,
             )
-            asr_chunks.append(
-                {
-                    "chunk_id": segment_id,
-                    "raw_response_path": ctx.paths.to_relative(raw_path),
-                    "timestamps": normalized_timestamps,
-                    "confidence": confidence,
-                }
-            )
-            logger.info(
-                "stage asr provider call completed segment=%s index=%s/%s request_duration_ms=%s text_chars=%s confidence=%s language=%s timestamp_source=%s timestamp_units=%s raw=%s",
-                segment_id,
-                index,
-                len(segments),
-                request_duration_ms,
-                len(text),
-                confidence,
-                asr_result.language,
-                normalized_timestamps.source,
-                len(normalized_timestamps.units),
-                ctx.paths.to_relative(raw_path),
-            )
         else:
-            text = f"Mock transcript segment {index} for vertical slice."
-            confidence = 1.0
-            write_json_atomic(raw_path, {"text": text, "confidence": confidence})
-            normalized_timestamps = NormalizedASRTimestamps(
+            text = str(raw.get("text", ""))
+            normalized = NormalizedASRTimestamps(
                 source="mock",
                 quality="mock",
                 units=[TimestampUnit(text=text, start_ms=int(segment["start_ms"]), end_ms=int(segment["end_ms"]))],
                 risk_flags=[],
             )
-            asr_chunks.append(
-                {
-                    "chunk_id": segment_id,
-                    "raw_response_path": ctx.paths.to_relative(raw_path),
-                    "timestamps": normalized_timestamps,
-                    "confidence": confidence,
-                }
-            )
-        elapsed_ms = int((perf_counter() - stage_started) * 1000)
-        average_ms = elapsed_ms / index
-        eta_ms = int(average_ms * max(0, len(segments) - index))
-        logger.info(
-            "stage asr segment completed segment=%s index=%s/%s text_chars=%s raw=%s progress=%.1f%% elapsed_ms=%s avg_segment_ms=%s eta_ms=%s",
-            segment_id,
-            index,
-            len(segments),
-            len(text),
-            ctx.paths.to_relative(raw_path),
-            (index / len(segments)) * 100 if segments else 100.0,
-            elapsed_ms,
-            int(average_ms),
-            eta_ms,
+        asr_chunks.append(
+            {
+                "chunk_id": segment_id,
+                "raw_response_path": ctx.paths.to_relative(raw_path),
+                "timestamps": normalized,
+                "confidence": confidence,
+            }
         )
-        segment_store.mark(segment_id, StageStatus.COMPLETED, artifact=ctx.paths.to_relative(raw_path))
-        segment_store.save()
+
     transcript_segments = build_transcript_segments(asr_chunks, ctx.config.transcript_segmentation)
     publisher.publish_file(
         stage=StageName.ASR,
@@ -516,99 +471,109 @@ def run_asr(ctx: StageContext) -> None:
         total=len(segments),
     )
 
-    logger.info("stage asr completed chunks=%s transcript_segments=%s artifact=artifacts/transcript.v1.json", len(segments), len(transcript_segments))
-
 
 def run_glossary(ctx: StageContext, *, glossary_review: bool) -> bool:
     domain = _effective_domain(ctx)
-    logger.info("stage glossary started review=%s provider_mode=%s domain=%s", glossary_review, ctx.provider_mode, domain)
     publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
-    ctx.store.mark_stage(StageName.GLOSSARY, StageStatus.RUNNING)
+    transcript = ctx.artifact_json("transcript.v1.json")
+    blocks = _translation_blocks(ctx, transcript["segments"])
+    block_ids = [f"block_{index:06d}" for index in range(1, max(1, len(blocks)) + 1)]
+    checkpoint = SegmentCheckpointStore.load_or_create(
+        ctx.paths.artifact_path("glossary_blocks.v1.json"),
+        stage=StageName.GLOSSARY.value,
+        segment_ids=block_ids,
+    )
+    checkpoint.invalidate_missing_artifacts(ctx.paths.root)
+    checkpoint.save()
+    ctx.store.mark_stage(
+        StageName.GLOSSARY,
+        StageStatus.RUNNING,
+        done=checkpoint.done_count,
+        total=checkpoint.total_count,
+    )
     ctx.store.save()
-    glossary_path = ctx.paths.artifact_path("glossary.draft.json" if glossary_review else "glossary.locked.json")
-    source_segments = [segment["segment_id"] for segment in ctx.artifact_json("segments.v1.json")["segments"]]
+    source_segments = [str(segment["segment_id"]) for segment in transcript["segments"]]
+    terms: list[dict[str, object]] = []
+
     if ctx.provider_mode == "openai_compatible":
-        transcript = ctx.artifact_json("transcript.v1.json")
-        blocks = _translation_blocks(ctx, transcript["segments"])
-        logger.info("stage glossary llm request started blocks=%s segments=%s domain=%s", len(blocks), len(transcript["segments"]), domain)
-        terms: list[dict[str, object]] = []
         for block_index, block in enumerate(blocks, start=1):
+            block_id = block_ids[block_index - 1]
+            raw_path = ctx.paths.raw_dir / "glossary" / f"{block_id}.json"
             block_segments = block.all_segments
             block_segment_ids = [str(segment["segment_id"]) for segment in block_segments]
-            logger.info("stage glossary block started block=%s/%s segments=%s segment_ids=%s", block_index, len(blocks), len(block_segments), ",".join(block_segment_ids))
-            try:
-                glossary_result = asyncio.run(
-                    _request_structured_json(
-                        ctx.require_provider_bundle().llm,
-                        f"Extract glossary terms for a {domain} video transcript block. Keep terminology consistent with the {domain} domain. Return raw JSON only.",
-                        json.dumps(
-                            {
-                                "instruction": "Return only a JSON object with a terms array. Do not write prose, markdown, headings, or bullets.",
-                                "domain": domain,
-                                "segment_window": {
-                                    "first_segment_id": block_segment_ids[0] if block_segment_ids else None,
-                                    "last_segment_id": block_segment_ids[-1] if block_segment_ids else None,
-                                    "segment_count": len(block_segments),
-                                    "context_overlap_words": ctx.config.translation.context_overlap_words,
+            if checkpoint.segments[block_id].status == StageStatus.COMPLETED and raw_path.exists():
+                block_terms = list(read_json(raw_path).get("terms", []))
+            else:
+                try:
+                    result = asyncio.run(
+                        _request_structured_json(
+                            ctx.require_provider_bundle().llm,
+                            f"Extract glossary terms for a {domain} video transcript block. Return raw JSON only.",
+                            json.dumps(
+                                {
+                                    "instruction": "Return only a JSON object with a terms array.",
+                                    "domain": domain,
+                                    "segments": block_segments,
                                 },
-                                "segments": block_segments,
-                                "required_output_example": {
-                                    "terms": [
-                                        {
-                                            "term_id": "term_01_0001",
-                                            "original": "Large language model",
-                                            "vietnamese": "mô hình ngôn ngữ lớn",
-                                            "category": "term",
-                                            "confidence": 0.9,
-                                            "source_segments": block_segment_ids[:1],
-                                            "notes": "",
-                                        }
-                                    ]
-                                },
-                            },
-                            ensure_ascii=False,
-                        ),
-                        _glossary_response_schema(),
-                        response_name="glossary_output",
-                        response_description="Glossary terms extracted from the transcript in structured JSON format.",
+                                ensure_ascii=False,
+                            ),
+                            _glossary_response_schema(),
+                            response_name="glossary_output",
+                            response_description="Glossary terms extracted from the transcript.",
+                        )
                     )
-                )
-                raw_terms = glossary_result.get("terms", [])
-            except LLMStructuredOutputError as exc:
-                raw_terms = _fallback_glossary_terms_from_text(
-                    exc.content,
-                    block_index=block_index,
-                    block_segment_ids=block_segment_ids or source_segments,
-                    glossary_review=glossary_review,
-                )
-            block_terms = []
-            if not isinstance(raw_terms, list):
-                logger.warning("stage glossary block returned invalid terms type block=%s/%s type=%s", block_index, len(blocks), type(raw_terms).__name__)
-                raw_terms = []
-            for index, term in enumerate(raw_terms, start=1):
-                normalized_term = _normalize_glossary_term(
-                    term,
-                    block_index=block_index,
-                    term_index=index,
-                    block_segment_ids=block_segment_ids or source_segments,
-                    glossary_review=glossary_review,
-                )
-                if normalized_term is not None:
-                    block_terms.append(normalized_term)
+                    raw_terms = result.get("terms", [])
+                except LLMStructuredOutputError as exc:
+                    raw_terms = _fallback_glossary_terms_from_text(
+                        exc.content,
+                        block_index=block_index,
+                        block_segment_ids=block_segment_ids or source_segments,
+                        glossary_review=glossary_review,
+                    )
+                if not isinstance(raw_terms, list):
+                    raw_terms = []
+                block_terms = []
+                for term_index, term in enumerate(raw_terms, start=1):
+                    normalized = _normalize_glossary_term(
+                        term,
+                        block_index=block_index,
+                        term_index=term_index,
+                        block_segment_ids=block_segment_ids or source_segments,
+                        glossary_review=glossary_review,
+                    )
+                    if normalized is not None:
+                        block_terms.append(normalized)
+                write_json_atomic(raw_path, {"schema_version": "1.0", "terms": block_terms})
+                checkpoint.mark(block_id, StageStatus.COMPLETED, artifact=ctx.paths.to_relative(raw_path))
+                checkpoint.save()
             terms = _merge_glossary_terms(terms, block_terms)
-            logger.info("stage glossary block completed block=%s/%s terms=%s merged_terms=%s", block_index, len(blocks), len(block_terms), len(terms))
     else:
-        terms = [
-            {
-                "term_id": "term_0001",
-                "original": "vertical slice",
-                "vietnamese": "lát cắt dọc",
-                "category": "phrase",
-                "locked": not glossary_review,
-                "source_segments": source_segments,
-                "notes": "Mock glossary entry.",
-            }
-        ]
+        block_id = block_ids[0]
+        raw_path = ctx.paths.raw_dir / "glossary" / f"{block_id}.json"
+        terms = [{
+            "term_id": "term_0001",
+            "original": "vertical slice",
+            "vietnamese": "lát cắt dọc",
+            "category": "phrase",
+            "locked": not glossary_review,
+            "source_segments": source_segments,
+            "notes": "Mock glossary entry.",
+        }]
+        if checkpoint.segments[block_id].status != StageStatus.COMPLETED or not raw_path.exists():
+            write_json_atomic(raw_path, {"schema_version": "1.0", "terms": terms})
+            checkpoint.mark(block_id, StageStatus.COMPLETED, artifact=ctx.paths.to_relative(raw_path))
+            checkpoint.save()
+
+    publisher.publish_file(
+        stage=StageName.GLOSSARY,
+        name="glossary_blocks",
+        path=checkpoint.path,
+        status=StageStatus.RUNNING,
+        done=checkpoint.done_count,
+        total=checkpoint.total_count,
+    )
+    filename = "glossary.draft.json" if glossary_review else "glossary.locked.json"
+    glossary_path = ctx.paths.artifact_path(filename)
     write_json_atomic(
         glossary_path,
         {
@@ -625,57 +590,62 @@ def run_glossary(ctx: StageContext, *, glossary_review: bool) -> bool:
             path=glossary_path,
             status=StageStatus.WAITING_REVIEW,
         )
-        logger.info("stage glossary waiting_review artifact=%s terms=%s", ctx.paths.to_relative(glossary_path), len(terms))
         return True
-    publisher.publish_file(
-        stage=StageName.GLOSSARY,
-        name="glossary",
-        path=glossary_path,
-    )
-    logger.info("stage glossary completed artifact=%s terms=%s", ctx.paths.to_relative(glossary_path), len(terms))
+    publisher.publish_file(stage=StageName.GLOSSARY, name="glossary", path=glossary_path)
     return False
 
 
 def run_translation(ctx: StageContext) -> None:
     domain = _effective_domain(ctx)
-    logger.info("stage translation started provider_mode=%s domain=%s", ctx.provider_mode, domain)
     transcript = ctx.artifact_json("transcript.v1.json")
     glossary = ctx.artifact_json("glossary.locked.json")
     publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
-    ctx.store.mark_stage(StageName.TRANSLATION, StageStatus.RUNNING, done=0, total=len(transcript["segments"]))
-    ctx.store.save()
-    translated_segments: list[dict[str, object]] = []
-    provider_translations: dict[str, dict] = {}
     blocks = _translation_blocks(ctx, transcript["segments"])
-    if ctx.provider_mode == "openai_compatible":
-        logger.info("stage translation llm request started blocks=%s segments=%s domain=%s", len(blocks), len(transcript["segments"]), domain)
-        for block_index, block in enumerate(blocks, start=1):
-            target_segment_ids = [str(segment["segment_id"]) for segment in block.target_segments]
-            logger.info("stage translation block started block=%s/%s target_segments=%s segment_ids=%s", block_index, len(blocks), len(block.target_segments), ",".join(target_segment_ids))
-            block_translations = 0
-            for attempt in range(1, 3):
+    block_ids = [f"block_{index:06d}" for index in range(1, len(blocks) + 1)]
+    checkpoint = SegmentCheckpointStore.load_or_create(
+        ctx.paths.artifact_path("translation_blocks.v1.json"),
+        stage=StageName.TRANSLATION.value,
+        segment_ids=block_ids,
+    )
+    checkpoint.invalidate_missing_artifacts(ctx.paths.root)
+    checkpoint.save()
+    ctx.store.mark_stage(
+        StageName.TRANSLATION,
+        StageStatus.RUNNING,
+        done=checkpoint.done_count,
+        total=checkpoint.total_count,
+    )
+    ctx.store.save()
+    provider_translations: dict[str, dict] = {}
+
+    for block_index, block in enumerate(blocks, start=1):
+        block_id = block_ids[block_index - 1]
+        raw_path = ctx.paths.raw_dir / "translation" / f"{block_id}.json"
+        target_ids = [str(segment["segment_id"]) for segment in block.target_segments]
+        if checkpoint.segments[block_id].status == StageStatus.COMPLETED and raw_path.exists():
+            block_result = read_json(raw_path)
+        elif ctx.provider_mode == "openai_compatible":
+            collected: dict[str, dict[str, object]] = {}
+            targets_by_id = {str(item["segment_id"]): item for item in block.target_segments}
+            max_attempts = max(2, ctx.config.runtime.retry_max_attempts)
+            for attempt in range(1, max_attempts + 1):
+                missing = [segment_id for segment_id in target_ids if segment_id not in collected]
+                if not missing:
+                    break
                 retry_instruction = (
-                    " You previously omitted one or more target segment IDs. Return exactly one segment object for each target_segment_id: "
-                    + ", ".join(target_segment_ids)
-                    if attempt > 1
-                    else ""
+                    " This is a retry. Return only the still-missing segment IDs: " + ", ".join(missing)
+                    if attempt > 1 else ""
                 )
-                translation_result = asyncio.run(
+                result = asyncio.run(
                     _request_structured_json(
                         ctx.require_provider_bundle().llm,
-                        f"Translate the target_segments of a {domain} video transcript block to Vietnamese. Use context_before and context_after only for continuity; do not translate context-only segments. Preserve glossary terminology. Return raw JSON only.{retry_instruction}",
+                        f"Translate the target_segments of a {domain} video transcript block to Vietnamese. Use context only for continuity. Return raw JSON only.{retry_instruction}",
                         json.dumps(
                             {
-                                "instruction": "Return only a JSON object with a segments array. The array must contain exactly one object for every target segment_id and no context-only segment IDs. Do not write prose, markdown, headings, or bullets.",
-                                "required_target_segment_ids": target_segment_ids,
+                                "instruction": "Return only a JSON object with a segments array. Return exactly one object for every required target ID.",
+                                "required_target_segment_ids": missing,
                                 "domain": domain,
-                                "segment_window": {
-                                    "first_target_segment_id": target_segment_ids[0] if target_segment_ids else None,
-                                    "last_target_segment_id": target_segment_ids[-1] if target_segment_ids else None,
-                                    "target_segment_count": len(block.target_segments),
-                                    "context_overlap_words": ctx.config.translation.context_overlap_words,
-                                },
-                                "target_segments": block.target_segments,
+                                "target_segments": [targets_by_id[segment_id] for segment_id in missing],
                                 "context_before": block.context_before,
                                 "context_after": block.context_after,
                                 "glossary": glossary["terms"],
@@ -684,64 +654,69 @@ def run_translation(ctx: StageContext) -> None:
                         ),
                         _translation_response_schema(),
                         response_name="translation_output",
-                        response_description="Vietnamese translation segments in structured JSON format.",
+                        response_description="Vietnamese translation segments.",
                     )
                 )
-                block_translations = 0
-                for segment in translation_result.get("segments", []):
-                    segment_id = segment.get("segment_id")
-                    if segment_id is None or str(segment_id) not in target_segment_ids:
-                        continue
-                    provider_translations[str(segment_id)] = segment
-                    block_translations += 1
-                missing_in_block = [segment_id for segment_id in target_segment_ids if segment_id not in provider_translations]
-                if not missing_in_block:
-                    break
-                logger.warning(
-                    "stage translation block missing target ids block=%s/%s attempt=%s missing_segment_ids=%s",
-                    block_index,
-                    len(blocks),
-                    attempt,
-                    ",".join(missing_in_block),
+                for item in result.get("segments", []):
+                    segment_id = str(item.get("segment_id", ""))
+                    if segment_id in missing:
+                        collected[segment_id] = item
+            missing = [segment_id for segment_id in target_ids if segment_id not in collected]
+            if missing:
+                raise ValueError(
+                    f"Translation response missing segment_ids after {max_attempts} attempts: {', '.join(missing[:5])}"
                 )
-                for segment_id in target_segment_ids:
-                    if segment_id in missing_in_block:
-                        provider_translations.pop(segment_id, None)
-            logger.info("stage translation block completed block=%s/%s translations=%s", block_index, len(blocks), block_translations)
-        missing_segments = [str(source["segment_id"]) for source in transcript["segments"] if str(source["segment_id"]) not in provider_translations]
-        if missing_segments:
-            raise ValueError(f"Translation response missing segment_ids: {', '.join(missing_segments[:5])}")
-    for index, source in enumerate(transcript["segments"], start=1):
-        logger.info("stage translation segment started segment=%s index=%s/%s", source["segment_id"], index, len(transcript["segments"]))
-        if ctx.provider_mode == "openai_compatible":
-            provider_segment = provider_translations.get(str(source["segment_id"]), {})
-            candidate = {
-                "segment_id": source["segment_id"],
-                "source_text": source["source_text"],
-                "vi_text": provider_segment.get("vi_text", ""),
-                "used_terms": provider_segment.get("used_terms", []),
-                "length_ratio": provider_segment.get("length_ratio", 1.0),
-                "translation_warnings": provider_segment.get("translation_warnings", []),
+            block_result = {
+                "schema_version": "1.0",
+                "segments": [collected[segment_id] for segment_id in target_ids],
             }
+            write_json_atomic(raw_path, block_result)
+            checkpoint.mark(block_id, StageStatus.COMPLETED, artifact=ctx.paths.to_relative(raw_path))
+            checkpoint.save()
         else:
-            candidate = {
-                "segment_id": source["segment_id"],
-                "source_text": source["source_text"],
-                "vi_text": f"Đây là lát cắt dọc thuyết minh tiếng Việt mẫu cho {source['segment_id']}.",
-                "used_terms": ["vertical slice"],
-                "length_ratio": 1.0,
-                "translation_warnings": [],
+            block_result = {
+                "schema_version": "1.0",
+                "segments": [
+                    {
+                        "segment_id": source["segment_id"],
+                        "vi_text": f"Đây là lát cắt dọc thuyết minh tiếng Việt mẫu cho {source['segment_id']}.",
+                        "used_terms": ["vertical slice"],
+                        "length_ratio": 1.0,
+                        "translation_warnings": [],
+                    }
+                    for source in block.target_segments
+                ],
             }
+            write_json_atomic(raw_path, block_result)
+            checkpoint.mark(block_id, StageStatus.COMPLETED, artifact=ctx.paths.to_relative(raw_path))
+            checkpoint.save()
+        for item in block_result.get("segments", []):
+            provider_translations[str(item["segment_id"])] = item
+
+    translated_segments: list[dict[str, object]] = []
+    for source in transcript["segments"]:
+        provider_segment = provider_translations.get(str(source["segment_id"]), {})
+        candidate = {
+            "segment_id": source["segment_id"],
+            "source_text": source["source_text"],
+            "vi_text": provider_segment.get("vi_text", ""),
+            "used_terms": provider_segment.get("used_terms", []),
+            "length_ratio": provider_segment.get("length_ratio", 1.0),
+            "translation_warnings": provider_segment.get("translation_warnings", []),
+        }
         compressed = compress_segment_translation(candidate, glossary["terms"], max_length_ratio=3.0)
         candidate["vi_text"] = compressed.vi_text
-        candidate["translation_warnings"] = candidate["translation_warnings"] + compressed.warnings
+        candidate["translation_warnings"] = list(candidate["translation_warnings"]) + compressed.warnings
         translated_segments.append(candidate)
-        logger.info("stage translation segment completed segment=%s index=%s/%s chars=%s", source["segment_id"], index, len(transcript["segments"]), len(candidate["vi_text"]))
-    validation = validate_translations(
-        transcript["segments"],
-        translated_segments,
-        glossary["terms"],
-        max_length_ratio=3.0,
+
+    validation = validate_translations(transcript["segments"], translated_segments, glossary["terms"], max_length_ratio=3.0)
+    publisher.publish_file(
+        stage=StageName.TRANSLATION,
+        name="translation_blocks",
+        path=checkpoint.path,
+        status=StageStatus.RUNNING,
+        done=checkpoint.done_count,
+        total=checkpoint.total_count,
     )
     publisher.publish_json(
         stage=StageName.TRANSLATION,
@@ -756,8 +731,6 @@ def run_translation(ctx: StageContext) -> None:
         total=len(transcript["segments"]),
     )
 
-    logger.info("stage translation completed segments=%s warnings=%s artifact=artifacts/translated.v1.json", len(transcript["segments"]), len(validation.warnings))
-
 
 def run_tts(
     ctx: StageContext,
@@ -766,59 +739,68 @@ def run_tts(
     crash_stage: str | None = None,
     crash_after_segments: int | None = None,
 ) -> Path:
-    transcript_segments = ctx.artifact_json("transcript.v1.json")["segments"]
-    segments = transcript_segments
-    logger.info("stage tts started segments=%s provider_mode=%s segment_source=transcript", len(segments), ctx.provider_mode)
-    ctx.store.mark_stage(StageName.TTS, StageStatus.RUNNING, done=0, total=len(segments))
-    ctx.store.save()
-    segment_store = SegmentCheckpointStore.create(
+    segments = ctx.artifact_json("transcript.v1.json")["segments"]
+    segment_ids = [str(segment["segment_id"]) for segment in segments]
+    checkpoint = SegmentCheckpointStore.load_or_create(
         ctx.paths.artifact_path("tts_segments.v1.json"),
         stage=StageName.TTS.value,
-        segment_ids=[str(segment["segment_id"]) for segment in segments],
+        segment_ids=segment_ids,
     )
+    checkpoint.invalidate_missing_artifacts(ctx.paths.root)
+    checkpoint.save()
+    ctx.store.mark_stage(
+        StageName.TTS,
+        StageStatus.RUNNING,
+        done=checkpoint.done_count,
+        total=len(segments),
+    )
+    ctx.store.save()
     if crash_stage == StageName.TTS.value and crash_after_segments == 0:
-        segment_store.save()
         raise RuntimeError("simulated crash at tts after 0 segments")
-    transcript_by_id = {
-        str(segment["segment_id"]): segment
-        for segment in transcript_segments
-    }
-    translations_by_id = {
+
+    translations = {
         str(segment["segment_id"]): segment
         for segment in ctx.artifact_json("translated.v1.json")["segments"]
     }
-    mix_audio_path = ctx.paths.tts_dir / "mix.wav"
-    tts_segments = []
     if ctx.provider_mode == "openai_compatible":
-        work_items = build_tts_work_items(segments, translations_by_id)
+        work_items = build_tts_work_items(segments, translations)
     else:
         work_items = [
-            TTSWorkItem(
-                segment=segment,
-                translated_text="",
-                parent_segment_ids=(str(segment["segment_id"]),),
-            )
+            TTSWorkItem(segment=segment, translated_text="", parent_segment_ids=(str(segment["segment_id"]),))
             for segment in segments
         ]
+    manifest_path = ctx.paths.artifact_path("tts_manifest.v1.json")
+    existing_rows = list(read_json(manifest_path).get("segments", [])) if manifest_path.exists() else []
+    rows_by_parents: dict[tuple[str, ...], list[dict[str, object]]] = {}
+    for row in existing_rows:
+        parents = tuple(str(item) for item in row.get("parent_segment_ids", [row.get("segment_id")]))
+        rows_by_parents.setdefault(parents, []).append(row)
+
+    tts_segments: list[dict[str, object]] = []
+    completed_work_items = 0
     for index, work_item in enumerate(work_items, start=1):
-        segment = work_item.segment
-        parent_segment_ids = work_item.parent_segment_ids
-        segment_id = "+".join(parent_segment_ids)
-        logger.info(
-            "stage tts segment started segment=%s index=%s/%s parent_segments=%s",
-            segment_id,
-            index,
-            len(work_items),
-            len(parent_segment_ids),
+        parents = tuple(work_item.parent_segment_ids)
+        prior_rows = rows_by_parents.get(parents, [])
+        reusable = all(
+            checkpoint.segments[parent].status == StageStatus.COMPLETED
+            for parent in parents
+        ) and bool(prior_rows) and all(
+            ctx.paths.resolve_relative(str(row["audio_path"])).exists()
+            for row in prior_rows
         )
-        if ctx.provider_mode == "openai_compatible":
-            source_text = str(segment.get("source_text", ""))
+        if reusable:
+            rows = prior_rows
+        elif ctx.provider_mode == "openai_compatible":
             tts_config = ctx.config.tts_service
             rows = asyncio.run(
                 produce_provider_tts_rows(
                     paths=ctx.paths,
-                    segment=segment,
-                    text="" if not source_text.strip() else work_item.translated_text,
+                    segment=work_item.segment,
+                    text=(
+                        work_item.translated_text
+                        if str(work_item.segment.get("source_text", "")).strip()
+                        else ""
+                    ),
                     provider_bundle=ctx.require_provider_bundle(),
                     ffmpeg=ctx.ffmpeg,
                     quality_retry_attempts=tts_config.quality_retry_attempts,
@@ -833,28 +815,34 @@ def run_tts(
                     clause_pause_threshold_ms=tts_config.clause_pause_threshold_ms,
                     next_segment_start_ms=(
                         int(work_items[index].segment["start_ms"]) + 500
-                        if index < len(work_items)
-                        else duration_ms
+                        if index < len(work_items) else duration_ms
                     ),
                 )
             )
         else:
-            rows = [produce_mock_tts_segment(paths=ctx.paths, segment=segment)]
+            rows = [produce_mock_tts_segment(paths=ctx.paths, segment=work_item.segment)]
         for row in rows:
-            row["parent_segment_ids"] = list(parent_segment_ids)
+            row["parent_segment_ids"] = list(parents)
         tts_segments.extend(rows)
-        logger.info(
-            "stage tts segment completed segment=%s index=%s/%s clauses=%s audio=%s",
-            segment_id,
-            index,
-            len(work_items),
-            len(rows),
-            ",".join(str(row["audio_path"]) for row in rows),
+        if not reusable:
+            for parent in parents:
+                checkpoint.mark(parent, StageStatus.COMPLETED, artifact=str(rows[0]["audio_path"]))
+            checkpoint.save()
+            write_json_atomic(manifest_path, {"schema_version": "1.0", "segments": tts_segments + [
+                row for key, values in rows_by_parents.items() if key not in {tuple(item.parent_segment_ids) for item in work_items[:index]} for row in values
+            ]})
+        completed_work_items += 1
+        ctx.store.mark_stage(
+            StageName.TTS,
+            StageStatus.RUNNING,
+            done=checkpoint.done_count,
+            total=len(segments),
         )
-        for parent_segment_id in parent_segment_ids:
-            segment_store.mark(parent_segment_id, StageStatus.COMPLETED, artifact=rows[0]["audio_path"])
-        segment_store.save()
-    publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
+        ctx.store.save()
+        if crash_stage == StageName.TTS.value and crash_after_segments == completed_work_items:
+            raise RuntimeError(f"simulated crash at tts after {completed_work_items} segments")
+
+    mix_audio_path = ctx.paths.tts_dir / "mix.wav"
     assemble_commentary_track(
         paths=ctx.paths,
         ffmpeg=ctx.ffmpeg,
@@ -862,12 +850,11 @@ def run_tts(
         output_audio=mix_audio_path,
         max_speedup_ratio=ctx.config.tts_service.max_speedup_ratio,
     )
-    logger.info("stage tts commentary track assembled audio=%s segments=%s", ctx.paths.to_relative(mix_audio_path), len(tts_segments))
-
+    publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
     publisher.publish_file(
         stage=StageName.TTS,
         name="tts_segments",
-        path=segment_store.path,
+        path=checkpoint.path,
         status=StageStatus.RUNNING,
     )
     publisher.publish_json(
@@ -878,7 +865,6 @@ def run_tts(
         done=len(segments),
         total=len(segments),
     )
-    logger.info("stage tts completed segments=%s mix_audio=%s", len(segments), ctx.paths.to_relative(mix_audio_path))
     return mix_audio_path
 
 

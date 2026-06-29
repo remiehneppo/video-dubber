@@ -11,7 +11,7 @@ from typing import Sequence
 from dubber.core.enums import StageName
 from dubber.core.io import read_json
 from dubber.orchestrator.artifact_manifest import ArtifactManifest
-from dubber.pipeline.job_manager import JobManager, RunOptions
+from dubber.pipeline.job_manager import BatchManager, BatchOptions, JobManager, RunOptions
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser = subparsers.add_parser("resume")
     resume_parser.add_argument("--job", required=True)
     resume_parser.add_argument("--workspace", default="workspace")
+    resume_parser.add_argument("--from-stage", choices=[stage.value for stage in StageName])
     resume_parser.set_defaults(handler=cmd_resume)
 
     status_parser = subparsers.add_parser("status")
@@ -78,6 +79,36 @@ def build_parser() -> argparse.ArgumentParser:
     rerun_segment_parser.add_argument("--stage", required=True, choices=[stage.value for stage in StageName])
     rerun_segment_parser.add_argument("--segment", required=True)
     rerun_segment_parser.set_defaults(handler=cmd_rerun_segment)
+
+    batch_parser = subparsers.add_parser("batch")
+    batch_commands = batch_parser.add_subparsers(dest="batch_command", required=True)
+
+    batch_run = batch_commands.add_parser("run")
+    batch_run.add_argument("--input-dir", required=True)
+    batch_run.add_argument("--workspace", default="workspace")
+    batch_run.add_argument("--config")
+    batch_run.add_argument("--domain")
+    batch_run.add_argument("--provider-mode", choices=["mock", "openai_compatible"], default="mock")
+    batch_run.add_argument("--glossary-review", action="store_true", default=False)
+    batch_run.add_argument("--no-glossary-review", action="store_false", dest="glossary_review")
+    batch_run.set_defaults(handler=cmd_batch_run)
+
+    batch_resume = batch_commands.add_parser("resume")
+    batch_resume.add_argument("--batch", required=True)
+    batch_resume.add_argument("--workspace", default="workspace")
+    batch_resume.add_argument("--job", action="append", dest="jobs")
+    batch_resume.add_argument("--from-stage", choices=[stage.value for stage in StageName])
+    batch_resume.set_defaults(handler=cmd_batch_resume)
+
+    batch_status = batch_commands.add_parser("status")
+    batch_status.add_argument("--batch", required=True)
+    batch_status.add_argument("--workspace", default="workspace")
+    batch_status.set_defaults(handler=cmd_batch_status)
+
+    batch_validate = batch_commands.add_parser("validate")
+    batch_validate.add_argument("--batch", required=True)
+    batch_validate.add_argument("--workspace", default="workspace")
+    batch_validate.set_defaults(handler=cmd_batch_validate)
 
     web_parser = subparsers.add_parser("web")
     web_parser.add_argument("--workspace", default="workspace")
@@ -111,7 +142,11 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_resume(args: argparse.Namespace) -> int:
     try:
-        summary = JobManager().resume(Path(args.workspace), args.job)
+        summary = JobManager().resume(
+            Path(args.workspace),
+            args.job,
+            from_stage=StageName(args.from_stage) if args.from_stage else None,
+        )
     except Exception as exc:
         print(f"resume failed: {exc}")
         return 1
@@ -137,6 +172,60 @@ def cmd_rerun_segment(args: argparse.Namespace) -> int:
         return 1
     print(json.dumps(summary.to_dict(), ensure_ascii=False, sort_keys=True))
     return 0
+
+
+def cmd_batch_run(args: argparse.Namespace) -> int:
+    try:
+        summary = BatchManager().run(
+            BatchOptions(
+                input_dir=Path(args.input_dir),
+                workspace_dir=Path(args.workspace),
+                config_path=Path(args.config) if args.config else None,
+                domain=args.domain,
+                provider_mode=args.provider_mode,
+                glossary_review=bool(args.glossary_review),
+            )
+        )
+    except Exception as exc:
+        print(f"batch run failed: {exc}")
+        return 1
+    print(json.dumps(summary.to_dict(), ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_batch_resume(args: argparse.Namespace) -> int:
+    try:
+        summary = BatchManager().resume(
+            Path(args.workspace),
+            args.batch,
+            job_ids=args.jobs,
+            from_stage=StageName(args.from_stage) if args.from_stage else None,
+        )
+    except Exception as exc:
+        print(f"batch resume failed: {exc}")
+        return 1
+    print(json.dumps(summary.to_dict(), ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_batch_status(args: argparse.Namespace) -> int:
+    try:
+        summary = BatchManager().status(Path(args.workspace), args.batch)
+    except Exception as exc:
+        print(f"batch status failed: {exc}")
+        return 1
+    print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_batch_validate(args: argparse.Namespace) -> int:
+    try:
+        result = BatchManager().validate(Path(args.workspace), args.batch)
+    except Exception as exc:
+        print(f"batch validate failed: {exc}")
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if result["valid"] else 1
 
 
 def cmd_web(args: argparse.Namespace) -> int:

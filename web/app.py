@@ -18,7 +18,8 @@ def create_app(workspace_dir: str | Path = "workspace") -> FastAPI:
     def list_jobs() -> dict[str, list[dict[str, Any]]]:
         jobs: list[dict[str, Any]] = []
         if workspace.exists():
-            for state_path in sorted(workspace.glob("*/job_state.json")):
+            state_paths = list(workspace.glob("*/job_state.json")) + list(workspace.glob("batch_*/jobs/*/job_state.json"))
+            for state_path in sorted(state_paths):
                 state = read_json(state_path)
                 jobs.append(
                     {
@@ -29,6 +30,29 @@ def create_app(workspace_dir: str | Path = "workspace") -> FastAPI:
                     }
                 )
         return {"jobs": jobs}
+
+    @app.get("/api/batches")
+    def list_batches() -> dict[str, list[dict[str, Any]]]:
+        batches = []
+        if workspace.exists():
+            for state_path in sorted(workspace.glob("batch_*/batch_state.json")):
+                state = read_json(state_path)
+                batches.append({
+                    "batch_id": state["batch_id"],
+                    "status": state["status"],
+                    "updated_at": state["updated_at"],
+                    "jobs": len(state.get("jobs", [])),
+                })
+        return {"batches": batches}
+
+    @app.get("/api/batches/{batch_id}")
+    def get_batch(batch_id: str) -> dict[str, Any]:
+        if "/" in batch_id or ".." in batch_id or not batch_id.startswith("batch_"):
+            raise HTTPException(status_code=400, detail="Invalid batch id")
+        state_path = workspace / batch_id / "batch_state.json"
+        if not state_path.exists():
+            raise HTTPException(status_code=404, detail="Batch not found")
+        return read_json(state_path)
 
     @app.websocket("/ws/jobs/{job_id}")
     async def job_progress(websocket: WebSocket, job_id: str) -> None:
@@ -66,7 +90,13 @@ def create_app(workspace_dir: str | Path = "workspace") -> FastAPI:
 def _job_dir(workspace: Path, job_id: str) -> Path:
     if "/" in job_id or ".." in job_id:
         raise HTTPException(status_code=400, detail="Invalid job id")
-    return workspace / job_id
+    direct = workspace / job_id
+    if (direct / "job_state.json").exists():
+        return direct
+    matches = sorted(workspace.glob(f"batch_*/jobs/{job_id}"))
+    if matches:
+        return matches[0]
+    return direct
 
 
 def _ensure_job_exists(job_dir: Path) -> None:

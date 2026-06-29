@@ -65,6 +65,32 @@ def test_websocket_progress_returns_job_state(tmp_path: Path, capsys) -> None:
     assert message["stages"]["mixing"]["status"] == "completed"
 
 
+def test_web_api_lists_batch_and_resolves_nested_job(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    batch = workspace / "batch_demo"
+    job = batch / "jobs" / "job_nested"
+    job.mkdir(parents=True)
+    state = {
+        "schema_version": "1.0",
+        "batch_id": "batch_demo",
+        "status": "running",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "jobs": [{"job_id": "job_nested", "status": "running"}],
+    }
+    (batch / "batch_state.json").write_text(json.dumps(state), encoding="utf-8")
+    (job / "job_state.json").write_text(json.dumps({
+        "job_id": "job_nested",
+        "status": "running",
+        "current_stage": "asr",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    }), encoding="utf-8")
+    client = TestClient(create_app(workspace))
+
+    assert client.get("/api/batches").json()["batches"][0]["batch_id"] == "batch_demo"
+    assert client.get("/api/batches/batch_demo").json()["status"] == "running"
+    assert client.get("/api/jobs/job_nested").json()["current_stage"] == "asr"
+
+
 def _make_sample_video(path: Path) -> None:
     subprocess.run(
         [

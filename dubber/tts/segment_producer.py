@@ -44,7 +44,11 @@ async def produce_provider_tts_rows(
     rows: list[dict[str, Any]] = []
     for index, clause in enumerate(clauses):
         is_last_clause = index == len(clauses) - 1
-        clause_next_start_ms = next_segment_start_ms if is_last_clause else clause.end_ms + 500
+        clause_next_start_ms = (
+            next_segment_start_ms
+            if is_last_clause
+            else clauses[index + 1].start_ms + 500
+        )
         row = await produce_provider_tts_segment(
             paths=paths,
             segment=clause.to_segment(),
@@ -186,8 +190,9 @@ async def produce_provider_tts_segment(
             )
 
         assert last_report is not None
-        speedup_ratio = tts_duration_ms / orig_ms
-        if speedup_ratio <= max_speedup_ratio:
+        available_ms = orig_ms + overflow_budget_ms
+        required_speedup_ratio = max(1.0, tts_duration_ms / available_ms)
+        if required_speedup_ratio <= max_speedup_ratio:
             return _align_segment(
                 paths=paths,
                 segment=segment,
@@ -205,29 +210,11 @@ async def produce_provider_tts_segment(
                 max_overflow_ms=overflow_budget_ms,
             )
 
-        overflow_ms = tts_duration_ms - orig_ms
-        if rephrase_count > 0 and overflow_ms <= overflow_budget_ms:
-            return _align_segment(
-                paths=paths,
-                segment=segment,
-                raw_audio_path=raw_audio_path,
-                tts_duration_ms=tts_duration_ms,
-                provider_metadata=provider_metadata,
-                quality_report=last_report,
-                quality_attempts=quality_attempts,
-                synthesis_attempts=synthesis_attempts,
-                rephrase_attempts=rephrase_count,
-                final_text=current_text,
-                source_text=source_text,
-                max_speedup_ratio=max_speedup_ratio,
-                rephrase_already_attempted=True,
-                max_overflow_ms=overflow_budget_ms,
-            )
-
         if rephrase_count >= rephrase_attempts:
             raise ValueError(
                 f"{segment_id}: tts_duration_exceeds_max_speedup "
-                f"duration_ms={tts_duration_ms} target_ms={orig_ms} ratio={speedup_ratio:.3f} "
+                f"duration_ms={tts_duration_ms} target_ms={orig_ms} available_ms={available_ms} "
+                f"required_speedup_ratio={required_speedup_ratio:.3f} "
                 f"max_speedup_ratio={max_speedup_ratio:.3f} rms={last_report.rms} "
                 f"max_internal_silence_ms={last_report.max_internal_silence_ms} "
                 f"clipped_sample_ratio={last_report.clipped_sample_ratio} "
@@ -274,12 +261,17 @@ def _align_segment(
     apply_time_stretch(
         raw_audio_path,
         aligned_audio_path,
-        timing_plan.stretch_ratio if timing_plan.action == "time_stretch" else 1.0,
+        timing_plan.stretch_ratio if timing_plan.action in {"time_stretch", "time_stretch_overflow"} else 1.0,
     )
     row = {
         "segment_id": segment["segment_id"],
         "target_start_ms": int(segment["start_ms"]) + 500,
-        "target_end_ms": _target_end_ms(segment, timing_plan.action, tts_duration_ms),
+        "target_end_ms": _target_end_ms(
+            segment,
+            timing_plan.action,
+            tts_duration_ms,
+            timing_plan.overflow_ms,
+        ),
         "original_start_ms": int(segment["start_ms"]),
         "original_end_ms": int(segment["end_ms"]),
         "commentary_delay_ms": 500,
@@ -315,9 +307,16 @@ def _overflow_budget_ms(segment: dict[str, Any], next_segment_start_ms: int | No
     return max(0, available_ms - orig_ms)
 
 
-def _target_end_ms(segment: dict[str, Any], action: str, tts_duration_ms: int) -> int:
+def _target_end_ms(
+    segment: dict[str, Any],
+    action: str,
+    tts_duration_ms: int,
+    overflow_ms: int,
+) -> int:
     if action == "overflow":
         return int(segment["start_ms"]) + 500 + tts_duration_ms
+    if action == "time_stretch_overflow":
+        return int(segment["start_ms"]) + 500 + int(segment["duration_ms"]) + overflow_ms
     return int(segment["end_ms"])
 
 

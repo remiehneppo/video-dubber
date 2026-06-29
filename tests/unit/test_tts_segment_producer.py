@@ -133,8 +133,9 @@ def test_produce_provider_tts_rows_preserves_source_pause_between_clauses(tmp_pa
             {"text": "sentence.", "start_ms": 3700, "end_ms": 4500},
         ],
     }
-    tts = SequenceProviderTTS([900, 1000])
-    providers = ProviderBundle(asr=None, llm=FakeLLM(), tts=tts)
+    tts = SequenceProviderTTS([1800, 1000])
+    llm = FakeLLM()
+    providers = ProviderBundle(asr=None, llm=llm, tts=tts)
 
     rows = asyncio.run(
         produce_provider_tts_rows(
@@ -156,6 +157,9 @@ def test_produce_provider_tts_rows_preserves_source_pause_between_clauses(tmp_pa
     assert [row["target_start_ms"] for row in rows] == [1500, 3700]
     assert rows[0]["parent_segment_id"] == "seg_000001"
     assert rows[0]["clause_count"] == 2
+    assert rows[0]["alignment_action"] == "overflow"
+    assert rows[0]["overflow_ms"] == 800
+    assert llm.calls == []
     assert rows[0]["target_start_ms"] + rows[0]["orig_duration_ms"] == 2500
     assert rows[1]["target_start_ms"] - 2500 == 1200
 
@@ -305,7 +309,7 @@ def test_produce_provider_tts_segment_rephrases_audio_that_exceeds_max_speedup(t
     assert row["final_text_chars"] == len("Ngắn gọn.")
 
 
-def test_produce_provider_tts_segment_allows_overflow_when_it_does_not_reach_next_segment(tmp_path: Path) -> None:
+def test_produce_provider_tts_segment_uses_silence_and_mild_speedup_before_rephrase(tmp_path: Path) -> None:
     paths = WorkspacePaths.create(tmp_path, "job_test")
     segment = {
         "segment_id": "seg_000001",
@@ -328,11 +332,13 @@ def test_produce_provider_tts_segment_allows_overflow_when_it_does_not_reach_nex
         )
     )
 
-    assert row["alignment_action"] == "overflow"
+    assert row["alignment_action"] == "time_stretch_overflow"
+    assert row["stretch_ratio"] == 1.134
     assert row["overflow_ms"] == 500
     assert row["target_start_ms"] == 1500
     assert row["target_end_ms"] == 3000
-    assert row["rephrase_attempts"] == 1
+    assert row["rephrase_attempts"] == 0
+    assert providers.llm.calls == []
 
 
 def test_produce_provider_tts_segment_compacts_excessive_internal_silence(tmp_path: Path) -> None:
@@ -431,3 +437,39 @@ def test_produce_provider_tts_segment_fails_after_repeated_bad_quality_audio(tmp
                 quality_retry_attempts=3,
             )
         )
+
+
+
+def test_provider_tts_uses_trailing_silence_then_only_required_speedup(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_trailing_silence")
+    segment = {
+        "segment_id": "seg_000010",
+        "start_ms": 1000,
+        "end_ms": 4220,
+        "duration_ms": 3220,
+    }
+    tts = SequenceProviderTTS([7420])
+    llm = FakeLLM("Không được gọi.")
+    providers = ProviderBundle(asr=None, llm=llm, tts=tts)
+
+    row = asyncio.run(
+        produce_provider_tts_segment(
+            paths=paths,
+            segment=segment,
+            text="Về cuối, xe chậm lại nên đường cong thoải dần.",
+            provider_bundle=providers,
+            ffmpeg=FakeFFmpeg(),
+            next_segment_start_ms=8560,
+            max_speedup_ratio=1.3,
+        )
+    )
+
+    assert llm.calls == []
+    assert tts.texts == ["Về cuối, xe chậm lại nên đường cong thoải dần."]
+    assert row["alignment_action"] == "time_stretch_overflow"
+    assert row["stretch_ratio"] == 1.051
+    assert row["overflow_ms"] == 3840
+    assert row["target_end_ms"] == 8560
+    with wave.open(str(paths.root / row["audio_path"]), "rb") as wav:
+        aligned_duration_ms = int(wav.getnframes() * 1000 / wav.getframerate())
+    assert 7000 <= aligned_duration_ms <= 7100
