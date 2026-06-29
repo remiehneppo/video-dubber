@@ -70,6 +70,23 @@ class MixingConfig:
 
 
 @dataclass(frozen=True)
+class SubtitleConfig:
+    enabled: bool = False
+    mode: str = "burn_in"
+    output_sidecar: bool = True
+    max_height_ratio: float = 0.10
+    background_opacity: float = 0.50
+    font_family: str = "Arial"
+    font_size_ratio: float = 0.026
+    bottom_margin_ratio: float = 0.035
+    source_enabled: bool = True
+    translation_enabled: bool = True
+    max_cue_duration_ms: int = 4_000
+    min_cue_duration_ms: int = 700
+    max_chars_per_line: int = 48
+
+
+@dataclass(frozen=True)
 class TranslationConfig:
     glossary_review: bool = True
     min_context_words: int = 120
@@ -135,6 +152,7 @@ class DubberConfig:
     input: InputConfig = field(default_factory=InputConfig)
     translation: TranslationConfig = field(default_factory=TranslationConfig)
     mixing: MixingConfig = field(default_factory=MixingConfig)
+    subtitles: SubtitleConfig = field(default_factory=SubtitleConfig)
     vad: VadConfig = field(default_factory=VadConfig)
     asr_service: ASRServiceConfig = field(default_factory=ASRServiceConfig)
     transcript_segmentation: TranscriptSegmentationConfig = field(default_factory=TranscriptSegmentationConfig)

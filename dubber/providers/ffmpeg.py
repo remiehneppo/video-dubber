@@ -187,3 +187,34 @@ class FFmpegAdapter:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+    def burn_in_subtitles(self, input_video: Path, subtitle_ass: Path, output_video: Path) -> None:
+        output_video.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_video),
+                "-vf",
+                f"ass={_escape_filter_path(subtitle_ass)}",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "18",
+                "-c:a",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(output_video),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def _escape_filter_path(path: Path) -> str:
+    return str(path).replace("\\", "\\\\").replace(":", "\\:")

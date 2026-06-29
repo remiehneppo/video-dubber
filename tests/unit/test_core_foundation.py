@@ -26,6 +26,20 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
                 "  original_ducking_db: -18",
                 "  tts_boost_db: 8.0",
                 "  final_loudness_normalization: false",
+                "subtitles:",
+                "  enabled: true",
+                "  mode: burn_in",
+                "  output_sidecar: false",
+                "  max_height_ratio: 0.12",
+                "  background_opacity: 0.5",
+                "  font_family: Noto Sans",
+                "  font_size_ratio: 0.03",
+                "  bottom_margin_ratio: 0.04",
+                "  source_enabled: true",
+                "  translation_enabled: false",
+                "  max_cue_duration_ms: 3000",
+                "  min_cue_duration_ms: 600",
+                "  max_chars_per_line: 42",
                 "vad:",
                 "  frame_ms: 50",
                 "  threshold_ratio: 0.2",
@@ -62,6 +76,19 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
     assert config.mixing.original_ducking_db == -18.0
     assert config.mixing.tts_boost_db == 8.0
     assert config.mixing.final_loudness_normalization is False
+    assert config.subtitles.enabled is True
+    assert config.subtitles.mode == "burn_in"
+    assert config.subtitles.output_sidecar is False
+    assert config.subtitles.max_height_ratio == 0.12
+    assert config.subtitles.background_opacity == 0.5
+    assert config.subtitles.font_family == "Noto Sans"
+    assert config.subtitles.font_size_ratio == 0.03
+    assert config.subtitles.bottom_margin_ratio == 0.04
+    assert config.subtitles.source_enabled is True
+    assert config.subtitles.translation_enabled is False
+    assert config.subtitles.max_cue_duration_ms == 3000
+    assert config.subtitles.min_cue_duration_ms == 600
+    assert config.subtitles.max_chars_per_line == 42
     assert config.vad.frame_ms == 50
     assert config.vad.threshold_ratio == 0.2
     assert config.vad.min_duration_ms == 150
@@ -207,3 +234,6 @@ def test_config_example_loads_provider_sections(monkeypatch: pytest.MonkeyPatch)
     assert config.tts_service.quality_retry_attempts == 3
     assert config.tts_service.rephrase_attempts == 2
     assert config.tts_service.max_speedup_ratio == 1.3
+    assert config.subtitles.enabled is False
+    assert config.subtitles.mode == "burn_in"
+    assert config.subtitles.background_opacity == 0.5

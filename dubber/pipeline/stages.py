@@ -16,6 +16,7 @@ from dubber.orchestrator.segment_checkpoint_store import SegmentCheckpointStore
 from dubber.orchestrator.stage_artifacts import StageArtifacts
 from dubber.pipeline.stage_context import StageContext
 from dubber.providers.llm_openai_compatible import LLMStructuredOutputError
+from dubber.subtitles.ass import build_subtitle_cues, render_ass
 from dubber.tts.clause_builder import TTSWorkItem, build_tts_work_items
 from dubber.tts.segment_producer import produce_mock_tts_segment, produce_provider_tts_rows
 from dubber.tts.track_mixer import assemble_commentary_track
@@ -895,7 +896,30 @@ def run_mixing(ctx: StageContext, copied_input: Path, tts_audio: Path, duration_
         final_loudness_normalization=ctx.config.mixing.final_loudness_normalization,
     )
     output_video = ctx.paths.output_dir / f"{copied_input.stem}_vi.mp4"
-    ctx.ffmpeg.mux_video_audio(copied_input, final_audio, output_video)
+    muxed_video = output_video
+    if ctx.config.subtitles.enabled:
+        muxed_video = ctx.paths.output_dir / f"{copied_input.stem}_vi.mux.mp4"
+    ctx.ffmpeg.mux_video_audio(copied_input, final_audio, muxed_video)
+    subtitle_ass_path: Path | None = None
+    if ctx.config.subtitles.enabled:
+        if ctx.config.subtitles.mode != "burn_in":
+            raise ValueError(f"Unsupported subtitles.mode: {ctx.config.subtitles.mode}")
+        subtitle_ass_path = ctx.paths.artifact_path("subtitles.ass")
+        video_width, video_height = _video_dimensions(ctx.ffmpeg.probe(muxed_video))
+        subtitle_ass_path.write_text(
+            render_ass(
+                build_subtitle_cues(
+                    ctx.artifact_json("transcript.v1.json"),
+                    ctx.artifact_json("translated.v1.json"),
+                    ctx.config.subtitles,
+                ),
+                ctx.config.subtitles,
+                video_width=video_width,
+                video_height=video_height,
+            ),
+            encoding="utf-8",
+        )
+        ctx.ffmpeg.burn_in_subtitles(muxed_video, subtitle_ass_path, output_video)
     qa_path = ctx.paths.output_dir / f"{copied_input.stem}_vi.qa.json"
     write_json_atomic(
         qa_path,
@@ -926,6 +950,13 @@ def run_mixing(ctx: StageContext, copied_input: Path, tts_audio: Path, duration_
         path=qa_path,
         status=StageStatus.RUNNING,
     )
+    if subtitle_ass_path is not None and ctx.config.subtitles.output_sidecar:
+        publisher.publish_file(
+            stage=StageName.MIXING,
+            name="subtitle_ass",
+            path=subtitle_ass_path,
+            status=StageStatus.RUNNING,
+        )
     publisher.publish_file(
         stage=StageName.MIXING,
         name="output_video",
@@ -934,3 +965,20 @@ def run_mixing(ctx: StageContext, copied_input: Path, tts_audio: Path, duration_
     )
     logger.info("stage mixing completed output=%s qa=%s", output_video, qa_path)
     return output_video
+
+
+def _video_dimensions(metadata: dict[str, object]) -> tuple[int, int]:
+    streams = metadata.get("streams", [])
+    if not isinstance(streams, list):
+        return 1920, 1080
+    for stream in streams:
+        if not isinstance(stream, dict) or stream.get("codec_type") != "video":
+            continue
+        try:
+            width = int(stream.get("width", 1920))
+            height = int(stream.get("height", 1080))
+        except (TypeError, ValueError):
+            return 1920, 1080
+        if width > 0 and height > 0:
+            return width, height
+    return 1920, 1080

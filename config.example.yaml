@@ -62,6 +62,21 @@ mixing:
   tts_boost_db: 8.0
   final_loudness_normalization: true
 
+subtitles:
+  enabled: false
+  mode: burn_in
+  output_sidecar: true
+  max_height_ratio: 0.10
+  background_opacity: 0.50
+  font_family: Arial
+  font_size_ratio: 0.026
+  bottom_margin_ratio: 0.035
+  source_enabled: true
+  translation_enabled: true
+  max_cue_duration_ms: 4000
+  min_cue_duration_ms: 700
+  max_chars_per_line: 48
+
 asr_service:
   provider: openai_compatible
   base_url: ${ASR_BASE_URL}

@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from dubber.core.models import ASRServiceConfig, DubberConfig, InputConfig, LLMServiceConfig, MixingConfig, ProjectConfig, RuntimeConfig, TranslationConfig, TranscriptSegmentationConfig, TTSServiceConfig, VadConfig
+from dubber.core.models import ASRServiceConfig, DubberConfig, InputConfig, LLMServiceConfig, MixingConfig, ProjectConfig, RuntimeConfig, SubtitleConfig, TranslationConfig, TranscriptSegmentationConfig, TTSServiceConfig, VadConfig
 
 
 def load_config(path: Path | str) -> DubberConfig:
@@ -15,6 +15,7 @@ def load_config(path: Path | str) -> DubberConfig:
     input_config = raw.get("input", {})
     translation = raw.get("translation", {})
     mixing = raw.get("mixing", {})
+    subtitles = raw.get("subtitles", {})
     vad = raw.get("vad", {})
     asr_service = raw.get("asr_service", {})
     transcript_segmentation = raw.get("transcript_segmentation", {})
@@ -53,6 +54,21 @@ def load_config(path: Path | str) -> DubberConfig:
             original_ducking_db=float(mixing.get("original_ducking_db", -22.0)),
             tts_boost_db=float(mixing.get("tts_boost_db", 8.0)),
             final_loudness_normalization=bool(mixing.get("final_loudness_normalization", True)),
+        ),
+        subtitles=SubtitleConfig(
+            enabled=bool(subtitles.get("enabled", False)),
+            mode=str(subtitles.get("mode", "burn_in")),
+            output_sidecar=bool(subtitles.get("output_sidecar", True)),
+            max_height_ratio=float(subtitles.get("max_height_ratio", 0.10)),
+            background_opacity=float(subtitles.get("background_opacity", 0.50)),
+            font_family=str(subtitles.get("font_family", "Arial")),
+            font_size_ratio=float(subtitles.get("font_size_ratio", 0.026)),
+            bottom_margin_ratio=float(subtitles.get("bottom_margin_ratio", 0.035)),
+            source_enabled=bool(subtitles.get("source_enabled", True)),
+            translation_enabled=bool(subtitles.get("translation_enabled", True)),
+            max_cue_duration_ms=int(subtitles.get("max_cue_duration_ms", 4_000)),
+            min_cue_duration_ms=int(subtitles.get("min_cue_duration_ms", 700)),
+            max_chars_per_line=int(subtitles.get("max_chars_per_line", 48)),
         ),
         vad=VadConfig(
             mode=str(vad.get("mode", "asr_context_chunks")),
