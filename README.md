@@ -57,12 +57,133 @@ This creates a workspace under `workspace/{job_id}` and emits an output MP4 unde
 python3 cli.py run --input lecture.mp4 --provider-mode mock --glossary-review
 ```
 
-The job pauses with `waiting_review` and writes `artifacts/glossary.draft.json`. Review it, save `artifacts/glossary.locked.json`, then run:
+The job pauses with `waiting_review` and writes `workspace/<job_id>/artifacts/glossary.draft.json`.
+Review the terms, then save `workspace/<job_id>/artifacts/glossary.locked.json`.
+The locked file has the same glossary schema as the draft, but must use `status: "locked"`.
+For accepted terms, set `locked: true`; keep protected terms protected.
+
+Minimal shape:
+
+```json
+{
+  "schema_version": "1.0",
+  "domain": "mathematics",
+  "domain_profile": "calculus",
+  "status": "locked",
+  "terms": [
+    {
+      "term_id": "protected_dr",
+      "original": "dr",
+      "vietnamese": "d r",
+      "category": "calculus_notation",
+      "confidence": 1.0,
+      "locked": true,
+      "protected": true,
+      "spoken": "d r",
+      "display": "dr",
+      "forbidden": ["doctor", "bác sĩ", "tiến sĩ"],
+      "source_segments": ["seg_000001"]
+    }
+  ]
+}
+```
+
+To accept a glossary draft mechanically, run:
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+job = Path("workspace/<job_id>")
+draft = json.loads((job / "artifacts/glossary.draft.json").read_text(encoding="utf-8"))
+draft["status"] = "locked"
+for term in draft.get("terms", []):
+    term["locked"] = True
+(job / "artifacts/glossary.locked.json").write_text(
+    json.dumps(draft, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+```
+
+Then resume:
 
 ```bash
 dubber resume --job <job_id>
 # or: python3 cli.py resume --job <job_id>
 ```
+
+### High-Risk Cue Review Flow
+
+After translation, the job may pause with `waiting_review` and write
+`workspace/<job_id>/artifacts/review.required.json`. This is separate from glossary
+review. It means a cue needs human approval before TTS because source normalization,
+protected spans, or ASR/timeline risk flags could affect spoken audio.
+
+Common reasons:
+
+- `source_normalization_review_required`: verify `source_text_normalized`, especially technical notation and protected spans.
+- `asr_timeline_review_required`: verify cue text/timing when ASR word timestamps were repaired or VAD produced over-long speech segments.
+
+Create `workspace/<job_id>/artifacts/review.locked.json` with this shape:
+
+```json
+{
+  "schema_version": "1.0",
+  "status": "locked",
+  "cues": [
+    {
+      "cue_id": "cue_abc123",
+      "review_overrides": {
+        "source_text_normalized": "original source text after approved normalization",
+        "display_text": "Vietnamese subtitle text",
+        "spoken_text": "Vietnamese text for TTS",
+        "protected_spans": []
+      }
+    }
+  ]
+}
+```
+
+To accept all current review suggestions mechanically, run:
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+job = Path("workspace/<job_id>")
+required = json.loads((job / "artifacts/review.required.json").read_text(encoding="utf-8"))
+locked = {
+    "schema_version": "1.0",
+    "status": "locked",
+    "cues": [
+        {
+            "cue_id": cue["cue_id"],
+            "review_overrides": cue.get("review_overrides", {}),
+        }
+        for cue in required.get("cues", [])
+    ],
+}
+(job / "artifacts/review.locked.json").write_text(
+    json.dumps(locked, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+```
+
+Resume normally after locking review:
+
+```bash
+python3 cli.py resume --job <job_id> --workspace workspace
+```
+
+Important review rules:
+
+- `display_text` is for subtitles; `spoken_text` is for TTS. Keep both intentional.
+- Preserve `protected_spans`; for technical notation, `spoken` and `forbidden` matter for validation and TTS normalization.
+- Only edit `start_ms`/`end_ms` when you are deliberately applying a safe timing override; keep intervals non-overlapping.
+- If a job already finished ASR/translation, prefer `resume` over a fresh `run` to avoid repeating provider calls.
+- For non-calculus videos, pass `--domain-profile generic` or a suitable profile so calculus protected-span rules do not dominate prompts.
 
 ## Status And Validation
 

@@ -46,10 +46,16 @@ def test_run_mock_vertical_slice_creates_output_video(tmp_path: Path, capsys) ->
         ("segments", 1),
         ("asr_segments", 1),
         ("transcript", 1),
+        ("source_normalization", 1),
         ("glossary", 1),
         ("translated", 1),
+        ("translated_v2", 1),
+        ("dubbing_cues", 1),
+        ("dubbing_cues_v2", 1),
+        ("speech_timeline", 1),
         ("tts_segments", 1),
         ("tts_manifest", 1),
+        ("spoken_cues", 1),
         ("final_audio", 1),
         ("qa_report", 1),
         ("output_video", 1),
@@ -63,6 +69,27 @@ def test_run_mock_vertical_slice_creates_output_video(tmp_path: Path, capsys) ->
     tts_manifest = json.loads((job_dir / "artifacts" / "tts_manifest.v1.json").read_text(encoding="utf-8"))
     assert tts_manifest["segments"][0]["alignment_action"] == "time_stretch"
     assert "raw_audio_path" in tts_manifest["segments"][0]
+    dubbing_cues = json.loads((job_dir / "artifacts" / "dubbing_cues.v1.json").read_text(encoding="utf-8"))
+    dubbing_cues_v2 = json.loads((job_dir / "artifacts" / "dubbing_cues.v2.json").read_text(encoding="utf-8"))
+    translated_v2 = json.loads((job_dir / "artifacts" / "translated.v2.json").read_text(encoding="utf-8"))
+    spoken_cues = json.loads((job_dir / "artifacts" / "spoken_cues.v1.json").read_text(encoding="utf-8"))
+    assert spoken_cues["cues"][0]["final_text"] == dubbing_cues["cues"][0]["translated_text"]
+    assert dubbing_cues_v2["schema_version"] == "2.0"
+    assert "display_text" in dubbing_cues_v2["cues"][0]
+    assert "spoken_text" in dubbing_cues_v2["cues"][0]
+    assert translated_v2["schema_version"] == "2.0"
+    assert "protected_spans" in translated_v2["segments"][0]
+    speech_timeline = json.loads((job_dir / "artifacts" / "speech_timeline.v1.json").read_text(encoding="utf-8"))
+    assert speech_timeline["speech_intervals"]
+    assert "silence_intervals" in speech_timeline
+    assert speech_timeline["total_duration_ms"] == 1000
+    assert spoken_cues["cues"][0]["semantic_metrics"]["mock"] is True
+    qa = json.loads((job_dir / "output" / "short_vi.qa.json").read_text(encoding="utf-8"))
+    assert qa["semantic_failures"] == 0
+    assert qa["semantic_cer_p95"] == 0.0
+    assert qa["semantic_token_recall_min"] == 1.0
+    assert "sync_drift_p95_ms" in qa
+    assert "unused_window_total_ms" in qa
 
 
 def test_glossary_review_pauses_then_resume_creates_output_video(tmp_path: Path, capsys) -> None:
@@ -227,6 +254,72 @@ def test_resume_repairs_earliest_invalid_artifact_and_completed_resume_is_noop(t
     assert (job_dir / "job_state.json").read_text(encoding="utf-8") == before
 
 
+def test_resume_rebuilds_new_asr_and_timeline_artifacts_for_old_jobs(tmp_path: Path, capsys) -> None:
+    input_video = tmp_path / "compat.mp4"
+    workspace = tmp_path / "workspace"
+    _make_sample_video(input_video)
+    assert main(["run", "--input", str(input_video), "--workspace", str(workspace), "--provider-mode", "mock", "--no-glossary-review"]) == 0
+    initial = json.loads(capsys.readouterr().out)
+    job_dir = workspace / initial["job_id"]
+
+    (job_dir / "artifacts" / "source_normalization.v1.json").unlink()
+    assert main(["resume", "--workspace", str(workspace), "--job", initial["job_id"]]) == 0
+    repaired_asr = json.loads(capsys.readouterr().out)
+    assert repaired_asr["status"] == "completed"
+    assert (job_dir / "artifacts" / "source_normalization.v1.json").exists()
+
+    (job_dir / "artifacts" / "speech_timeline.v1.json").unlink()
+    assert main(["resume", "--workspace", str(workspace), "--job", initial["job_id"]]) == 0
+    repaired_translation = json.loads(capsys.readouterr().out)
+    assert repaired_translation["status"] == "completed"
+    assert (job_dir / "artifacts" / "speech_timeline.v1.json").exists()
+    assert (job_dir / "artifacts" / "dubbing_cues.v2.json").exists()
+    assert (job_dir / "artifacts" / "translated.v2.json").exists()
+
+
+def test_run_cli_domain_profile_override_is_persisted_and_used(tmp_path: Path, capsys) -> None:
+    input_video = tmp_path / "profile.mp4"
+    workspace = tmp_path / "workspace"
+    config = tmp_path / "config.yaml"
+    _make_sample_video(input_video)
+    config.write_text(
+        "\n".join(
+            [
+                "project:",
+                "  domain: general",
+                "  domain_profile: ''",
+                "translation:",
+                "  glossary_review: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main([
+        "run",
+        "--input",
+        str(input_video),
+        "--workspace",
+        str(workspace),
+        "--config",
+        str(config),
+        "--domain-profile",
+        "calculus",
+        "--provider-mode",
+        "mock",
+        "--no-glossary-review",
+    ])
+
+    assert exit_code == 0
+    summary = json.loads(capsys.readouterr().out)
+    job_dir = workspace / summary["job_id"]
+    resolved = json.loads((job_dir / "config.resolved.json").read_text(encoding="utf-8"))
+    translated = json.loads((job_dir / "artifacts" / "translated.v2.json").read_text(encoding="utf-8"))
+    assert resolved["domain"] == "general"
+    assert resolved["domain_profile"] == "calculus"
+    assert translated["domain_profile"] == "calculus@1"
+
+
 def test_batch_run_processes_two_videos_with_shared_glossary(tmp_path: Path, capsys) -> None:
     input_dir = tmp_path / "inputs"
     input_dir.mkdir()
@@ -245,6 +338,52 @@ def test_batch_run_processes_two_videos_with_shared_glossary(tmp_path: Path, cap
         assert _has_audio_stream(output)
     assert (Path(summary["workspace"]) / "artifacts" / "glossary.locked.json").exists()
     assert main(["batch", "validate", "--workspace", str(workspace), "--batch", summary["batch_id"]]) == 0
+
+
+def test_batch_run_domain_profile_override_is_persisted_for_jobs(tmp_path: Path, capsys) -> None:
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir()
+    _make_sample_video(input_dir / "profile.mp4")
+    workspace = tmp_path / "workspace"
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "\n".join(
+            [
+                "project:",
+                "  domain: general",
+                "  domain_profile: ''",
+                "translation:",
+                "  glossary_review: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert main([
+        "batch",
+        "run",
+        "--input-dir",
+        str(input_dir),
+        "--workspace",
+        str(workspace),
+        "--config",
+        str(config),
+        "--domain-profile",
+        "calculus",
+        "--provider-mode",
+        "mock",
+        "--no-glossary-review",
+    ]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    root = Path(summary["workspace"])
+    state = json.loads((root / "batch_state.json").read_text(encoding="utf-8"))
+    job_id = summary["jobs"][0]["job_id"]
+    resolved = json.loads((root / "jobs" / job_id / "config.resolved.json").read_text(encoding="utf-8"))
+    translated = json.loads((root / "jobs" / job_id / "artifacts" / "translated.v2.json").read_text(encoding="utf-8"))
+
+    assert state["domain_profile"] == "calculus"
+    assert resolved["domain_profile"] == "calculus"
+    assert translated["domain_profile"] == "calculus@1"
 
 
 def test_batch_review_resume_uses_locked_shared_glossary(tmp_path: Path, capsys) -> None:

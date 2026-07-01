@@ -125,18 +125,17 @@ def post_process_speech_intervals(
             raise ValueError("preferred_max_chunk_ms must be positive")
         if hard_max_chunk_ms <= 0:
             raise ValueError("hard_max_chunk_ms must be positive")
-        split_ms = min(preferred_max_chunk_ms, hard_max_chunk_ms)
-        if duration <= split_ms:
+        if duration > hard_max_chunk_ms:
+            segments.append(
+                SileroVadSegment(
+                    start,
+                    end,
+                    "vad_silero_over_hard_max",
+                    ["segment_over_hard_max"],
+                )
+            )
+        else:
             segments.append(SileroVadSegment(start, end, "vad_silero"))
-            continue
-        chunk_start = start
-        first = True
-        while chunk_start < end:
-            chunk_end = min(chunk_start + split_ms, end)
-            reason = "vad_silero" if first else "vad_silero_hard_split"
-            segments.append(SileroVadSegment(chunk_start, chunk_end, reason))
-            chunk_start = chunk_end
-            first = False
     return segments
 
 

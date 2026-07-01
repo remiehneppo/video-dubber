@@ -73,6 +73,8 @@ def _build_segment(
     units: list[TimestampUnit],
     index: int,
 ) -> dict[str, object]:
+    vad_risk_flags = [str(flag) for flag in chunk.get("vad_risk_flags", [])]
+    risk_flags = list(dict.fromkeys([*timestamps.risk_flags, *vad_risk_flags]))
     segment = {
         "segment_id": f"seg_{index:06d}",
         "start_ms": units[0].start_ms,
@@ -82,10 +84,14 @@ def _build_segment(
         "confidence": 1.0,
         "timestamp_source": timestamps.source,
         "timestamp_quality": timestamps.quality,
-        "risk_flags": list(timestamps.risk_flags),
-        "asr_warnings": list(timestamps.risk_flags),
+        "risk_flags": risk_flags,
+        "asr_warnings": risk_flags,
         "raw_response_path": str(chunk.get("raw_response_path", "")),
         "source_chunk_id": str(chunk.get("chunk_id", "")),
+        "vad_split_reason": str(chunk.get("vad_split_reason", "")),
+        "vad_risk_flags": vad_risk_flags,
+        "silence_before_ms": int(chunk.get("silence_before_ms", 0)),
+        "silence_after_ms": int(chunk.get("silence_after_ms", 0)),
     }
     if timestamps.source == "word":
         segment["words"] = [_timestamp_unit_to_dict(unit) for unit in units]

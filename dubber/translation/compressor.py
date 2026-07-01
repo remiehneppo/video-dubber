@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from dubber.translation.glossary import term_applies
+
 
 @dataclass(frozen=True)
 class CompressionResult:
@@ -36,22 +38,22 @@ def compress_segment_translation(
     max_chars = max(1, int(max(1, len(source_text)) * max_length_ratio))
     warnings: list[str] = []
 
-    if len(original_text) <= max_chars and _locked_terms_present(source_text, original_text, glossary_terms):
+    used_terms = [str(term) for term in segment.get("used_terms", [])]
+    if len(original_text) <= max_chars and _locked_terms_present(source_text, original_text, glossary_terms, used_terms=used_terms):
         return CompressionResult(segment_id=segment_id, vi_text=original_text, warnings=[])
 
     compressed = original_text
     for phrase in FILLER_PHRASES:
         compressed = compressed.replace(phrase, "")
-    compressed = " ".join(compressed.split()).strip(" ,.")
+    compressed = " ".join(compressed.split()).strip()
 
-    if len(compressed) > max_chars:
-        compressed = _trim_to_limit_preserving_terms(compressed, max_chars, source_text, glossary_terms)
-
-    compressed, inserted = _ensure_locked_terms(source_text, compressed, glossary_terms)
+    locked_terms_missing = not _locked_terms_present(source_text, compressed, glossary_terms, used_terms=used_terms)
     if compressed != original_text:
         warnings.append("compressed_for_length")
-    if inserted:
-        warnings.append("locked_glossary_reinserted")
+    if len(compressed) > max_chars:
+        warnings.append("length_compression_required")
+    if locked_terms_missing:
+        warnings.append("locked_glossary_missing")
 
     return CompressionResult(segment_id=segment_id, vi_text=compressed, warnings=warnings)
 
@@ -60,66 +62,15 @@ def _locked_terms_present(
     source_text: str,
     vi_text: str,
     glossary_terms: list[Mapping[str, Any]],
+    *,
+    used_terms: list[str] | None = None,
 ) -> bool:
-    source_lower = source_text.lower()
     vi_lower = vi_text.lower()
     for term in glossary_terms:
         if not term.get("locked", False):
             continue
         original = str(term.get("original", "")).strip().lower()
         vietnamese = str(term.get("vietnamese", "")).strip().lower()
-        if original and vietnamese and original in source_lower and vietnamese not in vi_lower:
+        if original and vietnamese and term_applies(source_text, original, used_terms=used_terms or []) and vietnamese not in vi_lower:
             return False
     return True
-
-
-def _ensure_locked_terms(
-    source_text: str,
-    vi_text: str,
-    glossary_terms: list[Mapping[str, Any]],
-) -> tuple[str, bool]:
-    inserted = False
-    result = vi_text
-    source_lower = source_text.lower()
-    result_lower = result.lower()
-    for term in glossary_terms:
-        if not term.get("locked", False):
-            continue
-        original = str(term.get("original", "")).strip()
-        vietnamese = str(term.get("vietnamese", "")).strip()
-        if original and vietnamese and original.lower() in source_lower and vietnamese.lower() not in result_lower:
-            result = f"{vietnamese}: {result}" if result else vietnamese
-            result_lower = result.lower()
-            inserted = True
-    return result, inserted
-
-
-def _trim_to_limit_preserving_terms(
-    text: str,
-    max_chars: int,
-    source_text: str,
-    glossary_terms: list[Mapping[str, Any]],
-) -> str:
-    protected_terms = [
-        str(term.get("vietnamese", "")).strip()
-        for term in glossary_terms
-        if term.get("locked", False)
-        and str(term.get("original", "")).strip().lower() in source_text.lower()
-        and str(term.get("vietnamese", "")).strip()
-    ]
-    if any(term.lower() in text.lower() for term in protected_terms):
-        for term in protected_terms:
-            index = text.lower().find(term.lower())
-            if index >= 0:
-                window_start = max(0, index - max_chars // 3)
-                window = text[window_start : window_start + max_chars]
-                return window.strip(" ,.")
-
-    words = text.split()
-    result_words: list[str] = []
-    for word in words:
-        candidate = " ".join([*result_words, word])
-        if len(candidate) > max_chars:
-            break
-        result_words.append(word)
-    return " ".join(result_words).strip(" ,.")

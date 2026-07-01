@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from dubber.core.config import load_config
+from dubber.core.concurrency import ProviderConcurrency
 from dubber.core.enums import JobStatus, StageName, StageStatus
 from dubber.core.io import read_json, write_json_atomic
 from dubber.core.paths import WorkspacePaths
@@ -30,7 +30,6 @@ from dubber.pipeline.stages import (
 )
 from dubber.providers.factory import ProviderBundle, build_provider_bundle
 from dubber.providers.ffmpeg import FFmpegAdapter
-from dubber.tts.segment_producer import produce_mock_tts_segment
 from dubber.tts.track_mixer import assemble_commentary_track
 
 
@@ -40,6 +39,7 @@ class RunOptions:
     workspace_dir: Path
     config_path: Path | None = None
     domain: str | None = None
+    domain_profile: str | None = None
     provider_mode: str = "mock"
     glossary_review: bool = False
     crash_stage: str | None = None
@@ -64,15 +64,27 @@ class RunSummary:
 
 
 class JobManager:
-    def __init__(self, ffmpeg: FFmpegAdapter | None = None, provider_bundle: ProviderBundle | None = None) -> None:
+    def __init__(
+        self,
+        ffmpeg: FFmpegAdapter | None = None,
+        provider_bundle: ProviderBundle | None = None,
+        concurrency: ProviderConcurrency | None = None,
+    ) -> None:
         self.ffmpeg = ffmpeg or FFmpegAdapter()
         self.provider_bundle = provider_bundle
         self.provider_mode = "mock"
+        self.concurrency = concurrency
 
     def run(self, options: RunOptions, *, stop_after: StageName | None = None) -> RunSummary:
         config = load_config(options.config_path or Path("config.example.yaml"))
+        if self.concurrency is None:
+            self.concurrency = ProviderConcurrency(config.runtime)
         effective_domain = options.domain or config.project.domain
-        config = replace(config, project=replace(config.project, domain=effective_domain))
+        effective_profile = options.domain_profile if options.domain_profile is not None else config.project.domain_profile
+        config = replace(
+            config,
+            project=replace(config.project, domain=effective_domain, domain_profile=effective_profile),
+        )
         if options.provider_mode not in {"mock", "openai_compatible"}:
             raise ValueError(f"Unsupported provider-mode: {options.provider_mode}")
         self.provider_mode = options.provider_mode
@@ -87,7 +99,7 @@ class JobManager:
         manifest = ArtifactManifest.create(job_id, paths.manifest_file)
         copied_input = paths.input_dir / input_path.name
         shutil.copy2(input_path, copied_input)
-        self._write_resolved_config(paths, options, config.project.domain)
+        self._write_resolved_config(paths, options, config.project.domain, config.project.domain_profile)
         store.save()
         manifest.save()
         ctx = self._context(paths, store, manifest, config)
@@ -112,6 +124,8 @@ class JobManager:
         store = CheckpointStore.load(paths.job_state_file)
         manifest = ArtifactManifest.load(paths.manifest_file)
         config = self._load_resolved_config(paths)
+        if self.concurrency is None:
+            self.concurrency = ProviderConcurrency(config.runtime)
         self._restore_provider_context(paths, config)
         ctx = self._context(paths, store, manifest, config)
         if from_stage is not None:
@@ -133,6 +147,9 @@ class JobManager:
                 ctx = self._context(paths, store, manifest, config)
                 start_stage = StageName.TRANSLATION
             elif store.state.status == JobStatus.WAITING_REVIEW:
+                return self._summary(ctx, JobStatus.WAITING_REVIEW)
+        if start_stage == StageName.TRANSLATION and store.state.status == JobStatus.WAITING_REVIEW:
+            if not paths.artifact_path("review.locked.json").exists():
                 return self._summary(ctx, JobStatus.WAITING_REVIEW)
         return self._execute(
             ctx,
@@ -192,6 +209,7 @@ class JobManager:
             provider_mode=self.provider_mode,
             provider_bundle=self.provider_bundle,
             config=config,
+            concurrency=self.concurrency,
         )
 
     def _execute(
@@ -235,7 +253,10 @@ class JobManager:
                 if stop_after == StageName.GLOSSARY:
                     return self._summary(ctx, JobStatus.RUNNING)
             if start_index <= stages.index(StageName.TRANSLATION):
-                run_translation(ctx)
+                if run_translation(ctx, total_duration_ms=duration_ms):
+                    ctx.store.mark_job(JobStatus.WAITING_REVIEW)
+                    ctx.store.save()
+                    return self._summary(ctx, JobStatus.WAITING_REVIEW)
                 if stop_after == StageName.TRANSLATION:
                     return self._summary(ctx, JobStatus.RUNNING)
             if start_index <= stages.index(StageName.TTS):
@@ -277,15 +298,22 @@ class JobManager:
             StageName.JOB_INIT: ("input_metadata",),
             StageName.AUDIO_EXTRACT: ("audio_analysis",),
             StageName.VAD: ("segments",),
-            StageName.ASR: ("asr_segments", "transcript"),
+            StageName.ASR: ("asr_segments", "transcript", "source_normalization"),
             StageName.GLOSSARY: ("glossary",),
-            StageName.TRANSLATION: ("translation_blocks", "translated"),
-            StageName.TTS: ("tts_segments", "tts_manifest"),
+            StageName.TRANSLATION: (
+                "translation_blocks",
+                "dubbing_cues",
+                "dubbing_cues_v2",
+                "speech_timeline",
+                "translated",
+                "translated_v2",
+            ),
+            StageName.TTS: ("tts_segments", "tts_manifest", "spoken_cues"),
             StageName.MIXING: ("output_video",),
         }
         for stage in StageName:
             progress = ctx.store.state.stages[stage]
-            if stage == StageName.GLOSSARY and progress.status == StageStatus.WAITING_REVIEW:
+            if stage in {StageName.GLOSSARY, StageName.TRANSLATION} and progress.status == StageStatus.WAITING_REVIEW:
                 return stage
             if progress.status != StageStatus.COMPLETED:
                 return stage
@@ -355,75 +383,16 @@ class JobManager:
         )
         copied_input = paths.resolve_relative(store.state.input_file)
         duration_ms = self.ffmpeg.duration_ms(copied_input)
-        segments = read_json(paths.artifact_path("segments.v1.json"))["segments"]
-        matching = [segment for segment in segments if str(segment["segment_id"]) == segment_id]
+        cues = read_json(paths.artifact_path("dubbing_cues.v1.json"))["cues"]
+        matching = [cue for cue in cues if str(cue["cue_id"]) == segment_id]
         if not matching:
             raise ValueError(f"Unknown segment_id: {segment_id}")
-        segment = matching[0]
 
         checkpoint = SegmentCheckpointStore.load(paths.artifact_path("tts_segments.v1.json"))
-        if ctx.provider_mode == "openai_compatible":
-            transcript_by_id = {
-                str(item["segment_id"]): item
-                for item in read_json(paths.artifact_path("transcript.v1.json"))["segments"]
-            }
-            translations_by_id = {
-                str(item["segment_id"]): item
-                for item in read_json(paths.artifact_path("translated.v1.json"))["segments"]
-            }
-            source_text = str(transcript_by_id.get(segment_id, {}).get("source_text", ""))
-            translated_text = str(translations_by_id.get(segment_id, {}).get("vi_text", ""))
-            ordered_segments = sorted(segments, key=lambda item: int(item["start_ms"]))
-            segment_index = ordered_segments.index(segment)
-            next_segment_start_ms = (
-                int(ordered_segments[segment_index + 1]["start_ms"]) + 500
-                if segment_index + 1 < len(ordered_segments)
-                else duration_ms
-            )
-            tts_config = config.tts_service
-            row = asyncio.run(
-                produce_provider_tts_segment(
-                    paths=paths,
-                    segment=segment,
-                    text="" if not source_text.strip() else translated_text,
-                    provider_bundle=ctx.require_provider_bundle(),
-                    ffmpeg=self.ffmpeg,
-                    quality_retry_attempts=tts_config.quality_retry_attempts,
-                    rephrase_attempts=tts_config.rephrase_attempts,
-                    max_speedup_ratio=tts_config.max_speedup_ratio,
-                    min_rms=tts_config.min_rms,
-                    silence_rms_threshold=tts_config.silence_rms_threshold,
-                    max_edge_silence_ms=tts_config.max_edge_silence_ms,
-                    max_internal_silence_ms=tts_config.max_internal_silence_ms,
-                    clipping_peak_threshold=tts_config.clipping_peak_threshold,
-                    max_clipped_sample_ratio=tts_config.max_clipped_sample_ratio,
-                    next_segment_start_ms=next_segment_start_ms,
-                    max_overflow_ms=tts_config.max_overflow_ms,
-                    overflow_reserve_ms=tts_config.overflow_reserve_ms,
-                )
-            )
-        else:
-            row = produce_mock_tts_segment(paths=paths, segment=segment)
-        checkpoint.mark(segment_id, StageStatus.COMPLETED, artifact=row["audio_path"])
+        checkpoint.mark(segment_id, StageStatus.PENDING)
         checkpoint.save()
-
-        tts_manifest_path = paths.artifact_path("tts_manifest.v1.json")
-        tts_manifest = read_json(tts_manifest_path)
-        for item in tts_manifest["segments"]:
-            if str(item["segment_id"]) == segment_id:
-                item.update(row)
-        write_json_atomic(tts_manifest_path, tts_manifest)
-        tts_audio = paths.tts_dir / "mix.wav"
-        assemble_commentary_track(
-            paths=paths,
-            ffmpeg=self.ffmpeg,
-            tts_segments=list(tts_manifest["segments"]),
-            output_audio=tts_audio,
-        )
-        manifest.record_artifact(name="tts_segments", version=1, path=checkpoint.path, created_by_stage=StageName.TTS, schema_version="1.0")
-        manifest.record_artifact(name="tts_manifest", version=1, path=tts_manifest_path, created_by_stage=StageName.TTS, schema_version="1.0")
+        tts_audio = run_tts(ctx, duration_ms)
         output_video = run_mixing(ctx, copied_input, tts_audio, duration_ms)
-        store.mark_stage(StageName.TTS, StageStatus.COMPLETED, artifact=paths.to_relative(tts_manifest_path), done=checkpoint.done_count, total=checkpoint.total_count)
         store.mark_job(JobStatus.COMPLETED)
         store.save()
         manifest.save()
@@ -439,13 +408,20 @@ class JobManager:
         if not self.ffmpeg.has_audio_stream(input_path):
             raise ValueError("Input video has no audio stream")
 
-    def _write_resolved_config(self, paths: WorkspacePaths, options: RunOptions, default_domain: str) -> None:
+    def _write_resolved_config(
+        self,
+        paths: WorkspacePaths,
+        options: RunOptions,
+        default_domain: str,
+        default_domain_profile: str,
+    ) -> None:
         config_path = options.config_path.expanduser().resolve() if options.config_path is not None else None
         write_json_atomic(
             paths.root / "config.resolved.json",
             {
                 "provider_mode": options.provider_mode,
                 "domain": options.domain or default_domain,
+                "domain_profile": options.domain_profile if options.domain_profile is not None else default_domain_profile,
                 "glossary_review": options.glossary_review,
                 "config_path": str(config_path) if config_path is not None else None,
             },
@@ -460,7 +436,8 @@ class JobManager:
         config_path = Path(str(config_path_value)) if config_path_value else Path("config.example.yaml")
         config = load_config(config_path)
         domain = str(resolved.get("domain", config.project.domain))
-        return replace(config, project=replace(config.project, domain=domain))
+        domain_profile = str(resolved.get("domain_profile", config.project.domain_profile))
+        return replace(config, project=replace(config.project, domain=domain, domain_profile=domain_profile))
 
     def _restore_provider_context(self, paths: WorkspacePaths, config) -> None:
         resolved_path = paths.root / "config.resolved.json"
@@ -477,6 +454,7 @@ class BatchOptions:
     workspace_dir: Path
     config_path: Path | None = None
     domain: str | None = None
+    domain_profile: str | None = None
     provider_mode: str = "mock"
     glossary_review: bool = False
 
@@ -513,6 +491,7 @@ class BatchManager:
     def run(self, options: BatchOptions) -> BatchSummary:
         config_path = options.config_path or Path("config.example.yaml")
         config = load_config(config_path)
+        concurrency = ProviderConcurrency(config.runtime)
         inputs = self.scan_inputs(options.input_dir, config.input.allowed_extensions)
         if not inputs:
             raise ValueError("No supported video files found in input directory")
@@ -541,6 +520,7 @@ class BatchManager:
             "glossary_review": options.glossary_review,
             "config_path": str(options.config_path.expanduser().resolve()) if options.config_path else None,
             "domain": options.domain or config.project.domain,
+            "domain_profile": options.domain_profile if options.domain_profile is not None else config.project.domain_profile,
             "created_at": now,
             "updated_at": now,
             "jobs": jobs,
@@ -559,12 +539,13 @@ class BatchManager:
         )
 
         def prepare(job: dict[str, Any]) -> RunSummary:
-            return JobManager().run(
+            return JobManager(concurrency=concurrency).run(
                 RunOptions(
                     input_path=Path(job["input_file"]),
                     workspace_dir=root / "jobs",
                     config_path=options.config_path,
                     domain=options.domain,
+                    domain_profile=options.domain_profile,
                     provider_mode=options.provider_mode,
                     glossary_review=False,
                     job_id=str(job["job_id"]),
@@ -579,17 +560,21 @@ class BatchManager:
             self._save_state(root, state)
             return self._summary(root, state)
 
-        glossary = self._build_shared_glossary(root, state, config, successful)
+        glossary = self._build_shared_glossary(root, state, config, successful, concurrency)
         state["glossary"] = f"artifacts/{glossary.name}"
         if options.glossary_review:
             for job in successful:
-                JobManager().publish_shared_glossary(root / "jobs", str(job["job_id"]), glossary, locked=False)
+                JobManager(concurrency=concurrency).publish_shared_glossary(
+                    root / "jobs", str(job["job_id"]), glossary, locked=False
+                )
                 job["status"] = JobStatus.WAITING_REVIEW.value
             state["status"] = JobStatus.WAITING_REVIEW.value
             self._save_state(root, state)
             return self._summary(root, state)
 
-        self._complete_jobs(root, state, successful, glossary, config.runtime.max_parallel_jobs)
+        self._complete_jobs(
+            root, state, successful, glossary, config.runtime.max_parallel_jobs, concurrency=concurrency
+        )
         self._set_final_status(state)
         self._save_state(root, state)
         return self._summary(root, state)
@@ -603,6 +588,8 @@ class BatchManager:
         from_stage: StageName | None = None,
     ) -> BatchSummary:
         root, state = self._load(workspace_dir, batch_id)
+        config = self._batch_config(state)
+        concurrency = ProviderConcurrency(config.runtime)
         jobs = list(state["jobs"])
         selected = [
             job for job in jobs
@@ -619,11 +606,39 @@ class BatchManager:
             if configured and str(configured).endswith("glossary.locked.json"):
                 locked = root / str(configured)
         if not locked.exists():
-            raise FileNotFoundError("Batch locked glossary is missing; review artifacts/glossary.draft.json and save glossary.locked.json")
+            draft = root / "artifacts" / "glossary.draft.json"
+            if bool(state.get("glossary_review")) and draft.exists():
+                raise FileNotFoundError("Batch locked glossary is missing; review artifacts/glossary.draft.json and save glossary.locked.json")
+            glossary_jobs = [
+                job for job in jobs
+                if str(job.get("status")) in {
+                    "asr_completed",
+                    "ready",
+                    JobStatus.WAITING_REVIEW.value,
+                    JobStatus.COMPLETED.value,
+                }
+                and (root / "jobs" / str(job["job_id"]) / "artifacts" / "transcript.v1.json").exists()
+            ]
+            if not glossary_jobs:
+                raise FileNotFoundError(
+                    "Batch locked glossary is missing and no ASR-completed jobs are available to rebuild it"
+                )
+            rebuilt = self._build_shared_glossary(root, state, config, glossary_jobs, concurrency)
+            state["glossary"] = f"artifacts/{rebuilt.name}"
+            if bool(state.get("glossary_review")):
+                for job in glossary_jobs:
+                    JobManager(concurrency=concurrency).publish_shared_glossary(
+                        root / "jobs", str(job["job_id"]), rebuilt, locked=False
+                    )
+                    job["status"] = JobStatus.WAITING_REVIEW.value
+                state["status"] = JobStatus.WAITING_REVIEW.value
+                self._save_state(root, state)
+                return self._summary(root, state)
+            locked = rebuilt
 
         ready: list[dict[str, Any]] = []
         for job in selected:
-            manager = JobManager()
+            manager = JobManager(concurrency=concurrency)
             job_id = str(job["job_id"])
             try:
                 job_state = CheckpointStore.load(root / "jobs" / job_id / "job_state.json").state
@@ -652,6 +667,7 @@ class BatchManager:
             ready,
             locked,
             self._batch_config(state).runtime.max_parallel_jobs,
+            concurrency=concurrency,
             from_stage=from_stage if from_stage not in {StageName.JOB_INIT, StageName.AUDIO_EXTRACT, StageName.VAD, StageName.ASR, StageName.GLOSSARY} else None,
             publish_glossary=False,
         )
@@ -697,7 +713,11 @@ class BatchManager:
                 job = futures[future]
                 try:
                     summary = future.result()
-                    job["status"] = success_status
+                    job["status"] = (
+                        JobStatus.WAITING_REVIEW.value
+                        if summary.status == JobStatus.WAITING_REVIEW.value
+                        else success_status
+                    )
                     job["output_video"] = summary.output_video
                     job["error"] = None
                 except Exception as exc:
@@ -713,11 +733,12 @@ class BatchManager:
         glossary: Path,
         max_workers: int,
         *,
+        concurrency: ProviderConcurrency,
         from_stage: StageName | None = None,
         publish_glossary: bool = True,
     ) -> None:
         def complete(job: dict[str, Any]) -> RunSummary:
-            manager = JobManager()
+            manager = JobManager(concurrency=concurrency)
             if publish_glossary:
                 manager.publish_shared_glossary(root / "jobs", str(job["job_id"]), glossary, locked=True)
             return manager.resume(root / "jobs", str(job["job_id"]), from_stage=from_stage)
@@ -736,6 +757,7 @@ class BatchManager:
         state: dict[str, Any],
         config,
         jobs: list[dict[str, Any]],
+        concurrency: ProviderConcurrency,
     ) -> Path:
         shared_paths = WorkspacePaths.create(root, ".shared_glossary")
         combined: list[dict[str, Any]] = []
@@ -746,10 +768,20 @@ class BatchManager:
                 item["segment_id"] = f"{job['job_id']}::{segment['segment_id']}"
                 combined.append(item)
         write_json_atomic(shared_paths.artifact_path("transcript.v1.json"), {"schema_version": "1.0", "segments": combined})
-        store = CheckpointStore.create(shared_paths.job_state_file, job_id=f"{state['batch_id']}_glossary", input_file=Path("input/none"))
-        manifest = ArtifactManifest.create(f"{state['batch_id']}_glossary", shared_paths.manifest_file)
-        store.save()
-        manifest.save()
+        if shared_paths.job_state_file.exists():
+            store = CheckpointStore.load(shared_paths.job_state_file)
+        else:
+            store = CheckpointStore.create(
+                shared_paths.job_state_file,
+                job_id=f"{state['batch_id']}_glossary",
+                input_file=Path("input/none"),
+            )
+            store.save()
+        if shared_paths.manifest_file.exists():
+            manifest = ArtifactManifest.load(shared_paths.manifest_file)
+        else:
+            manifest = ArtifactManifest.create(f"{state['batch_id']}_glossary", shared_paths.manifest_file)
+            manifest.save()
         provider_bundle = build_provider_bundle(config) if state["provider_mode"] == "openai_compatible" else None
         ctx = StageContext(
             paths=shared_paths,
@@ -758,7 +790,15 @@ class BatchManager:
             ffmpeg=None,
             provider_mode=str(state["provider_mode"]),
             provider_bundle=provider_bundle,
-            config=replace(config, project=replace(config.project, domain=str(state["domain"]))),
+            config=replace(
+                config,
+                project=replace(
+                    config.project,
+                    domain=str(state["domain"]),
+                    domain_profile=str(state.get("domain_profile", config.project.domain_profile)),
+                ),
+            ),
+            concurrency=concurrency,
         )
         review = bool(state["glossary_review"])
         run_glossary(ctx, glossary_review=review)
@@ -769,7 +809,15 @@ class BatchManager:
 
     def _batch_config(self, state: dict[str, Any]):
         value = state.get("config_path")
-        return load_config(Path(str(value)) if value else Path("config.example.yaml"))
+        config = load_config(Path(str(value)) if value else Path("config.example.yaml"))
+        return replace(
+            config,
+            project=replace(
+                config.project,
+                domain=str(state.get("domain", config.project.domain)),
+                domain_profile=str(state.get("domain_profile", config.project.domain_profile)),
+            ),
+        )
 
     def _set_final_status(self, state: dict[str, Any]) -> None:
         statuses = [str(job["status"]) for job in state["jobs"]]

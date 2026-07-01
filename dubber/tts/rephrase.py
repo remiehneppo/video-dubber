@@ -21,18 +21,24 @@ async def rephrase_tts_text(
     target_duration_ms: int,
     current_duration_ms: int,
     segment_id: str,
+    protected_spans: list[dict[str, object]] | None = None,
 ) -> str:
     system_prompt = (
-        "Rewrite Vietnamese dubbing text so it can be spoken naturally inside the target duration. "
-        "Preserve meaning, technical terms, names, numbers, and domain terminology. Return JSON only."
+        "You shorten Vietnamese dubbing text for TTS timing. Return raw JSON only. "
+        "Preserve the original meaning, technical terms, names, formulas, symbols, numbers, units, and domain terminology. "
+        "Every protected span is binding: preserve its technical concept and use its spoken form; never use a forbidden rendering. "
+        "Make the text shorter and easier to speak naturally in Vietnamese; remove redundancy, not information. "
+        "Do not add new facts, commentary, greetings, markdown, or explanations. "
+        "Return one concise text value that can be spoken inside the target duration."
     )
     user_prompt = json.dumps(
         {
             "segment_id": segment_id,
             "target_duration_ms": target_duration_ms,
             "current_duration_ms": current_duration_ms,
-            "instruction": "Return a shorter natural Vietnamese sentence or phrase in the text field.",
+            "instruction": "Return a shorter natural Vietnamese sentence or phrase in the text field. Keep the same language and preserve all essential technical meaning.",
             "text": text,
+            "protected_spans": protected_spans or [],
         },
         ensure_ascii=False,
     )

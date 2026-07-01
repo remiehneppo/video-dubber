@@ -15,17 +15,20 @@ project:
   output_format: mp4
   # Chủ đề dùng trong prompt glossary và translation.
   domain: mathematics
+  # Profile kỹ thuật chi phối protected notation/glossary/prompt/validator/TTS.
+  # calculus bảo vệ các ký hiệu như dr, dx, dy/dx, πr² để tránh lỗi doctor/bác sĩ.
+  domain_profile: calculus
   # Giá trị mặc định mang tính mô tả; job hiện ghi output bên trong workspace job.
   output_dir: ./output
   # Workspace mặc định. CLI --workspace là nguồn quyết định khi chạy lệnh.
   workspace_dir: ./workspace
 
 runtime:
-  # Số video tối đa chạy đồng thời trong một batch. Mỗi worker có JobManager và
-  # provider context riêng. Đặt 1 để chạy tuần tự và giảm tải GPU/API.
+  # Số video tối đa chạy đồng thời trong một batch. Các job dùng chung giới hạn
+  # request provider bên dưới trong cùng một CLI process.
   max_parallel_jobs: 1
-  # Giới hạn concurrency dự kiến theo provider. Pipeline hiện checkpoint và gọi
-  # tuần tự trong mỗi job; các field này dành cho executor song song nội bộ sau này.
+  # Giới hạn request thực trên toàn CLI process: ASR gồm source + semantic QA,
+  # LLM gồm glossary + translation + rephrase, TTS gồm synthesize + retry.
   asr_concurrency: 4
   llm_concurrency: 2
   tts_concurrency: 4
@@ -68,8 +71,9 @@ vad:
   silence_merge_threshold_ms: 2500
   # Audio context thêm quanh speech chunk để tránh cắt mất âm đầu/cuối.
   context_padding_ms: 1500
-  # Cho phép cắt mềm tại vị trí không hoàn hảo khi chunk sắp vượt hard max.
-  soft_split_allowed: true
+  # false: không cắt giữa vùng speech liên tục; giữ chunk quá dài và gắn risk
+  # flag để review. Chỉ bật true cho debug/provider có hard upload limit.
+  soft_split_allowed: false
 
   # Đường dẫn và nguồn tải model Silero ONNX.
   silero_model_path: models/silero_vad.onnx
@@ -101,6 +105,12 @@ translation:
   # Số target segment tối đa mong muốn trong một request LLM.
   target_segment_count: 16
 
+source_normalization:
+  # false: chỉ dùng deterministic regex/rules từ domain profile.
+  # true: gọi LLM để đề xuất source-normalization ambiguity; LLM không tự sửa
+  # source, chỉ ghi suggestion để review trước TTS.
+  llm_adjudication: false
+
 transcript_segmentation:
   # Thời lượng mục tiêu tối thiểu. Short tail vẫn có thể ngắn hơn tại cuối ASR
   # chunk hoặc ranh giới câu tự nhiên; TTS sẽ tận dụng silence kế tiếp.
@@ -113,6 +123,13 @@ transcript_segmentation:
   min_pause_split_ms: 600
   # true: ưu tiên kết thúc segment tại '.', '?' hoặc '!' sau target minimum.
   prefer_punctuation_split: true
+
+dubbing_cues:
+  # Đơn vị timing chung cho translation, subtitle và TTS. Planner ưu tiên cắt
+  # tại punctuation/pause gần target và không vượt hard maximum.
+  target_duration_ms: 4000
+  min_duration_ms: 1500
+  max_duration_ms: 6000
 
 mixing:
   # Mức giảm âm lượng audio gốc khi trộn commentary; số âm giảm mạnh hơn.
@@ -160,8 +177,11 @@ asr_service:
   timestamp_mode: prefer_word
   # true: thiếu timestamp hợp lệ làm stage ASR lỗi.
   require_timestamps: true
+  # true: production voice-first yêu cầu word-level timestamps; segment-level
+  # hoặc chunk fallback sẽ fail sớm để tránh cue/TTS sai nhịp.
+  require_word_timestamps: true
   # true: cho phép dùng toàn text chunk làm một timestamp unit khi provider không
-  # trả timestamps. Đặt false để tránh sync giả.
+  # trả timestamps. Chỉ nên bật cho debug/draft; production nên giữ false.
   allow_chunk_text_fallback: false
   # Gửi vad_filter tới server ASR. Nên false khi pipeline đã tự VAD/chunk audio.
   vad_filter: false
@@ -184,6 +204,8 @@ tts_service:
   model: tts-1
   # Tên voice gửi nguyên văn tới provider.
   voice: nova
+  # Delay từ đầu cue tới speech onset. Mặc định 0 để không tạo drift cố định.
+  start_delay_ms: 0
 
   # Số lần synthesize lại cùng text khi audio vi phạm quality gate.
   quality_retry_attempts: 3
@@ -200,6 +222,14 @@ tts_service:
   # Khoảng đệm giữ lại trước target_start của TTS kế tiếp để tránh overlap/click
   # khi provider hoặc FFmpeg đo duration lệch vài frame.
   overflow_reserve_ms: 120
+  # Silence đầu/cuối sau trim được giữ lại để mép giọng tự nhiên.
+  retained_edge_silence_ms: 100
+
+  # Mọi cue TTS thật được ASR lại bằng tiếng Việt. Cả CER và token recall phải
+  # đạt ngưỡng; nếu không pipeline synthesize lại cùng final_text.
+  semantic_max_cer: 0.25
+  semantic_min_token_recall: 0.85
+  semantic_retry_attempts: 3
 
   # RMS tối thiểu để không coi audio là gần-im-lặng (PCM16 scale).
   min_rms: 500

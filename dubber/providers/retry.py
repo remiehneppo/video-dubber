@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import email.utils
 import logging
+import random
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 
 import httpx
 
@@ -38,9 +41,10 @@ async def request_with_retries(
             if attempt == max_attempts or not _is_retryable(exc):
                 logger.error("%s request failed attempt=%s/%s retryable=%s error=%s", provider, attempt, max_attempts, _is_retryable(exc), exc)
                 raise ProviderRequestError(provider=provider, attempts=attempt, cause=exc) from exc
-            logger.warning("%s request failed attempt=%s/%s; retrying in %ss: %s", provider, attempt, max_attempts, retry_delay_sec, exc)
-            if retry_delay_sec > 0:
-                await asyncio.sleep(retry_delay_sec)
+            delay_sec = _retry_delay_sec(exc, attempt=attempt, base_delay_sec=retry_delay_sec)
+            logger.warning("%s request failed attempt=%s/%s; retrying in %ss: %s", provider, attempt, max_attempts, delay_sec, exc)
+            if delay_sec > 0:
+                await asyncio.sleep(delay_sec)
 
     raise ProviderRequestError(
         provider=provider,
@@ -53,3 +57,39 @@ def _is_retryable(exc: httpx.HTTPStatusError | httpx.TransportError) -> bool:
     if isinstance(exc, httpx.TransportError):
         return True
     return exc.response.status_code == 429 or exc.response.status_code >= 500
+
+
+def _retry_delay_sec(
+    exc: httpx.HTTPStatusError | httpx.TransportError,
+    *,
+    attempt: int,
+    base_delay_sec: float,
+) -> float:
+    retry_after = _retry_after_seconds(exc)
+    if retry_after is not None:
+        return retry_after
+    if base_delay_sec <= 0:
+        return 0
+    backoff = min(base_delay_sec * (2 ** max(0, attempt - 1)), 30.0)
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+        return min(30.0, backoff + random.uniform(0.0, backoff * 0.25))
+    return backoff
+
+
+def _retry_after_seconds(exc: httpx.HTTPStatusError | httpx.TransportError) -> float | None:
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return None
+    value = exc.response.headers.get("retry-after")
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(0.0, min(float(value), 120.0))
+    except ValueError:
+        try:
+            parsed = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, min((parsed - datetime.now(timezone.utc)).total_seconds(), 120.0))

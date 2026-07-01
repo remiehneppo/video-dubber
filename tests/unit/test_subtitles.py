@@ -10,7 +10,22 @@ from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.orchestrator.checkpoint_store import CheckpointStore
 from dubber.pipeline.stage_context import StageContext
 from dubber.pipeline.stages import run_mixing
-from dubber.subtitles.ass import SubtitleCue, build_subtitle_cues, render_ass
+from dubber.subtitles.ass import SubtitleCue, build_spoken_subtitle_cues, build_subtitle_cues, render_ass
+
+
+def test_spoken_cues_use_exact_final_text_read_by_tts() -> None:
+    cues = build_spoken_subtitle_cues(
+        {"cues": [{
+            "cue_id": "cue_1",
+            "original_start_ms": 1000,
+            "original_end_ms": 5000,
+            "source_text": "Original source",
+            "final_text": "Bản đã rút gọn thực sự được đọc.",
+        }]}
+    )
+
+    assert cues[0].translation_text == "Bản đã rút gọn thực sự được đọc."
+    assert cues[0].source_text == "Original source"
 
 
 def test_build_subtitle_cues_splits_long_word_timed_segment() -> None:
@@ -120,6 +135,7 @@ def _mixing_context(tmp_path: Path, config: DubberConfig) -> tuple[StageContext,
     tts_audio.write_bytes(b"tts")
     (paths.audio_dir / "original.wav").write_bytes(b"original")
     _write_json(paths.artifact_path("segments.v1.json"), {"segments": [{"segment_id": "seg_000001"}]})
+    _write_json(paths.artifact_path("glossary.locked.json"), {"terms": []})
     _write_json(
         paths.artifact_path("transcript.v1.json"),
         {
@@ -136,6 +152,16 @@ def _mixing_context(tmp_path: Path, config: DubberConfig) -> tuple[StageContext,
     _write_json(
         paths.artifact_path("translated.v1.json"),
         {"segments": [{"segment_id": "seg_000001", "vi_text": "Dòng dịch"}]},
+    )
+    _write_json(
+        paths.artifact_path("spoken_cues.v1.json"),
+        {"cues": [{
+            "cue_id": "cue_1",
+            "original_start_ms": 0,
+            "original_end_ms": 900,
+            "source_text": "Source line",
+            "final_text": "Dòng dịch",
+        }]},
     )
     store = CheckpointStore.create(paths.job_state_file, job_id="job_subtitles", input_file=Path("input/input.mp4"))
     manifest = ArtifactManifest.create("job_subtitles", paths.manifest_file)

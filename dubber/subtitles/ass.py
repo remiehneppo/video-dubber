@@ -16,13 +16,28 @@ class SubtitleCue:
     translation_text: str
 
 
+def build_spoken_subtitle_cues(spoken: dict[str, Any]) -> list[SubtitleCue]:
+    """Build subtitle cues from the exact text and timing accepted by TTS QA."""
+    cues: list[SubtitleCue] = []
+    for item in spoken.get("cues", []):
+        if not isinstance(item, dict):
+            continue
+        start_ms = int(item.get("original_start_ms", item.get("target_start_ms", 0)))
+        end_ms = int(item.get("original_end_ms", item.get("target_end_ms", start_ms)))
+        source_text = str(item.get("source_text", "")).strip()
+        display_text = str(item.get("display_text") or item.get("final_text") or "").strip()
+        if source_text or display_text:
+            cues.append(SubtitleCue(start_ms, max(start_ms + 1, end_ms), source_text, display_text))
+    return cues
+
+
 def build_subtitle_cues(
     transcript: dict[str, Any],
     translated: dict[str, Any],
     config: SubtitleConfig,
 ) -> list[SubtitleCue]:
     translations_by_id = {
-        str(segment.get("segment_id")): str(segment.get("vi_text", "")).strip()
+        str(segment.get("segment_id")): str(segment.get("display_text") or segment.get("vi_text") or "").strip()
         for segment in translated.get("segments", [])
         if isinstance(segment, dict)
     }

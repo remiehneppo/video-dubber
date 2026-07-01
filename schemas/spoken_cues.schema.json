@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Spoken cues v1",
+  "type": "object",
+  "required": ["schema_version", "cues"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "cues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["cue_id", "final_text", "audio_path", "target_start_ms", "target_end_ms", "semantic_metrics"],
+        "properties": {
+          "cue_id": {"type": "string", "pattern": "^cue_"},
+          "final_text": {"type": "string"},
+          "audio_path": {"type": "string"},
+          "target_start_ms": {"type": "integer", "minimum": 0},
+          "target_end_ms": {"type": "integer", "minimum": 1},
+          "semantic_metrics": {"type": "object"}
+        }
+      }
+    }
+  }
+}

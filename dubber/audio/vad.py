@@ -22,7 +22,7 @@ class VadConfig:
     hard_max_chunk_ms: int = 90_000
     silence_merge_threshold_ms: int = 2_500
     context_padding_ms: int = 0
-    soft_split_allowed: bool = True
+    soft_split_allowed: bool = False
     silero_model_path: Path = Path("models/silero_vad.onnx")
     silero_model_url: str = "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx"
     silero_auto_download: bool = True

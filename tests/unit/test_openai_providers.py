@@ -1,15 +1,98 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import wave
 from pathlib import Path
 
 import httpx
 
 from dubber.providers.asr_openai_compatible import OpenAICompatibleASRProvider
 from dubber.providers.llm_openai_compatible import LLMStructuredOutputError, OpenAICompatibleLLMProvider
-from dubber.providers.retry import ProviderRequestError
+from dubber.providers.retry import ProviderRequestError, request_with_retries
 from dubber.providers.tts_openai_compatible import OpenAICompatibleTTSProvider
+
+
+def _wav_bytes(duration_ms: int = 100) -> bytes:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(1000)
+        wav.writeframes((1000).to_bytes(2, "little", signed=True) * duration_ms)
+    return output.getvalue()
+
+
+
+def test_retry_uses_retry_after_for_rate_limits(monkeypatch) -> None:
+    sleeps: list[float] = []
+    attempts = 0
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def request() -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            response = httpx.Response(429, headers={"Retry-After": "7"}, request=httpx.Request("POST", "https://api.example.test"))
+            response.raise_for_status()
+        return httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", "https://api.example.test"))
+
+    monkeypatch.setattr("dubber.providers.retry.asyncio.sleep", fake_sleep)
+
+    response = asyncio.run(request_with_retries(request, provider="llm", max_attempts=2, retry_delay_sec=1))
+
+    assert response.status_code == 200
+    assert sleeps == [7.0]
+
+
+def test_retry_uses_exponential_backoff_without_retry_after(monkeypatch) -> None:
+    sleeps: list[float] = []
+    attempts = 0
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def request() -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 4:
+            response = httpx.Response(503, request=httpx.Request("POST", "https://api.example.test"))
+            response.raise_for_status()
+        return httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", "https://api.example.test"))
+
+    monkeypatch.setattr("dubber.providers.retry.asyncio.sleep", fake_sleep)
+
+    response = asyncio.run(request_with_retries(request, provider="llm", max_attempts=4, retry_delay_sec=2))
+
+    assert response.status_code == 200
+    assert sleeps == [2, 4, 8]
+
+
+def test_retry_adds_jitter_for_rate_limit_without_retry_after(monkeypatch) -> None:
+    sleeps: list[float] = []
+    attempts = 0
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def request() -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            response = httpx.Response(429, request=httpx.Request("POST", "https://api.example.test"))
+            response.raise_for_status()
+        return httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", "https://api.example.test"))
+
+    monkeypatch.setattr("dubber.providers.retry.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("dubber.providers.retry.random.uniform", lambda _start, _end: 0.5)
+
+    response = asyncio.run(request_with_retries(request, provider="llm", max_attempts=2, retry_delay_sec=2))
+
+    assert response.status_code == 200
+    assert sleeps == [2.5]
 
 
 def test_openai_compatible_asr_posts_audio_and_normalizes_result(tmp_path: Path) -> None:
@@ -455,7 +538,7 @@ def test_openai_compatible_tts_writes_audio_file(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         seen["url"] = str(request.url)
         seen["payload"] = json.loads(request.content.decode("utf-8"))
-        return httpx.Response(200, content=b"WAVDATA", headers={"content-type": "audio/wav"})
+        return httpx.Response(200, content=_wav_bytes(), headers={"content-type": "audio/wav"})
 
     provider = OpenAICompatibleTTSProvider(
         base_url="https://api.example.test/v1",
@@ -468,7 +551,7 @@ def test_openai_compatible_tts_writes_audio_file(tmp_path: Path) -> None:
 
     assert seen["url"] == "https://api.example.test/v1/audio/speech"
     assert seen["payload"] == {"model": "tts-1", "input": "xin chao", "voice": "nova"}
-    assert output.read_bytes() == b"WAVDATA"
+    assert output.read_bytes().startswith(b"RIFF")
     assert result.audio_path == output
 
 
@@ -481,7 +564,7 @@ def test_openai_compatible_tts_retries_transient_server_errors(tmp_path: Path) -
         attempts += 1
         if attempts < 5:
             return httpx.Response(502, json={"error": "bad gateway"})
-        return httpx.Response(200, content=b"WAVDATA", headers={"content-type": "audio/wav"})
+        return httpx.Response(200, content=_wav_bytes(), headers={"content-type": "audio/wav"})
 
     provider = OpenAICompatibleTTSProvider(
         base_url="https://api.example.test/v1",
@@ -494,5 +577,27 @@ def test_openai_compatible_tts_retries_transient_server_errors(tmp_path: Path) -
     result = asyncio.run(provider.synthesize("xin chao", voice="nova", output_path=output))
 
     assert attempts == 5
-    assert output.read_bytes() == b"WAVDATA"
+    assert output.read_bytes().startswith(b"RIFF")
     assert result.audio_path == output
+
+
+def test_openai_compatible_tts_rejects_200_json_response(tmp_path: Path) -> None:
+    output = tmp_path / "tts.wav"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"error": "model unavailable"})
+
+    provider = OpenAICompatibleTTSProvider(
+        base_url="https://api.example.test/v1",
+        api_key="secret",
+        model="tts-1",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    try:
+        asyncio.run(provider.synthesize("xin chao", voice="nova", output_path=output))
+    except ValueError as exc:
+        assert "audio content type" in str(exc)
+    else:
+        raise AssertionError("expected invalid TTS response to fail")
+    assert not output.exists()

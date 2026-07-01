@@ -50,6 +50,10 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
                 "  soft_split_allowed: false",
                 "translation:",
                 "  glossary_review: false",
+                "dubbing_cues:",
+                "  target_duration_ms: 3800",
+                "  min_duration_ms: 1400",
+                "  max_duration_ms: 5900",
                 "tts_service:",
                 "  quality_retry_attempts: 4",
                 "  rephrase_attempts: 1",
@@ -63,6 +67,11 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
                 "  clause_pause_threshold_ms: 850",
                 "  max_overflow_ms: 4200",
                 "  overflow_reserve_ms: 180",
+                "  start_delay_ms: 25",
+                "  retained_edge_silence_ms: 90",
+                "  semantic_max_cer: 0.2",
+                "  semantic_min_token_recall: 0.9",
+                "  semantic_retry_attempts: 5",
             ]
         ),
         encoding="utf-8",
@@ -99,6 +108,9 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
     assert config.vad.context_padding_ms == 300
     assert config.vad.soft_split_allowed is False
     assert config.translation.glossary_review is False
+    assert config.dubbing_cues.target_duration_ms == 3800
+    assert config.dubbing_cues.min_duration_ms == 1400
+    assert config.dubbing_cues.max_duration_ms == 5900
     assert config.tts_service.quality_retry_attempts == 4
     assert config.tts_service.rephrase_attempts == 1
     assert config.tts_service.max_speedup_ratio == 1.25
@@ -111,6 +123,11 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
     assert config.tts_service.clause_pause_threshold_ms == 850
     assert config.tts_service.max_overflow_ms == 4200
     assert config.tts_service.overflow_reserve_ms == 180
+    assert config.tts_service.start_delay_ms == 25
+    assert config.tts_service.retained_edge_silence_ms == 90
+    assert config.tts_service.semantic_max_cer == 0.2
+    assert config.tts_service.semantic_min_token_recall == 0.9
+    assert config.tts_service.semantic_retry_attempts == 5
     assert config.input.allowed_extensions == [".mp4", ".mkv", ".mov"]
 
 
@@ -128,6 +145,7 @@ def test_load_config_applies_asr_driven_segmentation_settings(tmp_path: Path) ->
                 "asr_service:",
                 "  timestamp_mode: prefer_word",
                 "  require_timestamps: true",
+                "  require_word_timestamps: true",
                 "  allow_chunk_text_fallback: false",
                 "  vad_filter: false",
                 "transcript_segmentation:",
@@ -148,8 +166,10 @@ def test_load_config_applies_asr_driven_segmentation_settings(tmp_path: Path) ->
     assert config.vad.target_min_chunk_ms == 20_000
     assert config.vad.preferred_max_chunk_ms == 45_000
     assert config.vad.hard_max_chunk_ms == 90_000
+    assert config.vad.soft_split_allowed is False
     assert config.asr_service.timestamp_mode == "prefer_word"
     assert config.asr_service.require_timestamps is True
+    assert config.asr_service.require_word_timestamps is True
     assert config.asr_service.allow_chunk_text_fallback is False
     assert config.asr_service.vad_filter is False
     assert config.transcript_segmentation.target_min_segment_ms == 8_000
@@ -157,6 +177,15 @@ def test_load_config_applies_asr_driven_segmentation_settings(tmp_path: Path) ->
     assert config.transcript_segmentation.max_segment_ms == 45_000
     assert config.transcript_segmentation.min_pause_split_ms == 600
     assert config.transcript_segmentation.prefer_punctuation_split is True
+
+
+@pytest.mark.parametrize("name,value", [("max_parallel_jobs", 0), ("asr_concurrency", -1), ("llm_concurrency", 1.5), ("tts_concurrency", True)])
+def test_load_config_rejects_invalid_concurrency(tmp_path: Path, name: str, value: object) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(f"runtime:\n  {name}: {str(value).lower()}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=rf"runtime\.{name} must be an integer >= 1"):
+        load_config(config_file)
 
 
 def test_workspace_paths_create_expected_layout_and_reject_traversal(tmp_path: Path) -> None:

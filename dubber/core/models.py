@@ -16,6 +16,7 @@ class ProjectConfig:
     name: str = "video-dubber"
     output_format: str = "mp4"
     domain: str = "mathematics"
+    domain_profile: str = ""
     output_dir: Path = Path("output")
     workspace_dir: Path = Path("workspace")
 
@@ -51,7 +52,7 @@ class VadConfig:
     hard_max_chunk_ms: int = 90_000
     silence_merge_threshold_ms: int = 2_500
     context_padding_ms: int = 1_500
-    soft_split_allowed: bool = True
+    soft_split_allowed: bool = False
     silero_model_path: Path = Path("models/silero_vad.onnx")
     silero_model_url: str = "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx"
     silero_auto_download: bool = True
@@ -96,6 +97,18 @@ class TranslationConfig:
 
 
 @dataclass(frozen=True)
+class SourceNormalizationConfig:
+    llm_adjudication: bool = False
+
+
+@dataclass(frozen=True)
+class DubbingCueConfig:
+    target_duration_ms: int = 4_000
+    min_duration_ms: int = 1_500
+    max_duration_ms: int = 6_000
+
+
+@dataclass(frozen=True)
 class ASRServiceConfig:
     provider: str = "openai_compatible"
     base_url: str = ""
@@ -104,6 +117,7 @@ class ASRServiceConfig:
     language: str = "en"
     timestamp_mode: str = "prefer_word"
     require_timestamps: bool = True
+    require_word_timestamps: bool = True
     allow_chunk_text_fallback: bool = False
     vad_filter: bool = False
 
@@ -145,6 +159,11 @@ class TTSServiceConfig:
     clause_pause_threshold_ms: int = 700
     max_overflow_ms: int = 6_000
     overflow_reserve_ms: int = 120
+    start_delay_ms: int = 0
+    retained_edge_silence_ms: int = 100
+    semantic_max_cer: float = 0.25
+    semantic_min_token_recall: float = 0.85
+    semantic_retry_attempts: int = 3
 
 
 @dataclass(frozen=True)
@@ -153,6 +172,8 @@ class DubberConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     input: InputConfig = field(default_factory=InputConfig)
     translation: TranslationConfig = field(default_factory=TranslationConfig)
+    source_normalization: SourceNormalizationConfig = field(default_factory=SourceNormalizationConfig)
+    dubbing_cues: DubbingCueConfig = field(default_factory=DubbingCueConfig)
     mixing: MixingConfig = field(default_factory=MixingConfig)
     subtitles: SubtitleConfig = field(default_factory=SubtitleConfig)
     vad: VadConfig = field(default_factory=VadConfig)

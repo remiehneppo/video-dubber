@@ -40,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--workspace", default="workspace")
     run_parser.add_argument("--config")
     run_parser.add_argument("--domain")
+    run_parser.add_argument("--domain-profile")
     run_parser.add_argument("--provider-mode", choices=["mock", "openai_compatible"], default="mock")
     run_parser.add_argument("--glossary-review", action="store_true", default=False)
     run_parser.add_argument("--no-glossary-review", action="store_false", dest="glossary_review")
@@ -88,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch_run.add_argument("--workspace", default="workspace")
     batch_run.add_argument("--config")
     batch_run.add_argument("--domain")
+    batch_run.add_argument("--domain-profile")
     batch_run.add_argument("--provider-mode", choices=["mock", "openai_compatible"], default="mock")
     batch_run.add_argument("--glossary-review", action="store_true", default=False)
     batch_run.add_argument("--no-glossary-review", action="store_false", dest="glossary_review")
@@ -127,6 +129,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 workspace_dir=Path(args.workspace),
                 config_path=Path(args.config) if args.config else None,
                 domain=args.domain,
+                domain_profile=args.domain_profile,
                 provider_mode=args.provider_mode,
                 glossary_review=bool(args.glossary_review),
                 crash_stage=args.crash_stage,
@@ -182,6 +185,7 @@ def cmd_batch_run(args: argparse.Namespace) -> int:
                 workspace_dir=Path(args.workspace),
                 config_path=Path(args.config) if args.config else None,
                 domain=args.domain,
+                domain_profile=args.domain_profile,
                 provider_mode=args.provider_mode,
                 glossary_review=bool(args.glossary_review),
             )

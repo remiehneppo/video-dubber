@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Source normalization v1",
+  "type": "object",
+  "required": ["schema_version", "domain_profile", "segments"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "domain_profile": {"type": "string", "minLength": 1},
+    "segments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "segment_id",
+          "source_text_raw",
+          "source_text_normalized",
+          "normalization_edits",
+          "normalization_suggestions",
+          "normalization_confidence",
+          "protected_spans",
+          "risk_flags"
+        ],
+        "properties": {
+          "segment_id": {"type": "string", "minLength": 1},
+          "source_text_raw": {"type": "string"},
+          "source_text_normalized": {"type": "string"},
+          "normalization_edits": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/normalization_edit"}
+          },
+          "normalization_suggestions": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/normalization_suggestion"}
+          },
+          "normalization_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+          "protected_spans": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/protected_span"}
+          },
+          "risk_flags": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "normalization_edit": {
+      "type": "object",
+      "required": ["rule_id", "original", "normalized", "start_char", "end_char", "confidence", "reason"],
+      "properties": {
+        "rule_id": {"type": "string"},
+        "original": {"type": "string"},
+        "normalized": {"type": "string"},
+        "start_char": {"type": "integer", "minimum": 0},
+        "end_char": {"type": "integer", "minimum": 0},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "reason": {"type": "string"}
+      }
+    },
+    "normalization_suggestion": {
+      "type": "object",
+      "required": ["candidate_id", "original", "suggested_normalized", "confidence", "reason", "rule_id"],
+      "properties": {
+        "candidate_id": {"type": "string"},
+        "original": {"type": "string"},
+        "suggested_normalized": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "reason": {"type": "string"},
+        "rule_id": {"const": "llm.source_normalization_suggestion"}
+      }
+    },
+    "protected_span": {
+      "type": "object",
+      "required": ["kind", "source_text", "canonical", "spoken", "display", "start_char", "end_char", "confidence", "rule_id", "forbidden"],
+      "properties": {
+        "kind": {"type": "string"},
+        "source_text": {"type": "string"},
+        "canonical": {"type": "string"},
+        "spoken": {"type": "string"},
+        "display": {"type": "string"},
+        "start_char": {"type": "integer", "minimum": 0},
+        "end_char": {"type": "integer", "minimum": 0},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "rule_id": {"type": "string"},
+        "forbidden": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

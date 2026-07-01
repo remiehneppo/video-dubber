@@ -1,0 +1,23 @@
+{
+  "source": "workspace/batch_ff05119d2ed9/jobs/job_128becb4cbcf/artifacts/transcript.v1.json",
+  "examples": [
+    {
+      "segment_id": "batch_calculus_dr_area",
+      "source_text": "So, approximating this unwrapped ring as a thin rectangle, its area is 2 pi times r, the radius, times dr, the little thickness.",
+      "bad_vi_text": "Diện tích là 2 pi nhân r, tức bán kính, nhân doctor, độ dày nhỏ đó.",
+      "good_vi_text": "Diện tích là 2 pi nhân r, tức bán kính, nhân d r, độ dày nhỏ đó."
+    },
+    {
+      "segment_id": "batch_calculus_dr_spacing",
+      "source_text": "First of all, not only is dr a factor in the quantities we're adding up, 2 pi r times dr, it also gives the spacing between the different values of r.",
+      "bad_vi_text": "Trước hết, doctor không chỉ là một nhân tử trong 2 pi r nhân doctor.",
+      "good_vi_text": "Trước hết, d r không chỉ là một nhân tử trong 2 pi r nhân d r."
+    },
+    {
+      "segment_id": "batch_calculus_formula",
+      "source_text": "The area is πr², or one half times base times height.",
+      "bad_vi_text": "Diện tích là công thức hình tròn.",
+      "good_vi_text": "Diện tích là pi r bình phương, hay một phần hai nhân đáy nhân chiều cao."
+    }
+  ]
+}

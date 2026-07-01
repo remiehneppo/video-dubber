@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from dubber.core.models import ASRServiceConfig, DubberConfig, InputConfig, LLMServiceConfig, MixingConfig, ProjectConfig, RuntimeConfig, SubtitleConfig, TranslationConfig, TranscriptSegmentationConfig, TTSServiceConfig, VadConfig
+from dubber.core.models import ASRServiceConfig, DubberConfig, DubbingCueConfig, InputConfig, LLMServiceConfig, MixingConfig, ProjectConfig, RuntimeConfig, SourceNormalizationConfig, SubtitleConfig, TranslationConfig, TranscriptSegmentationConfig, TTSServiceConfig, VadConfig
 
 
 def load_config(path: Path | str) -> DubberConfig:
@@ -14,6 +14,8 @@ def load_config(path: Path | str) -> DubberConfig:
     runtime = raw.get("runtime", {})
     input_config = raw.get("input", {})
     translation = raw.get("translation", {})
+    source_normalization = raw.get("source_normalization", {})
+    dubbing_cues = raw.get("dubbing_cues", {})
     mixing = raw.get("mixing", {})
     subtitles = raw.get("subtitles", {})
     vad = raw.get("vad", {})
@@ -26,14 +28,15 @@ def load_config(path: Path | str) -> DubberConfig:
             name=str(project.get("name", "video-dubber")),
             output_format=str(project.get("output_format", "mp4")),
             domain=str(project.get("domain", "mathematics")),
+            domain_profile=str(project.get("domain_profile", "")),
             output_dir=Path(str(project.get("output_dir", "output"))),
             workspace_dir=Path(str(project.get("workspace_dir", "workspace"))),
         ),
         runtime=RuntimeConfig(
-            max_parallel_jobs=int(runtime.get("max_parallel_jobs", 1)),
-            asr_concurrency=int(runtime.get("asr_concurrency", 4)),
-            llm_concurrency=int(runtime.get("llm_concurrency", 2)),
-            tts_concurrency=int(runtime.get("tts_concurrency", 4)),
+            max_parallel_jobs=_positive_int(runtime, "max_parallel_jobs", 1),
+            asr_concurrency=_positive_int(runtime, "asr_concurrency", 4),
+            llm_concurrency=_positive_int(runtime, "llm_concurrency", 2),
+            tts_concurrency=_positive_int(runtime, "tts_concurrency", 4),
             retry_max_attempts=int(runtime.get("retry_max_attempts", 3)),
             retry_backoff_sec=int(runtime.get("retry_backoff_sec", 2)),
             request_timeout_sec=int(runtime.get("request_timeout_sec", 120)),
@@ -49,6 +52,14 @@ def load_config(path: Path | str) -> DubberConfig:
             max_context_words=int(translation.get("max_context_words", 350)),
             context_overlap_words=int(translation.get("context_overlap_words", 40)),
             target_segment_count=int(translation.get("target_segment_count", 6)),
+        ),
+        source_normalization=SourceNormalizationConfig(
+            llm_adjudication=bool(source_normalization.get("llm_adjudication", False)),
+        ),
+        dubbing_cues=DubbingCueConfig(
+            target_duration_ms=int(dubbing_cues.get("target_duration_ms", 4_000)),
+            min_duration_ms=int(dubbing_cues.get("min_duration_ms", 1_500)),
+            max_duration_ms=int(dubbing_cues.get("max_duration_ms", 6_000)),
         ),
         mixing=MixingConfig(
             original_ducking_db=float(mixing.get("original_ducking_db", -22.0)),
@@ -82,7 +93,7 @@ def load_config(path: Path | str) -> DubberConfig:
             hard_max_chunk_ms=int(vad.get("hard_max_chunk_ms", vad.get("max_duration_ms", 90_000))),
             silence_merge_threshold_ms=int(vad.get("silence_merge_threshold_ms", 2_500)),
             context_padding_ms=int(vad.get("context_padding_ms", 1_500)),
-            soft_split_allowed=bool(vad.get("soft_split_allowed", True)),
+            soft_split_allowed=bool(vad.get("soft_split_allowed", False)),
             silero_model_path=Path(str(vad.get("silero_model_path", "models/silero_vad.onnx"))),
             silero_model_url=str(vad.get("silero_model_url", "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx")),
             silero_auto_download=bool(vad.get("silero_auto_download", True)),
@@ -100,6 +111,7 @@ def load_config(path: Path | str) -> DubberConfig:
             language=str(asr_service.get("language", "en")),
             timestamp_mode=str(asr_service.get("timestamp_mode", "prefer_word")),
             require_timestamps=bool(asr_service.get("require_timestamps", True)),
+            require_word_timestamps=bool(asr_service.get("require_word_timestamps", True)),
             allow_chunk_text_fallback=bool(asr_service.get("allow_chunk_text_fallback", False)),
             vad_filter=bool(asr_service.get("vad_filter", False)),
         ),
@@ -135,8 +147,20 @@ def load_config(path: Path | str) -> DubberConfig:
             clause_pause_threshold_ms=int(tts_service.get("clause_pause_threshold_ms", 700)),
             max_overflow_ms=int(tts_service.get("max_overflow_ms", 6_000)),
             overflow_reserve_ms=int(tts_service.get("overflow_reserve_ms", 120)),
+            start_delay_ms=int(tts_service.get("start_delay_ms", 0)),
+            retained_edge_silence_ms=int(tts_service.get("retained_edge_silence_ms", 100)),
+            semantic_max_cer=float(tts_service.get("semantic_max_cer", 0.25)),
+            semantic_min_token_recall=float(tts_service.get("semantic_min_token_recall", 0.85)),
+            semantic_retry_attempts=int(tts_service.get("semantic_retry_attempts", 3)),
         ),
     )
+
+
+def _positive_int(values: dict[str, Any], name: str, default: int) -> int:
+    value = values.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"runtime.{name} must be an integer >= 1, got {value!r}")
+    return value
 
 
 def _load_mapping(path: Path) -> dict[str, Any]:

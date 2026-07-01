@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import wave
 
 import httpx
 
@@ -51,9 +52,32 @@ class OpenAICompatibleTTSProvider:
         finally:
             if created_client:
                 await client.aclose()
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if not content_type.startswith("audio/"):
+            raise ValueError(f"TTS response has invalid audio content type: {content_type or 'missing'}")
+        if not response.content:
+            raise ValueError("TTS response body is empty")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(response.content)
-        return TTSResult(audio_path=output_path, duration_ms=None, provider_metadata={"content_type": response.headers.get("content-type")})
+        attempt_path = output_path.with_name(f".{output_path.name}.provider-attempt")
+        attempt_path.write_bytes(response.content)
+        try:
+            with wave.open(str(attempt_path), "rb") as wav:
+                if wav.getsampwidth() != 2 or wav.getframerate() <= 0 or wav.getnframes() <= 0:
+                    raise ValueError("TTS WAV has invalid PCM format or duration")
+                duration_ms = int(wav.getnframes() * 1000 / wav.getframerate())
+        except (wave.Error, EOFError, ValueError) as exc:
+            attempt_path.unlink(missing_ok=True)
+            raise ValueError("TTS response is not a decodable WAV") from exc
+        attempt_path.replace(output_path)
+        return TTSResult(
+            audio_path=output_path,
+            duration_ms=duration_ms,
+            provider_metadata={
+                "content_type": content_type,
+                "response_bytes": len(response.content),
+                "duration_ms": duration_ms,
+            },
+        )
 
     async def close(self) -> None:
         if self.client is not None:

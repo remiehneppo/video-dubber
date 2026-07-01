@@ -109,13 +109,15 @@ def test_validate_translations_rejects_missing_segment() -> None:
         )
 
 
-def test_validate_translations_rejects_glossary_violation() -> None:
-    with pytest.raises(TranslationValidationError, match="locked glossary term"):
-        validate_translations(
-            [{"segment_id": "seg_000001", "source_text": "eigenvector"}],
-            [{"segment_id": "seg_000001", "vi_text": "một hướng đặc biệt"}],
-            [{"original": "eigenvector", "vietnamese": "vectơ riêng", "locked": True}],
-        )
+def test_validate_translations_warns_without_prepending_glossary_violation() -> None:
+    report = validate_translations(
+        [{"segment_id": "seg_000001", "source_text": "eigenvector"}],
+        [{"segment_id": "seg_000001", "vi_text": "một hướng đặc biệt"}],
+        [{"original": "eigenvector", "vietnamese": "vectơ riêng", "locked": True}],
+    )
+
+    glossary_warning = next(item for item in report.warnings if item["warning"] == "locked_glossary_term_missing")
+    assert glossary_warning["original"] == "eigenvector"
 
 
 def test_validate_translations_warns_when_translation_is_too_long() -> None:

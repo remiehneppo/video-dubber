@@ -6,6 +6,7 @@ from typing import Any
 
 from dubber.core.io import read_json
 from dubber.core.models import DubberConfig
+from dubber.core.concurrency import ProviderConcurrency, validate_threaded_provider_clients
 from dubber.core.paths import WorkspacePaths
 from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.orchestrator.checkpoint_store import CheckpointStore
@@ -22,6 +23,7 @@ class StageContext:
     config: DubberConfig = field(default_factory=DubberConfig)
     provider_mode: str = "mock"
     provider_bundle: ProviderBundle | None = None
+    concurrency: ProviderConcurrency | None = None
 
     def artifact_json(self, filename: str) -> dict[str, Any]:
         return read_json(self.paths.artifact_path(filename))
@@ -32,4 +34,10 @@ class StageContext:
     def require_provider_bundle(self) -> ProviderBundle:
         if self.provider_bundle is None:
             raise RuntimeError("provider bundle is not configured")
+        validate_threaded_provider_clients(self.provider_bundle)
         return self.provider_bundle
+
+    def require_concurrency(self) -> ProviderConcurrency:
+        if self.concurrency is None:
+            self.concurrency = ProviderConcurrency(self.config.runtime)
+        return self.concurrency

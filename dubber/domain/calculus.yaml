@@ -1,0 +1,50 @@
+id: calculus
+version: 1
+description: Calculus and educational mathematics notation rules for translation and TTS.
+prompt_summary: >
+  Calculus notation is technical content. Preserve differential notation and
+  formulas. Never expand dr/dx/dy/dt as English abbreviations or job titles.
+glossary_seeds:
+  - original: dr
+    vietnamese: d r
+    category: calculus_notation
+    spoken: d r
+    display: dr
+    forbidden: ["doctor", "bác sĩ", "tiến sĩ"]
+  - original: dx
+    vietnamese: d x
+    category: calculus_notation
+    spoken: d x
+    display: dx
+  - original: dy
+    vietnamese: d y
+    category: calculus_notation
+    spoken: d y
+    display: dy
+  - original: dt
+    vietnamese: d t
+    category: calculus_notation
+    spoken: d t
+    display: dt
+  - original: dy/dx
+    vietnamese: d y trên d x
+    category: calculus_notation
+    spoken: d y trên d x
+    display: dy/dx
+  - original: d/dx
+    vietnamese: d trên d x
+    category: calculus_notation
+    spoken: d trên d x
+    display: d/dx
+  - original: πr²
+    vietnamese: pi r bình phương
+    category: formula
+    spoken: pi r bình phương
+    display: πr²
+  - original: ½
+    vietnamese: một phần hai
+    category: fraction
+    spoken: một phần hai
+    display: ½
+forbidden_translations:
+  dr: ["doctor", "bác sĩ", "tiến sĩ"]

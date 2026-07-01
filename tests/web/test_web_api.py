@@ -91,6 +91,75 @@ def test_web_api_lists_batch_and_resolves_nested_job(tmp_path: Path) -> None:
     assert client.get("/api/jobs/job_nested").json()["current_stage"] == "asr"
 
 
+def test_web_api_gets_and_locks_review_for_nested_job(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    job = workspace / "batch_demo" / "jobs" / "job_review"
+    artifacts = job / "artifacts"
+    artifacts.mkdir(parents=True)
+    (job / "job_state.json").write_text(
+        json.dumps({
+            "job_id": "job_review",
+            "status": "waiting_review",
+            "current_stage": "translation",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }),
+        encoding="utf-8",
+    )
+    required = {
+        "schema_version": "1.0",
+        "status": "required",
+        "review_scope": "high_risk_cues",
+        "cues": [
+            {
+                "cue_id": "cue_001",
+                "source_text_raw": "thickness doctor",
+                "source_text_normalized": "thickness dr",
+                "display_text": "độ dày dr",
+                "spoken_text": "độ dày d r",
+                "protected_spans": [],
+                "review_overrides": {"spoken_text": "độ dày d r"},
+            }
+        ],
+    }
+    (artifacts / "review.required.json").write_text(json.dumps(required), encoding="utf-8")
+    client = TestClient(create_app(workspace))
+
+    review = client.get("/api/jobs/job_review/review")
+
+    assert review.status_code == 200
+    assert review.json()["status"] == "required"
+    assert review.json()["required"]["cues"][0]["cue_id"] == "cue_001"
+    assert review.json()["locked"] is None
+
+    locked_payload = {
+        "schema_version": "1.0",
+        "status": "locked",
+        "cues": [
+            {
+                "cue_id": "cue_001",
+                "review_overrides": {
+                    "source_text_normalized": "thickness dr",
+                    "display_text": "độ dày dr",
+                    "spoken_text": "độ dày d r",
+                    "protected_spans": [],
+                    "start_ms": 120,
+                    "end_ms": 1880,
+                },
+            }
+        ],
+    }
+
+    locked = client.put("/api/jobs/job_review/review", json=locked_payload)
+
+    assert locked.status_code == 200
+    assert locked.json()["status"] == "locked"
+    saved = json.loads((artifacts / "review.locked.json").read_text(encoding="utf-8"))
+    assert saved["cues"][0]["review_overrides"]["spoken_text"] == "độ dày d r"
+    assert saved["cues"][0]["review_overrides"]["start_ms"] == 120
+    assert saved["cues"][0]["review_overrides"]["end_ms"] == 1880
+    assert client.get("/api/jobs/job_review/review").json()["locked"]["status"] == "locked"
+
+
 def _make_sample_video(path: Path) -> None:
     subprocess.run(
         [

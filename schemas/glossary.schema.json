@@ -6,6 +6,7 @@
   "properties": {
     "schema_version": {"type": "string"},
     "domain": {"type": "string"},
+    "domain_profile": {"type": "string"},
     "status": {"type": "string", "enum": ["draft", "locked"]},
     "terms": {
       "type": "array",
@@ -19,6 +20,10 @@
           "category": {"type": "string"},
           "confidence": {"type": "number"},
           "locked": {"type": "boolean"},
+          "protected": {"type": "boolean"},
+          "spoken": {"type": "string"},
+          "display": {"type": "string"},
+          "forbidden": {"type": "array", "items": {"type": "string"}},
           "source_segments": {"type": "array", "items": {"type": "string"}},
           "occurrence_count": {"type": "integer"},
           "status": {"type": "string"},

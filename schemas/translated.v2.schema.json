@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Translated segments v2",
+  "type": "object",
+  "required": ["schema_version", "segments"],
+  "properties": {
+    "schema_version": {"const": "2.0"},
+    "domain_profile": {"type": "string"},
+    "segments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "segment_id",
+          "source_text",
+          "display_text",
+          "spoken_text",
+          "protected_spans"
+        ],
+        "properties": {
+          "segment_id": {"type": "string"},
+          "source_text": {"type": "string"},
+          "source_text_raw": {"type": "string"},
+          "display_text": {"type": "string"},
+          "spoken_text": {"type": "string"},
+          "protected_spans": {"type": "array", "items": {"type": "object"}},
+          "used_terms": {"type": "array", "items": {"type": "string"}},
+          "translation_warnings": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "validation_warnings": {"type": "array", "items": {"type": "object"}}
+  }
+}

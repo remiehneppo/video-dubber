@@ -28,10 +28,11 @@ def test_run_vad_uses_configured_max_duration(tmp_path: Path) -> None:
                 frame_ms=100,
                 threshold_ratio=0.2,
                 min_duration_ms=100,
-                max_duration_ms=500,
-                silence_merge_threshold_ms=100,
-                context_padding_ms=50,
-            )
+                    max_duration_ms=500,
+                    silence_merge_threshold_ms=100,
+                    context_padding_ms=50,
+                    soft_split_allowed=True,
+                )
         ),
     )
 

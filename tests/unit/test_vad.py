@@ -109,6 +109,7 @@ def test_detect_segments_splits_long_interval(tmp_path: Path) -> None:
             min_duration_ms=100,
             max_duration_ms=500,
             silence_merge_threshold_ms=100,
+            soft_split_allowed=True,
         ),
     )
 
@@ -273,7 +274,7 @@ def test_silero_vad_requires_available_runtime_or_model(tmp_path: Path) -> None:
         )
 
 
-def test_silero_post_processing_merges_pads_filters_and_splits() -> None:
+def test_silero_post_processing_merges_pads_filters_without_splitting_continuous_speech() -> None:
     segments = post_process_speech_intervals(
         [(100, 240), (500, 1200), (1350, 5200)],
         audio_duration_ms=6000,
@@ -287,10 +288,9 @@ def test_silero_post_processing_merges_pads_filters_and_splits() -> None:
     )
 
     assert [(segment.start_ms, segment.end_ms, segment.split_reason) for segment in segments] == [
-        (300, 2300, "vad_silero"),
-        (2300, 4300, "vad_silero_hard_split"),
-        (4300, 5400, "vad_silero_hard_split"),
+        (300, 5400, "vad_silero_over_hard_max"),
     ]
+    assert segments[0].risk_flags == ["segment_over_hard_max"]
 
 
 def test_silero_post_processing_merges_short_padded_islands_for_asr_context() -> None:
@@ -307,6 +307,24 @@ def test_silero_post_processing_merges_short_padded_islands_for_asr_context() ->
     )
 
     assert [(segment.start_ms, segment.end_ms) for segment in segments] == [(700, 5000), (7700, 9600)]
+
+
+def test_silero_keeps_continuous_speech_intact_when_no_safe_pause_exists() -> None:
+    segments = post_process_speech_intervals(
+        [(0, 10_000)],
+        audio_duration_ms=10_000,
+        min_speech_duration_ms=250,
+        min_silence_duration_ms=500,
+        speech_padding_ms=0,
+        target_min_chunk_ms=2_000,
+        preferred_max_chunk_ms=3_000,
+        hard_max_chunk_ms=5_000,
+        merge_gap_ms=300,
+    )
+
+    assert [(segment.start_ms, segment.end_ms) for segment in segments] == [(0, 10_000)]
+    assert segments[0].split_reason == "vad_silero_over_hard_max"
+    assert segments[0].risk_flags == ["segment_over_hard_max"]
 
 
 def _write_wav(path: Path, chunks: list[tuple[str, int]], sample_rate: int = 1000) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import shutil
 from collections.abc import Awaitable
 from pathlib import Path
@@ -10,21 +11,110 @@ from pathlib import Path
 from dubber.asr.timestamps import NormalizedASRTimestamps, TimestampUnit, normalize_asr_timestamps
 from dubber.audio.vad import VadConfig as AudioVadConfig, detect_segments
 from dubber.core.enums import StageName, StageStatus
+from dubber.core.concurrency import TaskCompletion, run_bounded
 from dubber.core.io import read_json, write_json_atomic
+from dubber.domain.profiles import (
+    DomainProfile,
+    ProtectedSpan,
+    detect_protected_spans,
+    glossary_terms_from_spans,
+    load_domain_profile,
+    normalize_spoken_text,
+    protected_spans_prompt,
+    protected_translation_errors,
+)
 from dubber.orchestrator.segment_checkpoint_store import SegmentCheckpointStore
 from dubber.orchestrator.stage_artifacts import StageArtifacts
 from dubber.pipeline.stage_context import StageContext
 from dubber.providers.llm_openai_compatible import LLMStructuredOutputError
-from dubber.subtitles.ass import build_subtitle_cues, render_ass
-from dubber.tts.clause_builder import TTSWorkItem, build_tts_work_items
-from dubber.tts.segment_producer import produce_mock_tts_segment, produce_provider_tts_rows
+from dubber.subtitles.ass import build_spoken_subtitle_cues, render_ass
+from dubber.tts.segment_producer import produce_mock_tts_segment, produce_provider_tts_segment
 from dubber.tts.track_mixer import assemble_commentary_track
 from dubber.transcript.segmentation import build_transcript_segments
+from dubber.transcript.cues import build_dubbing_cues
+from dubber.transcript.normalization import (
+    attach_source_normalization_suggestions,
+    find_source_normalization_candidates,
+    normalize_transcript_segments,
+)
+from dubber.transcript.timeline import build_speech_timeline
 from dubber.translation.block_builder import TranslationContextBlock, build_translation_context_blocks
 from dubber.translation.compressor import compress_segment_translation
+from dubber.translation.glossary import normalize_glossary_terms
 from dubber.translation.validator import validate_translations
 
 logger = logging.getLogger(__name__)
+
+_HIGH_RISK_CUE_FLAGS = frozenset({
+    "chunk_text_fallback",
+    "cue_duration_exceeds_max_for_safe_boundary",
+    "hard_split",
+    "no_speech_detected",
+    "segment_over_hard_max",
+    "segment_over_max_duration",
+    "timestamps_missing",
+    "word_timestamps_missing",
+})
+
+
+def _glossary_system_prompt(domain: str, profile: DomainProfile | None = None) -> str:
+    profile_text = (
+        f"Domain profile {profile.artifact_id}: {profile.prompt_summary}\n"
+        if profile is not None and profile.profile_id != "generic"
+        else ""
+    )
+    return (
+        f"You extract a compact locked glossary for a {domain} educational video transcript block.\n"
+        f"{profile_text}"
+        "Return raw JSON only.\n"
+        "Select only terms that materially affect translation consistency: domain terms, proper nouns, abbreviations, formulas, symbols, and repeated key phrases.\n"
+        "Do not include generic filler words or ordinary phrases unless they have a domain-specific meaning.\n"
+        "For Vietnamese, use concise natural terminology suitable for spoken educational commentary.\n"
+        "Preserve names, formulas, symbols, units, and conventional notation exactly when translation would be harmful.\n"
+        "Each term must cite source_segments from the provided segment_id values.\n"
+        "Use confidence to reflect certainty; prefer fewer high-value terms over a long noisy glossary."
+    )
+
+
+def _glossary_instruction() -> str:
+    return (
+        "Return exactly one JSON object with a terms array. "
+        "Each term should include term_id, original, vietnamese, category, confidence, source_segments, and notes. "
+        "Keep vietnamese concise; leave notes empty unless a translation choice needs clarification."
+    )
+
+
+def _translation_system_prompt(domain: str, profile: DomainProfile | None = None, retry_instruction: str = "") -> str:
+    profile_text = (
+        f"Domain profile {profile.artifact_id}: {profile.prompt_summary}\n"
+        "Protected calculus notation is binding: do not translate dr/dx/dy/dt as English abbreviations, doctor, bác sĩ, or tiến sĩ.\n"
+        "Produce subtitle/display translation only. The pipeline derives spoken_text deterministically from display_text and protected notation.\n"
+        if profile is not None and profile.profile_id != "generic"
+        else ""
+    )
+    return (
+        f"You translate target_segments from a {domain} educational video transcript into natural Vietnamese dubbing text.\n"
+        f"{profile_text}"
+        "Return raw JSON only.\n"
+        "Translate only target_segments. Use context_before and context_after only to resolve meaning, pronouns, sentence continuations, terminology, and tone.\n"
+        "Do not output translations for context-only segments.\n"
+        "Preserve every required target segment_id exactly and return exactly one output object per required_target_segment_id.\n"
+        "If a target segment begins or ends mid-sentence, translate it as a natural Vietnamese continuation that fits the neighboring context without duplicating the context.\n"
+        "Use locked glossary terms when their originals appear or clearly apply; preserve names, formulas, symbols, variables, units, and numbers accurately.\n"
+        "Optimize for spoken Vietnamese: clear, concise, educational, and easy for TTS to read. Avoid overly literal English word order.\n"
+        "Keep vi_text short enough for the segment duration when possible, but never drop technical meaning.\n"
+        "Fill used_terms with glossary original terms actually used; use translation_warnings for uncertainty, missing context, or length risk."
+        f"{retry_instruction}"
+    )
+
+
+def _translation_instruction() -> str:
+    return (
+        "Return exactly one JSON object with a segments array. "
+        "Return exactly one object for every required target ID and no objects for context-only IDs. "
+        "For each object include segment_id, vi_text, used_terms, length_ratio, and translation_warnings. "
+        "You may include display_text as an alias of vi_text; do not return spoken_text."
+    )
 
 
 def _translation_blocks(ctx: StageContext, segments: list[dict[str, object]]) -> list[TranslationContextBlock]:
@@ -184,6 +274,7 @@ def _translation_response_schema() -> dict[str, object]:
                     "properties": {
                         "segment_id": {"type": "string"},
                         "vi_text": {"type": "string"},
+                        "display_text": {"type": "string"},
                         "used_terms": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -205,6 +296,39 @@ def _translation_response_schema() -> dict[str, object]:
             }
         },
         "required": ["segments"],
+    }
+
+
+def _source_normalization_suggestion_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "suggestions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "segment_id": {"type": "string"},
+                        "candidate_id": {"type": "string"},
+                        "original": {"type": "string"},
+                        "suggested_normalized": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": [
+                        "segment_id",
+                        "candidate_id",
+                        "original",
+                        "suggested_normalized",
+                        "confidence",
+                        "reason",
+                    ],
+                },
+            }
+        },
+        "required": ["suggestions"],
     }
 
 
@@ -234,32 +358,77 @@ def _effective_domain(ctx: StageContext) -> str:
     return (ctx.config.project.domain or "general").strip() or "general"
 
 
+def _effective_domain_profile(ctx: StageContext) -> DomainProfile:
+    return load_domain_profile(_effective_domain(ctx), explicit_profile=ctx.config.project.domain_profile)
+
+
+def _protected_spans_for_segments(segments: list[dict[str, object]], profile: DomainProfile) -> dict[str, list[ProtectedSpan]]:
+    return {
+        str(segment["segment_id"]): detect_protected_spans(str(segment.get("source_text", "")), profile)
+        for segment in segments
+    }
+
+
+def _segment_with_protected_spans(segment: dict[str, object], spans: list[ProtectedSpan]) -> dict[str, object]:
+    if not spans:
+        return segment
+    return {**segment, "protected_spans": protected_spans_prompt(spans)}
+
+
 def _merge_glossary_terms(existing: list[dict[str, object]], new_terms: list[dict[str, object]]) -> list[dict[str, object]]:
-    merged: dict[tuple[str, str, str], dict[str, object]] = {}
-    for term in existing + new_terms:
-        original = str(term.get("original", "")).strip().lower()
-        vietnamese = str(term.get("vietnamese", "")).strip().lower()
-        category = str(term.get("category", "term")).strip().lower()
-        key = (original, vietnamese, category)
-        current = merged.get(key)
-        source_segments = list({str(segment) for segment in term.get("source_segments", [])})
-        if current is None:
-            merged[key] = {
-                "term_id": str(term.get("term_id", f"term_{len(merged) + 1:04d}")),
-                "original": str(term.get("original", "")),
-                "vietnamese": str(term.get("vietnamese", "")),
-                "category": str(term.get("category", "term")),
-                "confidence": float(term.get("confidence", 1.0)),
-                "locked": bool(term.get("locked", True)),
-                "source_segments": source_segments,
-                "notes": str(term.get("notes", "")),
-            }
+    return normalize_glossary_terms([*existing, *new_terms])
+
+
+def _source_normalization_suggestions(ctx: StageContext, segments: list[dict[str, object]], profile: DomainProfile) -> list[dict[str, object]]:
+    if ctx.provider_mode != "openai_compatible" or not ctx.config.source_normalization.llm_adjudication:
+        return []
+    candidates = find_source_normalization_candidates(segments, profile)
+    if not candidates:
+        return []
+    concurrency = ctx.require_concurrency()
+    result = asyncio.run(
+        concurrency.run_llm(
+            lambda: _request_structured_json(
+                ctx.require_provider_bundle().llm,
+                (
+                    "You review ASR source-normalization candidates for technical educational transcripts.\n"
+                    "You only suggest possible source normalization fixes. Do not translate. Do not rewrite unrelated text.\n"
+                    "The deterministic domain profile and user review remain authoritative; your output will be reviewed before TTS."
+                ),
+                json.dumps(
+                    {
+                        "instruction": (
+                            "Return JSON suggestions for candidates that may be ASR mistakes. "
+                            "Use suggested_normalized only for the exact technical source form, or return an empty suggestions array."
+                        ),
+                        "domain": _effective_domain(ctx),
+                        "domain_profile": profile.artifact_id,
+                        "domain_profile_summary": profile.prompt_summary,
+                        "candidates": candidates,
+                    },
+                    ensure_ascii=False,
+                ),
+                _source_normalization_suggestion_schema(),
+                response_name="source_normalization_suggestions",
+                response_description="Source normalization suggestions that require deterministic validation and human review.",
+            )
+        )
+    )
+    raw_suggestions = result.get("suggestions", [])
+    if not isinstance(raw_suggestions, list):
+        return []
+    candidate_ids = {str(candidate["candidate_id"]) for candidate in candidates}
+    segment_ids = {str(candidate["segment_id"]) for candidate in candidates}
+    suggestions: list[dict[str, object]] = []
+    for item in raw_suggestions:
+        if not isinstance(item, dict):
             continue
-        current["confidence"] = max(float(current.get("confidence", 1.0)), float(term.get("confidence", 1.0)))
-        current["source_segments"] = sorted({*map(str, current.get("source_segments", [])), *source_segments})
-        if not current.get("notes") and term.get("notes"):
-            current["notes"] = str(term.get("notes", ""))
-    return list(merged.values())
+        if str(item.get("candidate_id", "")) not in candidate_ids:
+            continue
+        if str(item.get("segment_id", "")) not in segment_ids:
+            continue
+        suggestions.append(dict(item))
+    return suggestions
 
 
 def run_job_init(ctx: StageContext, copied_input: Path) -> None:
@@ -347,6 +516,10 @@ def run_vad(ctx: StageContext) -> None:
 
 
 def run_asr(ctx: StageContext) -> None:
+    if ctx.provider_mode == "openai_compatible" and not ctx.config.asr_service.require_word_timestamps:
+        raise ValueError(
+            "production ASR requires word-level timestamps; set asr_service.require_word_timestamps=true"
+        )
     segments = ctx.artifact_json("segments.v1.json")["segments"]
     publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
     checkpoint_path = ctx.paths.artifact_path("asr_segments.v1.json")
@@ -366,45 +539,86 @@ def run_asr(ctx: StageContext) -> None:
     source_audio = ctx.paths.audio_dir / "vocals.wav"
     provider_bundle = ctx.require_provider_bundle() if ctx.provider_mode == "openai_compatible" else None
 
-    for index, segment in enumerate(segments, start=1):
-        segment_id = str(segment["segment_id"])
-        checkpoint = segment_store.segments[segment_id]
-        raw_path = ctx.paths.raw_dir / "asr" / f"{segment_id}.json"
-        if checkpoint.status == StageStatus.COMPLETED and raw_path.exists():
-            continue
-        try:
-            if ctx.provider_mode == "openai_compatible":
-                assert provider_bundle is not None
-                clip_path = ctx.paths.audio_dir / "asr" / f"{segment_id}.wav"
-                start_ms = int(segment["start_ms"])
-                end_ms = int(segment["end_ms"])
-                ctx.ffmpeg.extract_audio_segment(
-                    source_audio,
-                    clip_path,
-                    start_ms=start_ms,
-                    duration_ms=end_ms - start_ms,
+    if ctx.provider_mode == "openai_compatible":
+        for segment in segments:
+            segment_id = str(segment["segment_id"])
+            raw_path = ctx.paths.raw_dir / "asr" / f"{segment_id}.json"
+            if segment_store.segments[segment_id].status != StageStatus.COMPLETED or not raw_path.exists():
+                continue
+            try:
+                normalize_asr_timestamps(
+                    read_json(raw_path),
+                    chunk_start_ms=int(segment["start_ms"]),
+                    chunk_end_ms=int(segment["end_ms"]),
+                    require_timestamps=ctx.config.asr_service.require_timestamps,
+                    require_word_timestamps=ctx.config.asr_service.require_word_timestamps,
+                    allow_chunk_text_fallback=ctx.config.asr_service.allow_chunk_text_fallback,
                 )
-                result = asyncio.run(provider_bundle.asr.transcribe(clip_path, language="en"))
-                raw_payload = dict(result.raw)
-                if result.confidence is not None:
-                    raw_payload.setdefault("confidence", result.confidence)
-                write_json_atomic(raw_path, raw_payload)
+            except (OSError, ValueError, TypeError) as exc:
+                segment_store.mark(segment_id, StageStatus.FAILED, error=str(exc))
+        segment_store.save()
+
+    pending = [
+        (index, segment)
+        for index, segment in enumerate(segments, start=1)
+        if segment_store.segments[str(segment["segment_id"])].status != StageStatus.COMPLETED
+        or not (ctx.paths.raw_dir / "asr" / f"{segment['segment_id']}.json").exists()
+    ]
+
+    if ctx.provider_mode == "openai_compatible":
+        assert provider_bundle is not None
+        concurrency = ctx.require_concurrency()
+
+        def transcribe(item: tuple[int, dict[str, object]]) -> Path:
+            _, segment = item
+            segment_id = str(segment["segment_id"])
+            raw_path = ctx.paths.raw_dir / "asr" / f"{segment_id}.json"
+            clip_path = ctx.paths.audio_dir / "asr" / f"{segment_id}.wav"
+            start_ms = int(segment["start_ms"])
+            end_ms = int(segment["end_ms"])
+            ctx.ffmpeg.extract_audio_segment(
+                source_audio,
+                clip_path,
+                start_ms=start_ms,
+                duration_ms=end_ms - start_ms,
+            )
+            result = asyncio.run(
+                concurrency.run_asr(lambda: provider_bundle.asr.transcribe(clip_path, language="en"))
+            )
+            raw_payload = dict(result.raw)
+            if result.confidence is not None:
+                raw_payload.setdefault("confidence", result.confidence)
+            write_json_atomic(raw_path, raw_payload)
+            normalize_asr_timestamps(
+                raw_payload,
+                chunk_start_ms=start_ms,
+                chunk_end_ms=end_ms,
+                require_timestamps=ctx.config.asr_service.require_timestamps,
+                require_word_timestamps=ctx.config.asr_service.require_word_timestamps,
+                allow_chunk_text_fallback=ctx.config.asr_service.allow_chunk_text_fallback,
+            )
+            return raw_path
+
+        def save_completion(completion: TaskCompletion[tuple[int, dict[str, object]], Path]) -> None:
+            index, segment = completion.item
+            segment_id = str(segment["segment_id"])
+            if completion.error is not None:
+                segment_store.mark(segment_id, StageStatus.FAILED, error=str(completion.error))
             else:
-                text = f"Mock transcript segment {index} for vertical slice."
-                write_json_atomic(raw_path, {"text": text, "confidence": 1.0})
-            segment_store.mark(
-                segment_id,
-                StageStatus.COMPLETED,
-                artifact=ctx.paths.to_relative(raw_path),
-            )
+                assert completion.result is not None
+                segment_store.mark(
+                    segment_id,
+                    StageStatus.COMPLETED,
+                    artifact=ctx.paths.to_relative(completion.result),
+                )
+                logger.info(
+                    "stage asr segment completed segment=%s index=%s/%s progress=%.1f%% eta_ms=0",
+                    segment_id,
+                    index,
+                    len(segments),
+                    (segment_store.done_count / len(segments)) * 100 if segments else 100.0,
+                )
             segment_store.save()
-            logger.info(
-                "stage asr segment completed segment=%s index=%s/%s progress=%.1f%% eta_ms=0",
-                segment_id,
-                index,
-                len(segments),
-                (segment_store.done_count / len(segments)) * 100 if segments else 100.0,
-            )
             ctx.store.mark_stage(
                 StageName.ASR,
                 StageStatus.RUNNING,
@@ -412,10 +626,24 @@ def run_asr(ctx: StageContext) -> None:
                 total=len(segments),
             )
             ctx.store.save()
-        except Exception as exc:
-            segment_store.mark(segment_id, StageStatus.FAILED, error=str(exc))
+
+        logger.info("stage asr provider concurrency=%s pending=%s", concurrency.asr_limit, len(pending))
+        run_bounded(pending, transcribe, max_workers=concurrency.asr_limit, on_completion=save_completion)
+    else:
+        for index, segment in pending:
+            segment_id = str(segment["segment_id"])
+            raw_path = ctx.paths.raw_dir / "asr" / f"{segment_id}.json"
+            text = f"Mock transcript segment {index} for vertical slice."
+            write_json_atomic(raw_path, {"text": text, "confidence": 1.0})
+            segment_store.mark(segment_id, StageStatus.COMPLETED, artifact=ctx.paths.to_relative(raw_path))
             segment_store.save()
-            raise
+            ctx.store.mark_stage(
+                StageName.ASR,
+                StageStatus.RUNNING,
+                done=segment_store.done_count,
+                total=len(segments),
+            )
+            ctx.store.save()
 
     asr_chunks: list[dict[str, object]] = []
     for segment in segments:
@@ -429,6 +657,7 @@ def run_asr(ctx: StageContext) -> None:
                 chunk_start_ms=int(segment["start_ms"]),
                 chunk_end_ms=int(segment["end_ms"]),
                 require_timestamps=ctx.config.asr_service.require_timestamps,
+                require_word_timestamps=ctx.config.asr_service.require_word_timestamps,
                 allow_chunk_text_fallback=ctx.config.asr_service.allow_chunk_text_fallback,
             )
         else:
@@ -445,10 +674,22 @@ def run_asr(ctx: StageContext) -> None:
                 "raw_response_path": ctx.paths.to_relative(raw_path),
                 "timestamps": normalized,
                 "confidence": confidence,
+                "vad_split_reason": str(segment.get("split_reason", "")),
+                "vad_risk_flags": list(segment.get("risk_flags", [])),
+                "silence_before_ms": int(segment.get("silence_before_ms", 0)),
+                "silence_after_ms": int(segment.get("silence_after_ms", 0)),
             }
         )
 
-    transcript_segments = build_transcript_segments(asr_chunks, ctx.config.transcript_segmentation)
+    profile = _effective_domain_profile(ctx)
+    transcript_segments = normalize_transcript_segments(
+        build_transcript_segments(asr_chunks, ctx.config.transcript_segmentation),
+        profile,
+    )
+    transcript_segments = attach_source_normalization_suggestions(
+        transcript_segments,
+        _source_normalization_suggestions(ctx, transcript_segments, profile),
+    )
     publisher.publish_file(
         stage=StageName.ASR,
         name="asr_segments",
@@ -470,10 +711,35 @@ def run_asr(ctx: StageContext) -> None:
         done=len(segments),
         total=len(segments),
     )
+    publisher.publish_json(
+        stage=StageName.ASR,
+        name="source_normalization",
+        filename="source_normalization.v1.json",
+        payload={
+            "schema_version": "1.0",
+            "domain_profile": profile.artifact_id,
+            "segments": [
+                {
+                    "segment_id": segment["segment_id"],
+                    "source_text_raw": segment.get("source_text_raw", segment.get("source_text", "")),
+                    "source_text_normalized": segment.get("source_text_normalized", segment.get("source_text", "")),
+                    "normalization_edits": segment.get("normalization_edits", []),
+                    "normalization_suggestions": segment.get("normalization_suggestions", []),
+                    "normalization_confidence": segment.get("normalization_confidence", 1.0),
+                    "protected_spans": segment.get("protected_spans", []),
+                    "risk_flags": segment.get("risk_flags", []),
+                }
+                for segment in transcript_segments
+            ],
+        },
+        done=len(segments),
+        total=len(segments),
+    )
 
 
 def run_glossary(ctx: StageContext, *, glossary_review: bool) -> bool:
     domain = _effective_domain(ctx)
+    profile = _effective_domain_profile(ctx)
     publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
     transcript = ctx.artifact_json("transcript.v1.json")
     blocks = _translation_blocks(ctx, transcript["segments"])
@@ -493,27 +759,55 @@ def run_glossary(ctx: StageContext, *, glossary_review: bool) -> bool:
     )
     ctx.store.save()
     source_segments = [str(segment["segment_id"]) for segment in transcript["segments"]]
+    transcript_span_map = _protected_spans_for_segments(transcript["segments"], profile)
+    protected_glossary_terms = glossary_terms_from_spans(
+        [span for spans in transcript_span_map.values() for span in spans],
+        source_segments=source_segments,
+        locked=True,
+    )
     terms: list[dict[str, object]] = []
 
     if ctx.provider_mode == "openai_compatible":
+        concurrency = ctx.require_concurrency()
+        block_terms_by_id: dict[str, list[dict[str, object]]] = {}
+        pending_blocks: list[tuple[int, TranslationContextBlock]] = []
         for block_index, block in enumerate(blocks, start=1):
+            block_id = block_ids[block_index - 1]
+            raw_path = ctx.paths.raw_dir / "glossary" / f"{block_id}.json"
+            if checkpoint.segments[block_id].status == StageStatus.COMPLETED and raw_path.exists():
+                block_terms_by_id[block_id] = list(read_json(raw_path).get("terms", []))
+            else:
+                pending_blocks.append((block_index, block))
+
+        def extract_terms(item: tuple[int, TranslationContextBlock]) -> tuple[Path, list[dict[str, object]]]:
+            block_index, block = item
             block_id = block_ids[block_index - 1]
             raw_path = ctx.paths.raw_dir / "glossary" / f"{block_id}.json"
             block_segments = block.all_segments
             block_segment_ids = [str(segment["segment_id"]) for segment in block_segments]
-            if checkpoint.segments[block_id].status == StageStatus.COMPLETED and raw_path.exists():
-                block_terms = list(read_json(raw_path).get("terms", []))
-            else:
-                try:
-                    result = asyncio.run(
-                        _request_structured_json(
+            try:
+                result = asyncio.run(
+                    concurrency.run_llm(
+                        lambda: _request_structured_json(
                             ctx.require_provider_bundle().llm,
-                            f"Extract glossary terms for a {domain} video transcript block. Return raw JSON only.",
+                            _glossary_system_prompt(domain, profile),
                             json.dumps(
                                 {
-                                    "instruction": "Return only a JSON object with a terms array.",
+                                    "instruction": _glossary_instruction(),
                                     "domain": domain,
-                                    "segments": block_segments,
+                                    "domain_profile": profile.artifact_id,
+                                    "domain_profile_summary": profile.prompt_summary,
+                                    "protected_spans": {
+                                        segment_id: protected_spans_prompt(transcript_span_map.get(segment_id, []))
+                                        for segment_id in block_segment_ids
+                                    },
+                                    "segments": [
+                                        _segment_with_protected_spans(
+                                            dict(segment),
+                                            transcript_span_map.get(str(segment["segment_id"]), []),
+                                        )
+                                        for segment in block_segments
+                                    ],
                                 },
                                 ensure_ascii=False,
                             ),
@@ -522,31 +816,62 @@ def run_glossary(ctx: StageContext, *, glossary_review: bool) -> bool:
                             response_description="Glossary terms extracted from the transcript.",
                         )
                     )
-                    raw_terms = result.get("terms", [])
-                except LLMStructuredOutputError as exc:
-                    raw_terms = _fallback_glossary_terms_from_text(
-                        exc.content,
-                        block_index=block_index,
-                        block_segment_ids=block_segment_ids or source_segments,
-                        glossary_review=glossary_review,
-                    )
-                if not isinstance(raw_terms, list):
-                    raw_terms = []
-                block_terms = []
-                for term_index, term in enumerate(raw_terms, start=1):
-                    normalized = _normalize_glossary_term(
-                        term,
-                        block_index=block_index,
-                        term_index=term_index,
-                        block_segment_ids=block_segment_ids or source_segments,
-                        glossary_review=glossary_review,
-                    )
-                    if normalized is not None:
-                        block_terms.append(normalized)
-                write_json_atomic(raw_path, {"schema_version": "1.0", "terms": block_terms})
+                )
+                raw_terms = result.get("terms", [])
+            except LLMStructuredOutputError as exc:
+                raw_terms = _fallback_glossary_terms_from_text(
+                    exc.content,
+                    block_index=block_index,
+                    block_segment_ids=block_segment_ids or source_segments,
+                    glossary_review=glossary_review,
+                )
+            if not isinstance(raw_terms, list):
+                raw_terms = []
+            block_terms: list[dict[str, object]] = []
+            for term_index, term in enumerate(raw_terms, start=1):
+                normalized = _normalize_glossary_term(
+                    term,
+                    block_index=block_index,
+                    term_index=term_index,
+                    block_segment_ids=block_segment_ids or source_segments,
+                    glossary_review=glossary_review,
+                )
+                if normalized is not None:
+                    block_terms.append(normalized)
+            write_json_atomic(raw_path, {"schema_version": "1.0", "terms": block_terms})
+            return raw_path, block_terms
+
+        def save_completion(
+            completion: TaskCompletion[tuple[int, TranslationContextBlock], tuple[Path, list[dict[str, object]]]]
+        ) -> None:
+            block_index, _ = completion.item
+            block_id = block_ids[block_index - 1]
+            if completion.error is not None:
+                checkpoint.mark(block_id, StageStatus.FAILED, error=str(completion.error))
+            else:
+                assert completion.result is not None
+                raw_path, block_terms = completion.result
+                block_terms_by_id[block_id] = block_terms
                 checkpoint.mark(block_id, StageStatus.COMPLETED, artifact=ctx.paths.to_relative(raw_path))
-                checkpoint.save()
-            terms = _merge_glossary_terms(terms, block_terms)
+            checkpoint.save()
+            ctx.store.mark_stage(
+                StageName.GLOSSARY,
+                StageStatus.RUNNING,
+                done=checkpoint.done_count,
+                total=checkpoint.total_count,
+            )
+            ctx.store.save()
+
+        logger.info("stage glossary provider concurrency=%s pending=%s", concurrency.llm_limit, len(pending_blocks))
+        run_bounded(
+            pending_blocks,
+            extract_terms,
+            max_workers=concurrency.llm_limit,
+            on_completion=save_completion,
+        )
+        for block_id in block_ids:
+            terms = _merge_glossary_terms(terms, block_terms_by_id.get(block_id, []))
+        terms = _merge_glossary_terms(protected_glossary_terms, terms)
     else:
         block_id = block_ids[0]
         raw_path = ctx.paths.raw_dir / "glossary" / f"{block_id}.json"
@@ -559,6 +884,7 @@ def run_glossary(ctx: StageContext, *, glossary_review: bool) -> bool:
             "source_segments": source_segments,
             "notes": "Mock glossary entry.",
         }]
+        terms = _merge_glossary_terms(protected_glossary_terms, terms)
         if checkpoint.segments[block_id].status != StageStatus.COMPLETED or not raw_path.exists():
             write_json_atomic(raw_path, {"schema_version": "1.0", "terms": terms})
             checkpoint.mark(block_id, StageStatus.COMPLETED, artifact=ctx.paths.to_relative(raw_path))
@@ -579,6 +905,7 @@ def run_glossary(ctx: StageContext, *, glossary_review: bool) -> bool:
         {
             "schema_version": "1.0",
             "domain": domain,
+            "domain_profile": profile.artifact_id,
             "status": "draft" if glossary_review else "locked",
             "terms": terms,
         },
@@ -595,12 +922,69 @@ def run_glossary(ctx: StageContext, *, glossary_review: bool) -> bool:
     return False
 
 
-def run_translation(ctx: StageContext) -> None:
+def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) -> bool:
     domain = _effective_domain(ctx)
+    profile = _effective_domain_profile(ctx)
     transcript = ctx.artifact_json("transcript.v1.json")
     glossary = ctx.artifact_json("glossary.locked.json")
     publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
-    blocks = _translation_blocks(ctx, transcript["segments"])
+    cue_config = ctx.config.dubbing_cues
+    cues = build_dubbing_cues(
+        transcript["segments"],
+        target_duration_ms=cue_config.target_duration_ms,
+        min_duration_ms=cue_config.min_duration_ms,
+        max_duration_ms=cue_config.max_duration_ms,
+    )
+    transcript_by_id = {str(segment["segment_id"]): segment for segment in transcript["segments"]}
+    cue_segments = []
+    cue_protected_spans: dict[str, list[ProtectedSpan]] = {}
+    for cue in cues:
+        cue_id = str(cue["cue_id"])
+        parents = [transcript_by_id[parent_id] for parent_id in cue["parent_segment_ids"] if parent_id in transcript_by_id]
+        cue["source_text_raw"] = str(cue.get("source_text_raw", "")).strip() or " ".join(
+            str(parent.get("source_text_raw", parent.get("source_text", ""))).strip()
+            for parent in parents
+        ).strip() or str(cue.get("source_text", ""))
+        normalization_edits = [
+            edit
+            for parent in parents
+            for edit in parent.get("normalization_edits", [])
+            if _normalization_item_applies_to_cue(edit, cue)
+        ]
+        normalization_suggestions = [
+            suggestion
+            for parent in parents
+            for suggestion in parent.get("normalization_suggestions", [])
+            if _normalization_item_applies_to_cue(suggestion, cue)
+        ]
+        normalization_confidences = [float(parent.get("normalization_confidence", 1.0)) for parent in parents] or [1.0]
+        cue["normalization_edits"] = normalization_edits
+        cue["normalization_suggestions"] = normalization_suggestions
+        cue["normalization_confidence"] = min(normalization_confidences)
+        cue["risk_flags"] = list(dict.fromkeys([
+            *list(cue.get("risk_flags", [])),
+            *(flag for parent in parents for flag in parent.get("risk_flags", [])),
+        ]))
+        spans = detect_protected_spans(str(cue.get("source_text", "")), profile)
+        cue_protected_spans[cue_id] = spans
+        cue["protected_spans"] = [span.to_dict() for span in spans]
+        cue_segments.append(
+            {
+                "segment_id": cue_id,
+                "source_text": cue["source_text"],
+                "start_ms": cue["start_ms"],
+                "end_ms": cue["end_ms"],
+                "duration_ms": cue["duration_ms"],
+                "parent_segment_ids": cue["parent_segment_ids"],
+                "source_text_raw": cue["source_text_raw"],
+                "normalization_edits": cue["normalization_edits"],
+                "normalization_suggestions": cue["normalization_suggestions"],
+                "normalization_confidence": cue["normalization_confidence"],
+                "risk_flags": cue["risk_flags"],
+                "protected_spans": [span.to_dict() for span in spans],
+            }
+        )
+    blocks = _translation_blocks(ctx, cue_segments)
     block_ids = [f"block_{index:06d}" for index in range(1, len(blocks) + 1)]
     checkpoint = SegmentCheckpointStore.load_or_create(
         ctx.paths.artifact_path("translation_blocks.v1.json"),
@@ -618,49 +1002,93 @@ def run_translation(ctx: StageContext) -> None:
     ctx.store.save()
     provider_translations: dict[str, dict] = {}
 
+    block_results: dict[str, dict[str, object]] = {}
+    pending_blocks: list[tuple[int, TranslationContextBlock]] = []
     for block_index, block in enumerate(blocks, start=1):
         block_id = block_ids[block_index - 1]
         raw_path = ctx.paths.raw_dir / "translation" / f"{block_id}.json"
-        target_ids = [str(segment["segment_id"]) for segment in block.target_segments]
         if checkpoint.segments[block_id].status == StageStatus.COMPLETED and raw_path.exists():
-            block_result = read_json(raw_path)
-        elif ctx.provider_mode == "openai_compatible":
+            block_results[block_id] = read_json(raw_path)
+        else:
+            pending_blocks.append((block_index, block))
+
+    if ctx.provider_mode == "openai_compatible":
+        concurrency = ctx.require_concurrency()
+
+        def translate_block(item: tuple[int, TranslationContextBlock]) -> tuple[Path, dict[str, object]]:
+            block_index, block = item
+            block_id = block_ids[block_index - 1]
+            raw_path = ctx.paths.raw_dir / "translation" / f"{block_id}.json"
+            target_ids = [str(segment["segment_id"]) for segment in block.target_segments]
             collected: dict[str, dict[str, object]] = {}
             targets_by_id = {str(item["segment_id"]): item for item in block.target_segments}
+            protected_retry_used: set[str] = set()
+            protected_retry_messages: dict[str, list[str]] = {}
             max_attempts = max(2, ctx.config.runtime.retry_max_attempts)
             for attempt in range(1, max_attempts + 1):
                 missing = [segment_id for segment_id in target_ids if segment_id not in collected]
                 if not missing:
                     break
-                retry_instruction = (
-                    " This is a retry. Return only the still-missing segment IDs: " + ", ".join(missing)
-                    if attempt > 1 else ""
-                )
+                retry_instruction = ""
+                if attempt > 1:
+                    retry_instruction = "\nRetry constraint: return only the still-missing segment IDs: " + ", ".join(missing)
+                    protected_details = [
+                        f"{segment_id}: " + "; ".join(protected_retry_messages.get(segment_id, []))
+                        for segment_id in missing
+                        if protected_retry_messages.get(segment_id)
+                    ]
+                    if protected_details:
+                        retry_instruction += (
+                            "\nProtected notation correction required: "
+                            + " | ".join(protected_details)
+                            + ". Keep calculus notation such as dr as d r; never translate it as doctor/bác sĩ/tiến sĩ."
+                        )
                 result = asyncio.run(
-                    _request_structured_json(
-                        ctx.require_provider_bundle().llm,
-                        f"Translate the target_segments of a {domain} video transcript block to Vietnamese. Use context only for continuity. Return raw JSON only.{retry_instruction}",
-                        json.dumps(
-                            {
-                                "instruction": "Return only a JSON object with a segments array. Return exactly one object for every required target ID.",
-                                "required_target_segment_ids": missing,
-                                "domain": domain,
-                                "target_segments": [targets_by_id[segment_id] for segment_id in missing],
-                                "context_before": block.context_before,
-                                "context_after": block.context_after,
-                                "glossary": glossary["terms"],
-                            },
-                            ensure_ascii=False,
-                        ),
-                        _translation_response_schema(),
-                        response_name="translation_output",
-                        response_description="Vietnamese translation segments.",
+                    concurrency.run_llm(
+                        lambda: _request_structured_json(
+                            ctx.require_provider_bundle().llm,
+                            _translation_system_prompt(domain, profile, retry_instruction=retry_instruction),
+                            json.dumps(
+                                {
+                                    "instruction": _translation_instruction(),
+                                    "required_target_segment_ids": missing,
+                                    "domain": domain,
+                                    "domain_profile": profile.artifact_id,
+                                    "domain_profile_summary": profile.prompt_summary,
+                                    "target_segments": [targets_by_id[segment_id] for segment_id in missing],
+                                    "context_before": block.context_before,
+                                    "context_after": block.context_after,
+                                    "protected_spans": {
+                                        segment_id: protected_spans_prompt(cue_protected_spans.get(segment_id, []))
+                                        for segment_id in missing
+                                    },
+                                    "glossary": glossary["terms"],
+                                },
+                                ensure_ascii=False,
+                            ),
+                            _translation_response_schema(),
+                            response_name="translation_output",
+                            response_description="Vietnamese translation segments.",
+                        )
                     )
                 )
                 for item in result.get("segments", []):
                     segment_id = str(item.get("segment_id", ""))
-                    if segment_id in missing:
-                        collected[segment_id] = item
+                    if segment_id not in missing:
+                        continue
+                    vi_text = str(item.get("display_text") or item.get("vi_text") or "")
+                    errors = protected_translation_errors(
+                        str(targets_by_id[segment_id].get("source_text", "")),
+                        vi_text,
+                        cue_protected_spans.get(segment_id, []),
+                    )
+                    if errors:
+                        if segment_id in protected_retry_used:
+                            raise ValueError(f"protected span violation for {segment_id}: {'; '.join(errors)}")
+                        protected_retry_used.add(segment_id)
+                        protected_retry_messages[segment_id] = errors
+                        continue
+                    collected[segment_id] = item
             missing = [segment_id for segment_id in target_ids if segment_id not in collected]
             if missing:
                 raise ValueError(
@@ -671,9 +1099,40 @@ def run_translation(ctx: StageContext) -> None:
                 "segments": [collected[segment_id] for segment_id in target_ids],
             }
             write_json_atomic(raw_path, block_result)
-            checkpoint.mark(block_id, StageStatus.COMPLETED, artifact=ctx.paths.to_relative(raw_path))
+            return raw_path, block_result
+
+        def save_completion(
+            completion: TaskCompletion[tuple[int, TranslationContextBlock], tuple[Path, dict[str, object]]]
+        ) -> None:
+            block_index, _ = completion.item
+            block_id = block_ids[block_index - 1]
+            if completion.error is not None:
+                checkpoint.mark(block_id, StageStatus.FAILED, error=str(completion.error))
+            else:
+                assert completion.result is not None
+                raw_path, block_result = completion.result
+                block_results[block_id] = block_result
+                checkpoint.mark(block_id, StageStatus.COMPLETED, artifact=ctx.paths.to_relative(raw_path))
             checkpoint.save()
-        else:
+            ctx.store.mark_stage(
+                StageName.TRANSLATION,
+                StageStatus.RUNNING,
+                done=checkpoint.done_count,
+                total=checkpoint.total_count,
+            )
+            ctx.store.save()
+
+        logger.info("stage translation provider concurrency=%s pending=%s", concurrency.llm_limit, len(pending_blocks))
+        run_bounded(
+            pending_blocks,
+            translate_block,
+            max_workers=concurrency.llm_limit,
+            on_completion=save_completion,
+        )
+    else:
+        for block_index, block in pending_blocks:
+            block_id = block_ids[block_index - 1]
+            raw_path = ctx.paths.raw_dir / "translation" / f"{block_id}.json"
             block_result = {
                 "schema_version": "1.0",
                 "segments": [
@@ -690,26 +1149,79 @@ def run_translation(ctx: StageContext) -> None:
             write_json_atomic(raw_path, block_result)
             checkpoint.mark(block_id, StageStatus.COMPLETED, artifact=ctx.paths.to_relative(raw_path))
             checkpoint.save()
+            block_results[block_id] = block_result
+
+    for block_id in block_ids:
+        block_result = block_results[block_id]
         for item in block_result.get("segments", []):
             provider_translations[str(item["segment_id"])] = item
 
-    translated_segments: list[dict[str, object]] = []
-    for source in transcript["segments"]:
+    translated_cues: list[dict[str, object]] = []
+    for source in cue_segments:
         provider_segment = provider_translations.get(str(source["segment_id"]), {})
+        display_text = str(provider_segment.get("display_text") or provider_segment.get("vi_text") or "")
         candidate = {
             "segment_id": source["segment_id"],
             "source_text": source["source_text"],
-            "vi_text": provider_segment.get("vi_text", ""),
+            "vi_text": display_text,
+            "display_text": display_text,
+            "spoken_text": "",
+            "protected_spans": source.get("protected_spans", []),
             "used_terms": provider_segment.get("used_terms", []),
             "length_ratio": provider_segment.get("length_ratio", 1.0),
             "translation_warnings": provider_segment.get("translation_warnings", []),
         }
         compressed = compress_segment_translation(candidate, glossary["terms"], max_length_ratio=3.0)
         candidate["vi_text"] = compressed.vi_text
+        candidate["display_text"] = compressed.vi_text
+        candidate["spoken_text"] = normalize_spoken_text(
+            str(candidate["display_text"]),
+            cue_protected_spans.get(str(source["segment_id"]), []),
+        )
         candidate["translation_warnings"] = list(candidate["translation_warnings"]) + compressed.warnings
-        translated_segments.append(candidate)
+        translated_cues.append(candidate)
 
-    validation = validate_translations(transcript["segments"], translated_segments, glossary["terms"], max_length_ratio=3.0)
+    validation = validate_translations(
+        cue_segments,
+        translated_cues,
+        glossary["terms"],
+        max_length_ratio=3.0,
+        protected_spans_by_segment={
+            segment_id: [span.to_dict() for span in spans]
+            for segment_id, spans in cue_protected_spans.items()
+        },
+    )
+    translated_by_cue = {str(item["segment_id"]): item for item in translated_cues}
+    for cue in cues:
+        translated = translated_by_cue[str(cue["cue_id"])]
+        cue["translated_text"] = translated["display_text"]
+        cue["display_text"] = translated["display_text"]
+        cue["spoken_text"] = translated["spoken_text"]
+        cue["protected_spans"] = translated.get("protected_spans", [])
+        cue["used_terms"] = translated["used_terms"]
+        cue["translation_warnings"] = translated["translation_warnings"]
+
+    review_locked = _load_review_locked(ctx)
+    if review_locked:
+        _apply_review_locked(cues, review_locked)
+
+    translated_segments: list[dict[str, object]] = []
+    for source in transcript["segments"]:
+        parent_id = str(source["segment_id"])
+        children = [cue for cue in cues if parent_id in cue["parent_segment_ids"]]
+        translated_segments.append({
+            "segment_id": parent_id,
+            "source_text": source["source_text"],
+            "source_text_raw": source.get("source_text_raw", source["source_text"]),
+            "vi_text": " ".join(str(cue["display_text"]).strip() for cue in children).strip(),
+            "display_text": " ".join(str(cue["display_text"]).strip() for cue in children).strip(),
+            "spoken_text": " ".join(str(cue["spoken_text"]).strip() for cue in children).strip(),
+            "protected_spans": [span for cue in children for span in cue.get("protected_spans", [])],
+            "used_terms": list(dict.fromkeys(term for cue in children for term in cue.get("used_terms", []))),
+            "length_ratio": 1.0,
+            "translation_warnings": list(dict.fromkeys(warning for cue in children for warning in cue.get("translation_warnings", []))),
+        })
+    review_items = [] if review_locked else _review_required_items(cues)
     publisher.publish_file(
         stage=StageName.TRANSLATION,
         name="translation_blocks",
@@ -720,16 +1232,267 @@ def run_translation(ctx: StageContext) -> None:
     )
     publisher.publish_json(
         stage=StageName.TRANSLATION,
+        name="dubbing_cues",
+        filename="dubbing_cues.v1.json",
+        payload={"schema_version": "1.0", "cues": cues},
+        status=StageStatus.RUNNING,
+        done=len(cues),
+        total=len(cues),
+    )
+    publisher.publish_json(
+        stage=StageName.TRANSLATION,
+        name="dubbing_cues_v2",
+        filename="dubbing_cues.v2.json",
+        payload={
+            "schema_version": "2.0",
+            "domain_profile": profile.artifact_id,
+            "cues": [_dubbing_cue_v2(cue) for cue in cues],
+        },
+        schema_version="2.0",
+        status=StageStatus.RUNNING,
+        done=len(cues),
+        total=len(cues),
+    )
+    publisher.publish_json(
+        stage=StageName.TRANSLATION,
+        name="speech_timeline",
+        filename="speech_timeline.v1.json",
+        payload=build_speech_timeline(
+            cues,
+            source_segments=transcript["segments"],
+            total_duration_ms=total_duration_ms,
+        ),
+        status=StageStatus.RUNNING,
+        done=len(cues),
+        total=len(cues),
+    )
+    publisher.publish_json(
+        stage=StageName.TRANSLATION,
         name="translated",
         filename="translated.v1.json",
         payload={
             "schema_version": "1.0",
+            "domain_profile": profile.artifact_id,
             "segments": translated_segments,
             "validation_warnings": validation.warnings,
         },
-        done=len(transcript["segments"]),
-        total=len(transcript["segments"]),
+        done=len(cues),
+        total=len(cues),
     )
+    publisher.publish_json(
+        stage=StageName.TRANSLATION,
+        name="translated_v2",
+        filename="translated.v2.json",
+        payload={
+            "schema_version": "2.0",
+            "domain_profile": profile.artifact_id,
+            "segments": [_translated_segment_v2(segment) for segment in translated_segments],
+            "validation_warnings": validation.warnings,
+        },
+        schema_version="2.0",
+        done=len(cues),
+        total=len(cues),
+    )
+    if review_items:
+        publisher.publish_json(
+            stage=StageName.TRANSLATION,
+            name="review_required",
+            filename="review.required.json",
+            payload={
+                "schema_version": "1.0",
+                "domain_profile": profile.artifact_id,
+                "status": "required",
+                "review_scope": "high_risk_cues",
+                "cues": review_items,
+            },
+            status=StageStatus.WAITING_REVIEW,
+            done=0,
+            total=len(review_items),
+        )
+        return True
+    return False
+
+
+def _normalization_item_applies_to_cue(item: object, cue: dict[str, object]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    original = str(item.get("original", "")).strip().casefold()
+    normalized = str(item.get("normalized") or item.get("suggested_normalized") or "").strip().casefold()
+    if not original and not normalized:
+        return True
+    raw_text = str(cue.get("source_text_raw", "")).casefold()
+    source_text = str(cue.get("source_text", "")).casefold()
+    return bool((original and original in raw_text) or (normalized and normalized in source_text))
+
+
+def _dubbing_cue_v2(cue: dict[str, object]) -> dict[str, object]:
+    return {
+        "cue_id": str(cue["cue_id"]),
+        "start_ms": int(cue["start_ms"]),
+        "end_ms": int(cue["end_ms"]),
+        "duration_ms": int(cue["duration_ms"]),
+        "source_text": str(cue.get("source_text", "")),
+        "source_text_raw": str(cue.get("source_text_raw", cue.get("source_text", ""))),
+        "display_text": str(cue.get("display_text") or cue.get("translated_text") or ""),
+        "spoken_text": str(cue.get("spoken_text") or cue.get("translated_text") or ""),
+        "protected_spans": list(cue.get("protected_spans", [])),
+        "normalization_edits": list(cue.get("normalization_edits", [])),
+        "normalization_suggestions": list(cue.get("normalization_suggestions", [])),
+        "normalization_confidence": float(cue.get("normalization_confidence", 1.0)),
+        "risk_flags": list(cue.get("risk_flags", [])),
+        "parent_segment_ids": list(cue.get("parent_segment_ids", [])),
+        "used_terms": list(cue.get("used_terms", [])),
+        "translation_warnings": list(cue.get("translation_warnings", [])),
+    }
+
+
+def _review_required_items(cues: list[dict[str, object]]) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    for cue in cues:
+        normalization_edits = list(cue.get("normalization_edits", []))
+        normalization_suggestions = list(cue.get("normalization_suggestions", []))
+        risk_flags = list(cue.get("risk_flags", []))
+        high_risk_flags = [flag for flag in risk_flags if flag in _HIGH_RISK_CUE_FLAGS]
+        if not normalization_edits and not normalization_suggestions and not high_risk_flags:
+            continue
+        reason = (
+            "source_normalization_review_required"
+            if normalization_edits or normalization_suggestions
+            else "asr_timeline_review_required"
+        )
+        items.append(
+            {
+                "cue_id": str(cue["cue_id"]),
+                "reason": reason,
+                "source_text_raw": str(cue.get("source_text_raw", cue.get("source_text", ""))),
+                "source_text_normalized": str(cue.get("source_text", "")),
+                "display_text": str(cue.get("display_text") or cue.get("translated_text") or ""),
+                "spoken_text": str(cue.get("spoken_text") or cue.get("translated_text") or ""),
+                "protected_spans": list(cue.get("protected_spans", [])),
+                "normalization_edits": normalization_edits,
+                "normalization_suggestions": normalization_suggestions,
+                "risk_flags": risk_flags,
+                "review_overrides": {
+                    "source_text_normalized": str(cue.get("source_text", "")),
+                    "display_text": str(cue.get("display_text") or cue.get("translated_text") or ""),
+                    "spoken_text": str(cue.get("spoken_text") or cue.get("translated_text") or ""),
+                    "protected_spans": list(cue.get("protected_spans", [])),
+                },
+            }
+        )
+    return items
+
+
+def _load_review_locked(ctx: StageContext) -> dict[str, object]:
+    path = ctx.paths.artifact_path("review.locked.json")
+    if not path.exists():
+        return {}
+    data = read_json(path)
+    return data if isinstance(data, dict) else {}
+
+
+def _apply_review_locked(cues: list[dict[str, object]], review_locked: dict[str, object]) -> None:
+    locked_items = review_locked.get("cues", [])
+    if not isinstance(locked_items, list):
+        return
+    by_id = {str(item.get("cue_id")): item for item in locked_items if isinstance(item, dict)}
+    timing_updates: dict[str, tuple[int, int]] = {}
+    for index, cue in enumerate(cues):
+        item = by_id.get(str(cue["cue_id"]))
+        if not item:
+            continue
+        overrides = item.get("review_overrides", item)
+        if not isinstance(overrides, dict):
+            continue
+        if "source_text_normalized" in overrides:
+            cue["source_text"] = str(overrides["source_text_normalized"])
+        if "display_text" in overrides:
+            cue["display_text"] = str(overrides["display_text"])
+            cue["translated_text"] = str(overrides["display_text"])
+        if "spoken_text" in overrides:
+            cue["spoken_text"] = str(overrides["spoken_text"])
+        if "protected_spans" in overrides and isinstance(overrides["protected_spans"], list):
+            cue["protected_spans"] = list(overrides["protected_spans"])
+        if "start_ms" in overrides or "end_ms" in overrides:
+            start_ms = _review_timing_value(
+                overrides.get("start_ms", cue["start_ms"]),
+                cue_id=str(cue["cue_id"]),
+                field="start_ms",
+            )
+            end_ms = _review_timing_value(
+                overrides.get("end_ms", cue["end_ms"]),
+                cue_id=str(cue["cue_id"]),
+                field="end_ms",
+            )
+            _validate_review_timing_override(cues, index, start_ms, end_ms)
+            timing_updates[str(cue["cue_id"])] = (start_ms, end_ms)
+        cue["review_status"] = "locked"
+    for cue in cues:
+        update = timing_updates.get(str(cue["cue_id"]))
+        if update is None:
+            continue
+        start_ms, end_ms = update
+        cue["start_ms"] = start_ms
+        cue["end_ms"] = end_ms
+        cue["duration_ms"] = end_ms - start_ms
+
+
+def _review_timing_value(value: object, *, cue_id: str, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{cue_id}: review timing override {field} must be a non-negative integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{cue_id}: review timing override {field} must be a non-negative integer") from None
+    if parsed < 0:
+        raise ValueError(f"{cue_id}: review timing override {field} must be a non-negative integer")
+    return parsed
+
+
+def _validate_review_timing_override(cues: list[dict[str, object]], index: int, start_ms: int, end_ms: int) -> None:
+    cue_id = str(cues[index]["cue_id"])
+    if end_ms <= start_ms:
+        raise ValueError(f"{cue_id}: review timing override must satisfy start_ms < end_ms")
+    if index > 0:
+        previous_end = int(cues[index - 1]["end_ms"])
+        if start_ms < previous_end:
+            raise ValueError(f"{cue_id}: review timing override overlaps previous cue")
+    if index + 1 < len(cues):
+        next_start = int(cues[index + 1]["start_ms"])
+        if end_ms > next_start:
+            raise ValueError(f"{cue_id}: review timing override overlaps next cue")
+
+
+def _translated_segment_v2(segment: dict[str, object]) -> dict[str, object]:
+    return {
+        "segment_id": str(segment["segment_id"]),
+        "source_text": str(segment.get("source_text", "")),
+        "source_text_raw": str(segment.get("source_text_raw", segment.get("source_text", ""))),
+        "display_text": str(segment.get("display_text") or segment.get("vi_text") or ""),
+        "spoken_text": str(segment.get("spoken_text") or segment.get("vi_text") or ""),
+        "protected_spans": list(segment.get("protected_spans", [])),
+        "used_terms": list(segment.get("used_terms", [])),
+        "translation_warnings": list(segment.get("translation_warnings", [])),
+    }
+
+
+def _timeline_overflow_by_cue(speech_timeline: dict[str, object]) -> dict[str, int]:
+    overflow_by_cue: dict[str, int] = {}
+    gaps = speech_timeline.get("silence_intervals", [])
+    if not isinstance(gaps, list):
+        return overflow_by_cue
+    for gap in gaps:
+        if not isinstance(gap, dict):
+            continue
+        cue_id = gap.get("preceding_cue_id")
+        if cue_id is None:
+            continue
+        try:
+            usable = int(gap.get("usable_overflow_ms", 0))
+        except (TypeError, ValueError):
+            usable = 0
+        overflow_by_cue[str(cue_id)] = max(overflow_by_cue.get(str(cue_id), 0), max(0, usable))
+    return overflow_by_cue
 
 
 def run_tts(
@@ -739,7 +1502,17 @@ def run_tts(
     crash_stage: str | None = None,
     crash_after_segments: int | None = None,
 ) -> Path:
-    segments = ctx.artifact_json("transcript.v1.json")["segments"]
+    cues = ctx.artifact_json("dubbing_cues.v1.json")["cues"]
+    timeline_overflow_by_cue = _timeline_overflow_by_cue(ctx.artifact_json("speech_timeline.v1.json"))
+    segments = [
+        {
+            **cue,
+            "segment_id": cue["cue_id"],
+            "source_text": cue["source_text"],
+            "timeline_usable_overflow_ms": timeline_overflow_by_cue.get(str(cue["cue_id"]), 0),
+        }
+        for cue in cues
+    ]
     segment_ids = [str(segment["segment_id"]) for segment in segments]
     checkpoint = SegmentCheckpointStore.load_or_create(
         ctx.paths.artifact_path("tts_segments.v1.json"),
@@ -758,49 +1531,39 @@ def run_tts(
     if crash_stage == StageName.TTS.value and crash_after_segments == 0:
         raise RuntimeError("simulated crash at tts after 0 segments")
 
-    translations = {
-        str(segment["segment_id"]): segment
-        for segment in ctx.artifact_json("translated.v1.json")["segments"]
-    }
-    if ctx.provider_mode == "openai_compatible":
-        work_items = build_tts_work_items(segments, translations)
-    else:
-        work_items = [
-            TTSWorkItem(segment=segment, translated_text="", parent_segment_ids=(str(segment["segment_id"]),))
-            for segment in segments
-        ]
     manifest_path = ctx.paths.artifact_path("tts_manifest.v1.json")
     existing_rows = list(read_json(manifest_path).get("segments", [])) if manifest_path.exists() else []
-    rows_by_parents: dict[tuple[str, ...], list[dict[str, object]]] = {}
-    for row in existing_rows:
-        parents = tuple(str(item) for item in row.get("parent_segment_ids", [row.get("segment_id")]))
-        rows_by_parents.setdefault(parents, []).append(row)
+    existing_by_id = {str(row["segment_id"]): row for row in existing_rows}
 
-    tts_segments: list[dict[str, object]] = []
-    completed_work_items = 0
-    for index, work_item in enumerate(work_items, start=1):
-        parents = tuple(work_item.parent_segment_ids)
-        prior_rows = rows_by_parents.get(parents, [])
-        reusable = all(
-            checkpoint.segments[parent].status == StageStatus.COMPLETED
-            for parent in parents
-        ) and bool(prior_rows) and all(
-            ctx.paths.resolve_relative(str(row["audio_path"])).exists()
-            for row in prior_rows
+    rows_by_id: dict[str, dict[str, object]] = {}
+    pending: list[tuple[int, dict[str, object]]] = []
+    for index, segment in enumerate(segments):
+        cue_id = str(segment["segment_id"])
+        prior_row = existing_by_id.get(cue_id)
+        reusable = (
+            checkpoint.segments[cue_id].status == StageStatus.COMPLETED
+            and prior_row is not None
+            and ctx.paths.resolve_relative(str(prior_row["audio_path"])).exists()
         )
         if reusable:
-            rows = prior_rows
-        elif ctx.provider_mode == "openai_compatible":
-            tts_config = ctx.config.tts_service
-            rows = asyncio.run(
-                produce_provider_tts_rows(
+            rows_by_id[cue_id] = prior_row
+        else:
+            pending.append((index, segment))
+
+    if ctx.provider_mode == "openai_compatible":
+        tts_config = ctx.config.tts_service
+        concurrency = ctx.require_concurrency()
+        worker_count = max(concurrency.asr_limit, concurrency.llm_limit, concurrency.tts_limit)
+        completed_count = 0
+
+        def produce(item: tuple[int, dict[str, object]]) -> dict[str, object]:
+            index, segment = item
+            tts_text = str(segment.get("spoken_text") or segment.get("translated_text") or "")
+            return asyncio.run(
+                produce_provider_tts_segment(
                     paths=ctx.paths,
-                    segment=work_item.segment,
-                    text=(
-                        work_item.translated_text
-                        if str(work_item.segment.get("source_text", "")).strip()
-                        else ""
-                    ),
+                    segment=segment,
+                    text=tts_text if str(segment.get("source_text", "")).strip() else "",
                     provider_bundle=ctx.require_provider_bundle(),
                     ffmpeg=ctx.ffmpeg,
                     quality_retry_attempts=tts_config.quality_retry_attempts,
@@ -812,37 +1575,126 @@ def run_tts(
                     max_internal_silence_ms=tts_config.max_internal_silence_ms,
                     clipping_peak_threshold=tts_config.clipping_peak_threshold,
                     max_clipped_sample_ratio=tts_config.max_clipped_sample_ratio,
-                    clause_pause_threshold_ms=tts_config.clause_pause_threshold_ms,
-                    max_overflow_ms=tts_config.max_overflow_ms,
-                    overflow_reserve_ms=tts_config.overflow_reserve_ms,
-                    next_segment_start_ms=(
-                        int(work_items[index].segment["start_ms"]) + 500
-                        if index < len(work_items) else duration_ms
+                    max_overflow_ms=min(
+                        tts_config.max_overflow_ms,
+                        int(segment.get("timeline_usable_overflow_ms", 0)),
                     ),
+                    overflow_reserve_ms=0,
+                    start_delay_ms=tts_config.start_delay_ms,
+                    retained_edge_silence_ms=tts_config.retained_edge_silence_ms,
+                    semantic_max_cer=tts_config.semantic_max_cer,
+                    semantic_min_token_recall=tts_config.semantic_min_token_recall,
+                    semantic_retry_attempts=tts_config.semantic_retry_attempts,
+                    next_segment_start_ms=(
+                        int(segments[index + 1]["start_ms"]) + tts_config.start_delay_ms
+                        if index + 1 < len(segments) else duration_ms
+                    ),
+                    concurrency=concurrency,
                 )
             )
-        else:
-            rows = [produce_mock_tts_segment(paths=ctx.paths, segment=work_item.segment)]
-        for row in rows:
-            row["parent_segment_ids"] = list(parents)
-        tts_segments.extend(rows)
-        if not reusable:
-            for parent in parents:
-                checkpoint.mark(parent, StageStatus.COMPLETED, artifact=str(rows[0]["audio_path"]))
+
+        def save_manifest() -> None:
+            ordered_rows = [rows_by_id[segment_id] for segment_id in segment_ids if segment_id in rows_by_id]
+            write_json_atomic(manifest_path, {"schema_version": "1.0", "segments": ordered_rows})
+
+        def save_completion(
+            completion: TaskCompletion[tuple[int, dict[str, object]], dict[str, object]]
+        ) -> None:
+            nonlocal completed_count
+            _, segment = completion.item
+            cue_id = str(segment["segment_id"])
+            if completion.error is not None:
+                checkpoint.mark(cue_id, StageStatus.FAILED, error=str(completion.error))
+                quality_path = ctx.paths.raw_dir / "tts" / f"{cue_id}.quality.json"
+                failed_row: dict[str, object] = read_json(quality_path) if quality_path.exists() else {}
+                failed_row.update({
+                    "cue_id": cue_id,
+                    "segment_id": cue_id,
+                    "status": "failed",
+                    "final_text": str(failed_row.get("final_text", segment.get("spoken_text") or segment["translated_text"])),
+                    "display_text": str(segment.get("display_text") or segment.get("translated_text") or ""),
+                    "spoken_text": str(segment.get("spoken_text") or segment.get("translated_text") or ""),
+                    "final_error": str(completion.error),
+                    "source_text": segment["source_text"],
+                    "parent_segment_ids": list(segment["parent_segment_ids"]),
+                })
+                rows_by_id[cue_id] = failed_row
+            else:
+                assert completion.result is not None
+                row = completion.result
+                row["cue_id"] = cue_id
+                row["source_text"] = segment["source_text"]
+                row["display_text"] = str(segment.get("display_text") or segment.get("translated_text") or "")
+                row["spoken_text"] = str(segment.get("spoken_text") or segment.get("translated_text") or "")
+                row["parent_segment_ids"] = list(segment["parent_segment_ids"])
+                rows_by_id[cue_id] = row
+                checkpoint.mark(cue_id, StageStatus.COMPLETED, artifact=str(row["audio_path"]))
+                completed_count += 1
             checkpoint.save()
-            write_json_atomic(manifest_path, {"schema_version": "1.0", "segments": tts_segments + [
-                row for key, values in rows_by_parents.items() if key not in {tuple(item.parent_segment_ids) for item in work_items[:index]} for row in values
-            ]})
-        completed_work_items += 1
-        ctx.store.mark_stage(
-            StageName.TTS,
-            StageStatus.RUNNING,
-            done=checkpoint.done_count,
-            total=len(segments),
+            save_manifest()
+            ctx.store.mark_stage(
+                StageName.TTS,
+                StageStatus.RUNNING,
+                done=checkpoint.done_count,
+                total=len(segments),
+            )
+            ctx.store.save()
+            if (
+                crash_stage == StageName.TTS.value
+                and crash_after_segments is not None
+                and completed_count == crash_after_segments
+            ):
+                raise RuntimeError(f"simulated crash at tts after {completed_count} segments")
+
+        logger.info(
+            "stage tts provider concurrency tts=%s asr=%s llm=%s cue_workers=%s pending=%s",
+            concurrency.tts_limit,
+            concurrency.asr_limit,
+            concurrency.llm_limit,
+            worker_count,
+            len(pending),
         )
-        ctx.store.save()
-        if crash_stage == StageName.TTS.value and crash_after_segments == completed_work_items:
-            raise RuntimeError(f"simulated crash at tts after {completed_work_items} segments")
+        run_bounded(pending, produce, max_workers=worker_count, on_completion=save_completion)
+    else:
+        for index, segment in pending:
+            cue_id = str(segment["segment_id"])
+            row = produce_mock_tts_segment(paths=ctx.paths, segment=segment)
+            spoken_text = str(segment.get("spoken_text") or segment.get("translated_text") or "")
+            display_text = str(segment.get("display_text") or segment.get("translated_text") or "")
+            row["final_text"] = spoken_text
+            row["display_text"] = display_text
+            row["spoken_text"] = spoken_text
+            row["semantic_metrics"] = {
+                "expected_text": spoken_text,
+                "transcript": spoken_text,
+                "cer": 0.0,
+                "token_recall": 1.0,
+                "mock": True,
+            }
+            row["cue_id"] = cue_id
+            row["source_text"] = segment["source_text"]
+            row["parent_segment_ids"] = list(segment["parent_segment_ids"])
+            rows_by_id[cue_id] = row
+            checkpoint.mark(cue_id, StageStatus.COMPLETED, artifact=str(row["audio_path"]))
+            checkpoint.save()
+            write_json_atomic(
+                manifest_path,
+                {
+                    "schema_version": "1.0",
+                    "segments": [rows_by_id[item_id] for item_id in segment_ids if item_id in rows_by_id],
+                },
+            )
+            ctx.store.mark_stage(
+                StageName.TTS,
+                StageStatus.RUNNING,
+                done=checkpoint.done_count,
+                total=len(segments),
+            )
+            ctx.store.save()
+            if crash_stage == StageName.TTS.value and crash_after_segments == index + 1:
+                raise RuntimeError(f"simulated crash at tts after {index + 1} segments")
+
+    tts_segments = [rows_by_id[segment_id] for segment_id in segment_ids]
 
     mix_audio_path = ctx.paths.tts_dir / "mix.wav"
     assemble_commentary_track(
@@ -864,6 +1716,14 @@ def run_tts(
         name="tts_manifest",
         filename="tts_manifest.v1.json",
         payload={"schema_version": "1.0", "segments": tts_segments},
+        done=len(segments),
+        total=len(segments),
+    )
+    publisher.publish_json(
+        stage=StageName.TTS,
+        name="spoken_cues",
+        filename="spoken_cues.v1.json",
+        payload={"schema_version": "1.0", "cues": tts_segments},
         done=len(segments),
         total=len(segments),
     )
@@ -896,11 +1756,7 @@ def run_mixing(ctx: StageContext, copied_input: Path, tts_audio: Path, duration_
         video_width, video_height = _video_dimensions(ctx.ffmpeg.probe(muxed_video))
         subtitle_ass_path.write_text(
             render_ass(
-                build_subtitle_cues(
-                    ctx.artifact_json("transcript.v1.json"),
-                    ctx.artifact_json("translated.v1.json"),
-                    ctx.config.subtitles,
-                ),
+                build_spoken_subtitle_cues(ctx.artifact_json("spoken_cues.v1.json")),
                 ctx.config.subtitles,
                 video_width=video_width,
                 video_height=video_height,
@@ -912,7 +1768,27 @@ def run_mixing(ctx: StageContext, copied_input: Path, tts_audio: Path, duration_
     tts_manifest_path = ctx.paths.artifact_path("tts_manifest.v1.json")
     tts_manifest = read_json(tts_manifest_path) if tts_manifest_path.exists() else {"segments": []}
     tts_segments = list(tts_manifest.get("segments", []))
+    glossary_terms = list(ctx.artifact_json("glossary.locked.json").get("terms", []))
     overflow_values = [int(segment.get("overflow_ms", 0)) for segment in tts_segments]
+    drift_values = [
+        max(
+            abs(int(segment.get("target_start_ms", 0)) + int(segment.get("quality_report", {}).get("leading_silence_ms", 0)) - int(segment.get("original_start_ms", 0))),
+            max(0, int(segment.get("target_end_ms", 0)) - int(segment.get("original_end_ms", 0))),
+        )
+        for segment in tts_segments
+    ]
+    cer_values = [float(segment.get("semantic_metrics", {}).get("cer", 0.0)) for segment in tts_segments]
+    token_recalls = [float(segment.get("semantic_metrics", {}).get("token_recall", 1.0)) for segment in tts_segments]
+    semantic_retries = sum(
+        1
+        for segment in tts_segments
+        for attempt in segment.get("quality_attempts", [])
+        if attempt.get("semantic_ok") is False
+    )
+    unused_window_values = [
+        max(0, int(segment.get("target_window_ms", 0)) - int(segment.get("tts_duration_ms", 0) / max(1.0, float(segment.get("stretch_ratio", 1.0)))))
+        for segment in tts_segments
+    ]
     write_json_atomic(
         qa_path,
         {
@@ -921,11 +1797,19 @@ def run_mixing(ctx: StageContext, copied_input: Path, tts_audio: Path, duration_
             "input_duration_ms": duration_ms,
             "output_duration_ms": ctx.ffmpeg.duration_ms(output_video),
             "segments_total": len(ctx.artifact_json("segments.v1.json")["segments"]),
+            "cues_total": len(tts_segments),
             "low_confidence_segments": 0,
-            "glossary_terms": 1,
+            "glossary_terms": len(glossary_terms),
             "tts_overflow_segments": sum(1 for value in overflow_values if value > 0),
             "max_overflow_ms": max(overflow_values, default=0),
-            "sync_drift_p95_ms": 0,
+            "sync_drift_p95_ms": _percentile(drift_values, 0.95),
+            "rephrased_cues": sum(1 for segment in tts_segments if int(segment.get("rephrase_attempts", 0)) > 0),
+            "semantic_retries": semantic_retries,
+            "semantic_failures": sum(1 for segment in tts_segments if not bool(segment.get("semantic_metrics"))),
+            "semantic_cer_p95": _percentile(cer_values, 0.95),
+            "semantic_token_recall_min": min(token_recalls, default=1.0),
+            "unused_window_total_ms": sum(unused_window_values),
+            "overflow_total_ms": sum(overflow_values),
             "warnings": [],
         },
     )
@@ -974,3 +1858,11 @@ def _video_dimensions(metadata: dict[str, object]) -> tuple[int, int]:
         if width > 0 and height > 0:
             return width, height
     return 1920, 1080
+
+
+def _percentile(values: list[int] | list[float], quantile: float) -> int | float:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * quantile) - 1))
+    return ordered[index]
