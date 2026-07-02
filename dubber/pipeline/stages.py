@@ -7,7 +7,7 @@ import logging
 import math
 import re
 import shutil
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from dubber.asr.timestamps import NormalizedASRTimestamps, TimestampUnit, normalize_asr_timestamps
@@ -30,6 +30,13 @@ from dubber.orchestrator.stage_artifacts import StageArtifacts
 from dubber.pipeline.stage_context import StageContext
 from dubber.providers.llm_openai_compatible import LLMStructuredOutputError
 from dubber.subtitles.ass import build_spoken_subtitle_cues, render_ass
+from dubber.tts.interactive_review import (
+    TTSReviewDecision,
+    TTSReviewRequest,
+    is_manual_tts_review_error,
+    load_tts_interactive_overrides,
+    save_tts_interactive_override,
+)
 from dubber.tts.segment_producer import produce_mock_tts_segment, produce_provider_tts_segment
 from dubber.tts.track_mixer import assemble_commentary_track
 from dubber.transcript.segmentation import build_transcript_segments
@@ -1662,6 +1669,7 @@ def run_tts(
     *,
     crash_stage: str | None = None,
     crash_after_segments: int | None = None,
+    tts_review_handler: Callable[[TTSReviewRequest], TTSReviewDecision] | None = None,
 ) -> Path:
     cues = ctx.artifact_json("dubbing_cues.v2.json")["cues"]
     timeline_overflow_by_cue = _timeline_overflow_by_cue(ctx.artifact_json("speech_timeline.v1.json"))
@@ -1674,6 +1682,7 @@ def run_tts(
         }
         for cue in cues
     ]
+    _apply_tts_overrides(ctx, segments)
     segment_ids = [str(segment["segment_id"]) for segment in segments]
     checkpoint = SegmentCheckpointStore.load_or_create(
         ctx.paths.artifact_path("tts_segments.v1.json"),
@@ -1719,7 +1728,7 @@ def run_tts(
 
         def produce(item: tuple[int, dict[str, object]]) -> dict[str, object]:
             index, segment = item
-            tts_text = str(segment.get("spoken_text") or segment.get("translated_text") or "")
+            tts_text = _tts_text_for_segment(segment)
             return asyncio.run(
                 produce_provider_tts_segment(
                     paths=ctx.paths,
@@ -1758,6 +1767,8 @@ def run_tts(
             ordered_rows = [rows_by_id[segment_id] for segment_id in segment_ids if segment_id in rows_by_id]
             write_json_atomic(manifest_path, {"schema_version": "1.0", "segments": ordered_rows})
 
+        manual_failures: list[tuple[dict[str, object], dict[str, object], BaseException]] = []
+
         def save_completion(
             completion: TaskCompletion[tuple[int, dict[str, object]], dict[str, object]]
         ) -> None:
@@ -1772,22 +1783,24 @@ def run_tts(
                     "cue_id": cue_id,
                     "segment_id": cue_id,
                     "status": "failed",
-                    "final_text": str(failed_row.get("final_text", segment.get("spoken_text") or segment["translated_text"])),
-                    "display_text": str(segment.get("display_text") or segment.get("translated_text") or ""),
-                    "spoken_text": str(segment.get("spoken_text") or segment.get("translated_text") or ""),
+                    "final_text": str(failed_row.get("final_text", _tts_text_for_segment(segment))),
+                    "display_text": _tts_display_text_for_segment(segment),
+                    "spoken_text": _tts_text_for_segment(segment),
                     "final_error": str(completion.error),
                     "source_text": segment["source_text"],
-                    "parent_segment_ids": list(segment["parent_segment_ids"]),
+                    "parent_segment_ids": list(segment.get("parent_segment_ids", [])),
                 })
                 rows_by_id[cue_id] = failed_row
+                if is_manual_tts_review_error(completion.error):
+                    manual_failures.append((segment, failed_row, completion.error))
             else:
                 assert completion.result is not None
                 row = completion.result
                 row["cue_id"] = cue_id
                 row["source_text"] = segment["source_text"]
-                row["display_text"] = str(segment.get("display_text") or segment.get("translated_text") or "")
-                row["spoken_text"] = str(segment.get("spoken_text") or segment.get("translated_text") or "")
-                row["parent_segment_ids"] = list(segment["parent_segment_ids"])
+                row["display_text"] = _tts_display_text_for_segment(segment)
+                row["spoken_text"] = _tts_text_for_segment(segment)
+                row["parent_segment_ids"] = list(segment.get("parent_segment_ids", []))
                 rows_by_id[cue_id] = row
                 checkpoint.mark(cue_id, StageStatus.COMPLETED, artifact=str(row["audio_path"]))
                 completed_count += 1
@@ -1807,28 +1820,76 @@ def run_tts(
             ):
                 raise RuntimeError(f"simulated crash at tts after {completed_count} segments")
 
-        failed_pending = sum(
-            1
-            for _, segment in pending
-            if checkpoint.segments[str(segment["segment_id"])].status == StageStatus.FAILED
-        )
-        logger.info(
-            "stage tts provider concurrency tts=%s asr=%s llm=%s cue_workers=%s reused=%s pending=%s failed_pending=%s",
-            concurrency.tts_limit,
-            concurrency.asr_limit,
-            concurrency.llm_limit,
-            worker_count,
-            len(rows_by_id),
-            len(pending),
-            failed_pending,
-        )
-        run_bounded(pending, produce, max_workers=worker_count, on_completion=save_completion)
+        while True:
+            pending = [
+                (index, segment)
+                for index, segment in enumerate(segments)
+                if checkpoint.segments[str(segment["segment_id"])].status != StageStatus.COMPLETED
+            ]
+            if not pending:
+                break
+            failed_pending = sum(
+                1
+                for _, segment in pending
+                if checkpoint.segments[str(segment["segment_id"])].status == StageStatus.FAILED
+            )
+            logger.info(
+                "stage tts provider concurrency tts=%s asr=%s llm=%s cue_workers=%s reused=%s pending=%s failed_pending=%s",
+                concurrency.tts_limit,
+                concurrency.asr_limit,
+                concurrency.llm_limit,
+                worker_count,
+                len(rows_by_id),
+                len(pending),
+                failed_pending,
+            )
+            manual_failures.clear()
+            try:
+                run_bounded(pending, produce, max_workers=worker_count, on_completion=save_completion)
+            except BaseException:
+                if tts_review_handler is None or not manual_failures:
+                    raise
+                failed_segment, failed_row, failed_error = manual_failures[0]
+                cue_id = str(failed_segment["segment_id"])
+                decision = tts_review_handler(
+                    TTSReviewRequest(
+                        paths=ctx.paths,
+                        cue=failed_segment,
+                        all_cues=segments,
+                        failed_row=failed_row,
+                    )
+                )
+                if decision.action in {"fail", "quit"}:
+                    raise RuntimeError(f"{cue_id}: manual TTS review {decision.action}") from failed_error
+                if decision.action not in {"edit", "silence"}:
+                    raise RuntimeError(f"{cue_id}: unsupported manual TTS review action {decision.action!r}") from failed_error
+                save_tts_interactive_override(
+                    ctx.paths,
+                    cue_id=cue_id,
+                    action=decision.action,
+                    display_text=decision.display_text,
+                    spoken_text=decision.spoken_text,
+                )
+                _apply_tts_override(
+                    failed_segment,
+                    {
+                        "action": decision.action,
+                        "display_text": decision.display_text,
+                        "spoken_text": decision.spoken_text,
+                    },
+                )
+                rows_by_id.pop(cue_id, None)
+                checkpoint.mark(cue_id, StageStatus.PENDING)
+                checkpoint.save()
+                save_manifest()
+                continue
+            break
     else:
         for index, segment in pending:
             cue_id = str(segment["segment_id"])
             row = produce_mock_tts_segment(paths=ctx.paths, segment=segment)
-            spoken_text = str(segment.get("spoken_text") or segment.get("translated_text") or "")
-            display_text = str(segment.get("display_text") or segment.get("translated_text") or "")
+            spoken_text = _tts_text_for_segment(segment)
+            display_text = _tts_display_text_for_segment(segment)
             row["final_text"] = spoken_text
             row["display_text"] = display_text
             row["spoken_text"] = spoken_text
@@ -1841,7 +1902,7 @@ def run_tts(
             }
             row["cue_id"] = cue_id
             row["source_text"] = segment["source_text"]
-            row["parent_segment_ids"] = list(segment["parent_segment_ids"])
+            row["parent_segment_ids"] = list(segment.get("parent_segment_ids", []))
             rows_by_id[cue_id] = row
             checkpoint.mark(cue_id, StageStatus.COMPLETED, artifact=str(row["audio_path"]))
             checkpoint.save()
@@ -1896,6 +1957,37 @@ def run_tts(
         total=len(segments),
     )
     return mix_audio_path
+
+
+def _tts_text_for_segment(segment: dict[str, object]) -> str:
+    if segment.get("tts_manual_action") == "silence":
+        return ""
+    if "spoken_text" in segment:
+        return str(segment.get("spoken_text") or "")
+    return str(segment.get("translated_text") or "")
+
+
+def _tts_display_text_for_segment(segment: dict[str, object]) -> str:
+    if segment.get("tts_manual_action") == "silence":
+        return ""
+    if "display_text" in segment:
+        return str(segment.get("display_text") or "")
+    return str(segment.get("translated_text") or "")
+
+
+def _apply_tts_overrides(ctx: StageContext, segments: list[dict[str, object]]) -> None:
+    overrides = load_tts_interactive_overrides(ctx.paths)
+    for segment in segments:
+        override = overrides.get(str(segment["segment_id"]))
+        if override is not None:
+            _apply_tts_override(segment, override)
+
+
+def _apply_tts_override(segment: dict[str, object], override: dict[str, object]) -> None:
+    action = str(override.get("action") or "edit")
+    segment["tts_manual_action"] = action
+    segment["display_text"] = str(override.get("display_text") or "")
+    segment["spoken_text"] = str(override.get("spoken_text") or "")
 
 
 def run_mixing(ctx: StageContext, copied_input: Path, tts_audio: Path, duration_ms: int) -> Path:

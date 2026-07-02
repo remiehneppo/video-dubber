@@ -12,6 +12,7 @@ from dubber.core.enums import StageName
 from dubber.core.io import read_json, write_json_atomic
 from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.pipeline.job_manager import BatchManager, BatchOptions, JobManager, RunOptions
+from dubber.tts.interactive_review import TerminalTTSReviewHandler
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -128,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def cmd_run(args: argparse.Namespace) -> int:
     try:
-        summary = JobManager().run(
+        summary = JobManager(tts_review_handler=TerminalTTSReviewHandler().review).run(
             RunOptions(
                 input_path=Path(args.input),
                 workspace_dir=Path(args.workspace),
@@ -150,7 +151,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_resume(args: argparse.Namespace) -> int:
     try:
-        summary = JobManager().resume(
+        summary = JobManager(tts_review_handler=TerminalTTSReviewHandler().review).resume(
             Path(args.workspace),
             args.job,
             from_stage=StageName(args.from_stage) if args.from_stage else None,

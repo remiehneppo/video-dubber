@@ -4,6 +4,7 @@ import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
@@ -30,6 +31,7 @@ from dubber.pipeline.stages import (
 )
 from dubber.providers.factory import ProviderBundle, build_provider_bundle
 from dubber.providers.ffmpeg import FFmpegAdapter
+from dubber.tts.interactive_review import TTSReviewDecision, TTSReviewRequest
 from dubber.tts.track_mixer import assemble_commentary_track
 
 
@@ -69,11 +71,13 @@ class JobManager:
         ffmpeg: FFmpegAdapter | None = None,
         provider_bundle: ProviderBundle | None = None,
         concurrency: ProviderConcurrency | None = None,
+        tts_review_handler: Callable[[TTSReviewRequest], TTSReviewDecision] | None = None,
     ) -> None:
         self.ffmpeg = ffmpeg or FFmpegAdapter()
         self.provider_bundle = provider_bundle
         self.provider_mode = "mock"
         self.concurrency = concurrency
+        self.tts_review_handler = tts_review_handler
 
     def run(self, options: RunOptions, *, stop_after: StageName | None = None) -> RunSummary:
         config = load_config(options.config_path or Path("config.example.yaml"))
@@ -269,6 +273,7 @@ class JobManager:
                     duration_ms,
                     crash_stage=crash_stage,
                     crash_after_segments=crash_after_segments,
+                    tts_review_handler=self.tts_review_handler,
                 )
                 if stop_after == StageName.TTS:
                     return self._summary(ctx, JobStatus.RUNNING)
