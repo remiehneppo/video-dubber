@@ -168,12 +168,20 @@ def test_run_asr_transcribes_per_segment_audio(tmp_path: Path) -> None:
     assert sorted(path.name for path in provider_bundle.asr.audio_paths) == ["seg_000001.wav", "seg_000002.wav"]
     assert all(path.parent.name == "asr" for path in provider_bundle.asr.audio_paths)
     transcript = json.loads((paths.artifact_path("transcript.v1.json")).read_text(encoding="utf-8"))
+    word_timeline = json.loads((paths.artifact_path("word_timeline.v1.json")).read_text(encoding="utf-8"))
     source_normalization = json.loads((paths.artifact_path("source_normalization.v1.json")).read_text(encoding="utf-8"))
     assert [segment["source_text"] for segment in transcript["segments"]] == ["First sentence.", "Second sentence."]
     assert [segment["source_text_raw"] for segment in transcript["segments"]] == ["First sentence.", "Second sentence."]
     assert source_normalization["segments"][0]["normalization_edits"] == []
     assert transcript["segments"][0]["timestamp_source"] == "word"
     assert transcript["segments"][0]["source_chunk_id"] == "seg_000001"
+    assert [word["text"] for word in word_timeline["words"]] == [
+        "First",
+        "sentence.",
+        "Second",
+        "sentence.",
+    ]
+    assert word_timeline["words"][0]["segment_id"] == "seg_000001"
     assert store.state.stages["asr"].status == StageStatus.COMPLETED
 
 

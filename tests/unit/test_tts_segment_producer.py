@@ -97,6 +97,7 @@ class FakeLLM:
         assert "Preserve the original meaning" in system_prompt
         assert "formulas, symbols, numbers, units" in system_prompt
         assert "remove redundancy, not information" in system_prompt
+        assert "Never return an empty text value" in system_prompt
         self.calls.append(
             {
                 "system_prompt": system_prompt,
@@ -107,6 +108,16 @@ class FakeLLM:
             }
         )
         return {"text": self.response_text}
+
+
+class SequenceLLM(FakeLLM):
+    def __init__(self, responses: list[str]) -> None:
+        super().__init__(responses[0])
+        self.responses = responses
+
+    async def complete_structured_json(self, *args, **kwargs) -> dict[str, object]:
+        self.response_text = self.responses[min(len(self.calls), len(self.responses) - 1)]
+        return await super().complete_structured_json(*args, **kwargs)
 
 
 class FakeFFmpeg:
@@ -432,6 +443,70 @@ def test_tts_rephrase_targets_cue_plus_borrowable_silence_window(tmp_path: Path)
 
     prompt = json.loads(str(llm.calls[0]["user_prompt"]))
     assert prompt["target_duration_ms"] == 1300
+    assert prompt["max_chars"] < len("Nội dung kỹ thuật ban đầu dài hơn cửa sổ cho phép.")
+    assert 0 < prompt["required_compression_ratio"] < 1
+
+
+def test_tts_rephrase_retries_empty_llm_output_before_failing_cue(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_rephrase_empty")
+    segment = {
+        "segment_id": "cue_rephrase_empty",
+        "start_ms": 0,
+        "end_ms": 1000,
+        "duration_ms": 1000,
+    }
+    original = "Đây là phần giải thích dài cần được rút gọn để vừa nhịp đọc."
+    shortened = "Giải thích rút gọn."
+    llm = SequenceLLM(["", shortened])
+    tts = SequenceProviderTTS([2000, 900])
+
+    row = asyncio.run(
+        produce_provider_tts_segment(
+            paths=paths,
+            segment=segment,
+            text=original,
+            provider_bundle=ProviderBundle(asr=None, llm=llm, tts=tts),
+            ffmpeg=FakeFFmpeg(),
+            max_speedup_ratio=1.2,
+            rephrase_attempts=2,
+        )
+    )
+
+    assert len(llm.calls) == 2
+    assert tts.texts == [original, shortened]
+    assert row["final_text"] == shortened
+    assert row["rephrase_attempts"] == 2
+
+
+def test_tts_rephrase_retries_llm_before_synthesizing_text_over_hard_char_limit(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_rephrase_char_limit")
+    segment = {
+        "segment_id": "cue_char_limit",
+        "start_ms": 0,
+        "end_ms": 1000,
+        "duration_ms": 1000,
+    }
+    original = "Đây là phần giải thích kỹ thuật rất dài cần được rút gọn để vừa nhịp đọc của đoạn gốc."
+    too_long = "Phiên bản này vẫn còn quá dài và không tuân thủ giới hạn ký tự đã yêu cầu."
+    short = "Giải thích kỹ thuật được rút gọn."
+    llm = SequenceLLM([too_long, short])
+    tts = SequenceProviderTTS([2000, 900])
+
+    row = asyncio.run(
+        produce_provider_tts_segment(
+            paths=paths,
+            segment=segment,
+            text=original,
+            provider_bundle=ProviderBundle(asr=None, llm=llm, tts=tts),
+            ffmpeg=FakeFFmpeg(),
+            max_speedup_ratio=1.2,
+            rephrase_attempts=2,
+        )
+    )
+
+    assert len(llm.calls) == 2
+    assert tts.texts == [original, short]
+    assert row["final_text"] == short
 
 
 def test_tts_rephrase_rejects_protected_calculus_notation_change(tmp_path: Path) -> None:
@@ -611,7 +686,7 @@ def test_produce_provider_tts_segment_compacts_excessive_internal_silence(tmp_pa
     assert row["quality_report"]["ok"] is True
 
 
-def test_produce_provider_tts_segment_fails_when_rephrased_audio_is_still_too_long(tmp_path: Path) -> None:
+def test_produce_provider_tts_segment_fails_before_resynthesis_when_rephrase_ignores_limit(tmp_path: Path) -> None:
     paths = WorkspacePaths.create(tmp_path, "job_test")
     segment = {
         "segment_id": "seg_000001",
@@ -622,7 +697,7 @@ def test_produce_provider_tts_segment_fails_when_rephrased_audio_is_still_too_lo
     tts = SequenceProviderTTS([1700, 1600, 1500])
     providers = ProviderBundle(asr=None, llm=FakeLLM("Vẫn dài."), tts=tts)
 
-    with pytest.raises(ValueError, match="seg_000001.*tts_duration_exceeds_max_speedup"):
+    with pytest.raises(ValueError, match="seg_000001.*tts_rephrase_exceeds_char_limit"):
         asyncio.run(
             produce_provider_tts_segment(
                 paths=paths,
@@ -633,6 +708,9 @@ def test_produce_provider_tts_segment_fails_when_rephrased_audio_is_still_too_lo
                 rephrase_attempts=2,
             )
         )
+
+    assert tts.texts == ["Nội dung dài.", "Vẫn dài."]
+    assert len(providers.llm.calls) == 2
 
 
 def test_produce_provider_tts_segment_fails_after_repeated_bad_quality_audio(tmp_path: Path) -> None:

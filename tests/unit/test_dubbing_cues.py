@@ -145,3 +145,74 @@ def test_cue_planner_keeps_formula_intact_when_safe_boundary_exceeds_maximum() -
     formula_cue = next(cue for cue in cues if "2 pi r dr" in str(cue["source_text"]))
     assert formula_cue["duration_ms"] > 2200
     assert "cue_duration_exceeds_max_for_safe_boundary" in formula_cue["risk_flags"]
+
+
+def test_cue_planner_avoids_dangling_linguistic_boundaries() -> None:
+    words = [
+        {"text": "Transformers", "start_ms": 0, "end_ms": 300},
+        {"text": "typically", "start_ms": 400, "end_ms": 700},
+        {"text": "also", "start_ms": 800, "end_ms": 1100},
+        {"text": "include", "start_ms": 1200, "end_ms": 1500},
+        {"text": "a", "start_ms": 1600, "end_ms": 1900},
+        {"text": "second", "start_ms": 2000, "end_ms": 2300},
+        {"text": "type", "start_ms": 2400, "end_ms": 2700},
+        {"text": "of", "start_ms": 2800, "end_ms": 3100},
+        {"text": "operation", "start_ms": 3200, "end_ms": 3500},
+        {"text": "known", "start_ms": 3600, "end_ms": 3900},
+        {"text": "as", "start_ms": 4000, "end_ms": 4300},
+        {"text": "attention.", "start_ms": 4400, "end_ms": 4700},
+        {"text": "This", "start_ms": 5200, "end_ms": 5500},
+        {"text": "matters.", "start_ms": 5600, "end_ms": 5900},
+    ]
+
+    cues = build_dubbing_cues(
+        [{
+            "segment_id": "seg_transformer",
+            "start_ms": 0,
+            "end_ms": words[-1]["end_ms"],
+            "duration_ms": words[-1]["end_ms"],
+            "source_text": " ".join(word["text"] for word in words),
+            "words": words,
+        }],
+        target_duration_ms=4000,
+        min_duration_ms=1500,
+        max_duration_ms=4200,
+    )
+
+    joined = " | ".join(str(cue["source_text"]) for cue in cues)
+    assert "known | as" not in joined
+    assert "as | attention" not in joined
+    assert "known as | attention" not in joined
+    assert "type of | operation" not in joined
+    assert any("operation known as attention." in str(cue["source_text"]) for cue in cues)
+
+
+def test_cue_planner_splits_long_sentence_at_clause_not_dependency_boundary() -> None:
+    text = (
+        "An algorithm called back propagation is used to tweak all of the parameters, "
+        "making the model a little more likely to choose the true last word."
+    )
+    words = [
+        {"text": token, "start_ms": index * 320, "end_ms": index * 320 + 240}
+        for index, token in enumerate(text.split())
+    ]
+
+    cues = build_dubbing_cues(
+        [{
+            "segment_id": "sentence_000001",
+            "parent_segment_ids": ["seg_000001"],
+            "source_text": text,
+            "words": words,
+            "start_ms": 0,
+            "end_ms": words[-1]["end_ms"],
+            "duration_ms": words[-1]["end_ms"],
+        }],
+        target_duration_ms=2800,
+        min_duration_ms=1500,
+        max_duration_ms=3600,
+    )
+
+    joined = " | ".join(str(cue["source_text"]) for cue in cues)
+    assert "all | of" not in joined
+    assert "likely | to" not in joined
+    assert any(str(cue["source_text"]).endswith("parameters,") for cue in cues[:-1])

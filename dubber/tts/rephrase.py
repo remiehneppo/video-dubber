@@ -22,6 +22,8 @@ async def rephrase_tts_text(
     current_duration_ms: int,
     segment_id: str,
     protected_spans: list[dict[str, object]] | None = None,
+    max_chars: int | None = None,
+    required_compression_ratio: float | None = None,
 ) -> str:
     system_prompt = (
         "You shorten Vietnamese dubbing text for TTS timing. Return raw JSON only. "
@@ -29,14 +31,24 @@ async def rephrase_tts_text(
         "Every protected span is binding: preserve its technical concept and use its spoken form; never use a forbidden rendering. "
         "Make the text shorter and easier to speak naturally in Vietnamese; remove redundancy, not information. "
         "Do not add new facts, commentary, greetings, markdown, or explanations. "
-        "Return one concise text value that can be spoken inside the target duration."
+        "Return one concise text value that can be spoken inside the target duration. "
+        "Never return an empty text value. "
+        "If no safe shorter wording exists, return the original text unchanged. "
+        "When max_chars is provided, the text must not exceed that hard character limit."
     )
     user_prompt = json.dumps(
         {
             "segment_id": segment_id,
             "target_duration_ms": target_duration_ms,
             "current_duration_ms": current_duration_ms,
-            "instruction": "Return a shorter natural Vietnamese sentence or phrase in the text field. Keep the same language and preserve all essential technical meaning.",
+            "max_chars": max_chars,
+            "required_compression_ratio": required_compression_ratio,
+            "instruction": (
+                "Return a shorter natural Vietnamese sentence or phrase in the text field. "
+                "Keep the same language and preserve all essential technical meaning. "
+                "The text field must be non-empty. "
+                + (f"Hard limit: at most {max_chars} characters. " if max_chars is not None else "")
+            ),
             "text": text,
             "protected_spans": protected_spans or [],
         },

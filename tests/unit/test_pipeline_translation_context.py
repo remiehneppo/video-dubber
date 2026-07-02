@@ -5,12 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from dubber.core.models import DubberConfig, DubbingCueConfig, ProjectConfig
+from dubber.core.models import DubberConfig, DubbingCueConfig, ProjectConfig, TTSServiceConfig
 from dubber.core.paths import WorkspacePaths
 from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.orchestrator.checkpoint_store import CheckpointStore
 from dubber.pipeline.stage_context import StageContext
-from dubber.pipeline.stages import _fallback_glossary_terms_from_text, _normalize_glossary_term, run_glossary, run_translation
+from dubber.pipeline.stages import _fallback_glossary_terms_from_text, _normalize_glossary_term, _review_required_items, run_glossary, run_translation
 from dubber.providers.factory import ProviderBundle
 from dubber.transcript.cues import build_dubbing_cues
 
@@ -268,6 +268,73 @@ def test_translation_retries_only_missing_segments_and_merges_partial_result(tmp
     assert [item["segment_id"] for item in translated["segments"]] == [item["segment_id"] for item in segments]
 
 
+class BoundaryDedupeLLMProvider:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    async def complete_json(self, system_prompt: str, user_prompt: str, schema: dict) -> dict:
+        payload = json.loads(user_prompt)
+        if system_prompt.startswith("You extract"):
+            return {"terms": []}
+        target_segments = payload["target_segments"]
+        target_ids = [segment["segment_id"] for segment in target_segments]
+        self.calls.append(target_ids)
+        return {
+            "segments": [
+                {
+                    "segment_id": target_segments[0]["segment_id"],
+                    "vi_text": "Cụm mở đầu. Phần tiếp theo.",
+                    "used_terms": [],
+                    "length_ratio": 1.0,
+                    "translation_warnings": [],
+                },
+                {
+                    "segment_id": target_segments[1]["segment_id"],
+                    "vi_text": "Cụm mở đầu. Phần tiếp theo mở rộng.",
+                    "used_terms": [],
+                    "length_ratio": 1.0,
+                    "translation_warnings": [],
+                },
+            ]
+        }
+
+
+def test_translation_trims_repeated_boundary_prefix_before_cue_assembly(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_boundary_dedupe")
+    segments = [
+        {"segment_id": "seg_000001", "start_ms": 0, "end_ms": 1000, "source_text": "First source sentence.", "source_text_raw": "First source sentence."},
+        {"segment_id": "seg_000002", "start_ms": 1000, "end_ms": 2000, "source_text": "Second source sentence.", "source_text_raw": "Second source sentence."},
+    ]
+    _write_segments(paths, segments)
+    _write_transcript(paths, segments)
+    paths.artifact_path("glossary.locked.json").write_text(
+        json.dumps({"schema_version": "1.0", "domain": "seo", "status": "locked", "terms": []}),
+        encoding="utf-8",
+    )
+    store = CheckpointStore.create(paths.job_state_file, job_id="job_boundary_dedupe", input_file=Path("input/video.mp4"))
+    manifest = ArtifactManifest.create("job_boundary_dedupe", paths.manifest_file)
+    llm = BoundaryDedupeLLMProvider()
+    ctx = StageContext(
+        paths=paths,
+        store=store,
+        manifest=manifest,
+        ffmpeg=None,
+        provider_mode="openai_compatible",
+        provider_bundle=ProviderBundle(asr=object(), llm=llm, tts=object()),
+        config=DubberConfig(project=ProjectConfig(domain="seo"), dubbing_cues=DubbingCueConfig(1000, 1000, 1000)),
+    )
+
+    run_translation(ctx)
+
+    translated = json.loads(paths.artifact_path("translated.v1.json").read_text(encoding="utf-8"))
+    cues = json.loads(paths.artifact_path("dubbing_cues.v1.json").read_text(encoding="utf-8"))["cues"]
+    assert translated["segments"][0]["display_text"] == "Cụm mở đầu. Phần tiếp theo."
+    assert translated["segments"][1]["display_text"] == "mở rộng."
+    assert cues[0]["display_text"] == "Cụm mở đầu. Phần tiếp theo."
+    assert cues[1]["display_text"] == "mở rộng."
+    assert "boundary_overlap_trimmed" in cues[1]["translation_warnings"]
+
+
 class ProtectedSpanRetryLLMProvider:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -393,6 +460,57 @@ class ReviewCueLLMProvider:
                 for segment in payload["target_segments"]
             ]
         }
+
+
+class DenseTranslationLLMProvider(ReviewCueLLMProvider):
+    async def complete_json(self, system_prompt: str, user_prompt: str, schema: dict) -> dict:
+        payload = json.loads(user_prompt)
+        return {
+            "segments": [
+                {
+                    "segment_id": segment["segment_id"],
+                    "vi_text": "Nội dung kỹ thuật này quá dài để đọc trong cửa sổ ngắn.",
+                    "used_terms": [],
+                    "length_ratio": 1.0,
+                    "translation_warnings": [],
+                }
+                for segment in payload["target_segments"]
+            ]
+        }
+
+
+def test_review_required_items_are_chronological_and_include_timing() -> None:
+    cues = [
+        {
+            "cue_id": "cue_late",
+            "start_ms": 3000,
+            "end_ms": 4000,
+            "duration_ms": 1000,
+            "source_text_raw": "late raw",
+            "source_text": "late normalized",
+            "display_text": "late display",
+            "spoken_text": "late spoken",
+            "normalization_edits": [{"rule_id": "late"}],
+        },
+        {
+            "cue_id": "cue_early",
+            "start_ms": 1000,
+            "end_ms": 1800,
+            "duration_ms": 800,
+            "source_text_raw": "early raw",
+            "source_text": "early normalized",
+            "display_text": "early display",
+            "spoken_text": "early spoken",
+            "risk_flags": ["tts_timing_density_high"],
+        },
+    ]
+
+    items = _review_required_items(cues)
+
+    assert [item["cue_id"] for item in items] == ["cue_early", "cue_late"]
+    assert [item["start_ms"] for item in items] == [1000, 3000]
+    assert items[0]["review_overrides"]["start_ms"] == 1000
+    assert items[0]["review_overrides"]["end_ms"] == 1800
 
 
 def test_translation_review_required_pauses_and_locked_review_overrides_text(tmp_path: Path) -> None:
@@ -596,6 +714,101 @@ def test_translation_locked_review_rejects_overlapping_timeline_override(tmp_pat
 
     with pytest.raises(ValueError, match="overlaps next cue"):
         run_translation(ctx)
+
+
+def test_translation_stale_review_lock_does_not_approve_new_high_risk_cue(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_stale_review_lock")
+    _write_segments(paths, [{"segment_id": "seg_000001", "start_ms": 0, "end_ms": 2000}])
+    paths.artifact_path("transcript.v1.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "segments": [
+                    {
+                        "segment_id": "seg_000001",
+                        "start_ms": 0,
+                        "end_ms": 2000,
+                        "duration_ms": 2000,
+                        "source_text_raw": "Repeated raw text.",
+                        "source_text": "Normalized text.",
+                        "normalization_edits": [
+                            {
+                                "rule_id": "generic.repeated_asr_loop",
+                                "original": "Repeated raw text.",
+                                "normalized": "Normalized text.",
+                            }
+                        ],
+                        "risk_flags": ["source_normalized_repetitive_asr_loop"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    paths.artifact_path("glossary.locked.json").write_text(
+        json.dumps({"schema_version": "1.0", "domain": "AI", "status": "locked", "terms": []}),
+        encoding="utf-8",
+    )
+    paths.artifact_path("review.locked.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "status": "locked",
+                "cues": [{"cue_id": "cue_from_old_transcript", "review_overrides": {"spoken_text": "old"}}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = CheckpointStore.create(
+        paths.job_state_file,
+        job_id="job_stale_review_lock",
+        input_file=Path("input/video.mp4"),
+    )
+    ctx = StageContext(
+        paths=paths,
+        store=store,
+        manifest=ArtifactManifest.create("job_stale_review_lock", paths.manifest_file),
+        ffmpeg=None,
+        provider_mode="openai_compatible",
+        provider_bundle=ProviderBundle(asr=object(), llm=ReviewCueLLMProvider(), tts=object()),
+        config=DubberConfig(project=ProjectConfig(domain="AI")),
+    )
+
+    assert run_translation(ctx) is True
+    required = json.loads(paths.artifact_path("review.required.json").read_text(encoding="utf-8"))
+    assert required["cues"][0]["cue_id"] != "cue_from_old_transcript"
+
+
+def test_translation_requires_review_when_spoken_text_cannot_fit_timing_budget(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_tts_timing_review")
+    segments = [{"segment_id": "seg_000001", "start_ms": 0, "end_ms": 1200}]
+    _write_segments(paths, segments)
+    _write_transcript(paths, segments)
+    paths.artifact_path("glossary.locked.json").write_text(
+        json.dumps({"schema_version": "1.0", "domain": "AI", "status": "locked", "terms": []}),
+        encoding="utf-8",
+    )
+    ctx = StageContext(
+        paths=paths,
+        store=CheckpointStore.create(
+            paths.job_state_file,
+            job_id="job_tts_timing_review",
+            input_file=Path("input/video.mp4"),
+        ),
+        manifest=ArtifactManifest.create("job_tts_timing_review", paths.manifest_file),
+        ffmpeg=None,
+        provider_mode="openai_compatible",
+        provider_bundle=ProviderBundle(asr=object(), llm=DenseTranslationLLMProvider(), tts=object()),
+        config=DubberConfig(
+            project=ProjectConfig(domain="AI"),
+            dubbing_cues=DubbingCueConfig(1200, 1000, 1600),
+            tts_service=TTSServiceConfig(max_speedup_ratio=1.2),
+        ),
+    )
+
+    assert run_translation(ctx) is True
+    required = json.loads(paths.artifact_path("review.required.json").read_text(encoding="utf-8"))
+    assert "tts_timing_density_high" in required["cues"][0]["risk_flags"]
 
 
 def test_translation_review_required_for_llm_source_normalization_suggestion(tmp_path: Path) -> None:

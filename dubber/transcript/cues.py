@@ -15,6 +15,25 @@ _FORMULA_MARKERS = {
     "d", "pi", "π", "dr", "dx", "dy", "dt", "over",
     "squared", "cubed", "/", "*", "×", "+", "-", "=", "^2", "^3",
 }
+_DANGLING_LEFT_TOKENS = {
+    "a", "an", "the", "and", "or", "but", "of", "to", "for", "with", "by",
+    "as", "that", "which", "who", "whose", "what", "when", "where", "how",
+    "include", "includes", "including", "known", "called", "named", "type", "kind",
+    "will", "would", "could", "should", "can", "may", "might", "must",
+    "is", "are", "was", "were", "be", "been", "being",
+    "all", "each", "every", "some", "any", "no", "not", "their", "our", "your",
+    "likely",
+}
+_DANGLING_PAIRS = {
+    ("known", "as"),
+    ("type", "of"),
+    ("kind", "of"),
+    ("one", "another"),
+}
+_DANGLING_RIGHT_TOKENS = {
+    "of", "to", "for", "with", "by", "as", "than", "from",
+    "also", "another", "based", "change", "data", "values", "what",
+}
 
 
 def build_dubbing_cues(
@@ -34,14 +53,18 @@ def build_dubbing_cues(
         if remaining_duration <= max_duration_ms:
             groups.append(units[cursor:])
             break
-        candidates: list[tuple[tuple[int, int], int]] = []
+        candidates: list[tuple[tuple[int, int, int], int]] = []
         first_safe_before_max: int | None = None
+        unsafe_before_max = False
+        extended_max_duration_ms = max_duration_ms + min(2000, max_duration_ms // 2)
         for index in range(cursor, len(units)):
             duration = int(units[index]["end_ms"]) - int(units[cursor]["start_ms"])
-            if duration > max_duration_ms:
+            if duration > extended_max_duration_ms:
                 break
             safe = _is_safe_boundary(units, index)
-            if safe and first_safe_before_max is None:
+            if duration <= max_duration_ms and not safe:
+                unsafe_before_max = True
+            if safe and duration <= max_duration_ms and first_safe_before_max is None:
                 first_safe_before_max = index
             if duration < min_duration_ms:
                 continue
@@ -50,9 +73,15 @@ def build_dubbing_cues(
                 if index + 1 < len(units)
                 else 0
             )
-            natural = str(units[index]["text"]).rstrip().endswith(_PUNCTUATION) or pause_ms >= 400
-            if safe:
-                candidates.append(((0 if natural else 1, abs(duration - target_duration_ms)), index))
+            if safe and (duration <= max_duration_ms or unsafe_before_max):
+                candidates.append((
+                    (
+                        _boundary_priority(units, index, pause_ms=pause_ms),
+                        max(0, duration - max_duration_ms),
+                        abs(duration - target_duration_ms),
+                    ),
+                    index,
+                ))
         chosen = (
             min(candidates)[1]
             if candidates
@@ -71,7 +100,7 @@ def build_dubbing_cues(
 def _timeline_units(segments: list[dict[str, Any]], *, max_duration_ms: int) -> list[dict[str, object]]:
     units: list[dict[str, object]] = []
     for segment in segments:
-        parent = str(segment["segment_id"])
+        parents = list(segment.get("parent_segment_ids", [str(segment["segment_id"])]))
         words = segment.get("words")
         if isinstance(words, list) and words:
             valid_words = [word for word in words if isinstance(word, dict)]
@@ -93,7 +122,7 @@ def _timeline_units(segments: list[dict[str, Any]], *, max_duration_ms: int) -> 
                         "raw_text": raw_text,
                         "start_ms": start_ms,
                         "end_ms": end_ms,
-                        "parent": parent,
+                        "parents": parents,
                     })
             continue
         start_ms = int(segment["start_ms"])
@@ -113,7 +142,7 @@ def _timeline_units(segments: list[dict[str, Any]], *, max_duration_ms: int) -> 
                 "raw_text": " ".join(raw_words[word_start:word_end]),
                 "start_ms": unit_start,
                 "end_ms": unit_end,
-                "parent": parent,
+                "parents": parents,
             })
     return sorted(units, key=lambda unit: (int(unit["start_ms"]), int(unit["end_ms"])))
 
@@ -185,6 +214,9 @@ def _is_safe_boundary(units: list[dict[str, object]], index: int) -> bool:
     if index + 1 >= len(units):
         return True
     tokens = [_normalized_token(str(unit.get("text", ""))) for unit in units]
+    ends_sentence = str(units[index].get("text", "")).rstrip().endswith(_PUNCTUATION)
+    if not ends_sentence and _is_dangling_linguistic_boundary(tokens, index):
+        return False
     if not (_is_formula_token(tokens[index]) and _is_formula_token(tokens[index + 1])):
         return True
     left = index
@@ -195,6 +227,29 @@ def _is_safe_boundary(units: list[dict[str, object]], index: int) -> bool:
         right += 1
     run = tokens[left:right + 1]
     return not any(token in _FORMULA_MARKERS or _is_number_token(token) for token in run)
+
+
+def _is_dangling_linguistic_boundary(tokens: list[str], index: int) -> bool:
+    left = tokens[index]
+    right = tokens[index + 1]
+    if (
+        left in _DANGLING_LEFT_TOKENS
+        or right in _DANGLING_RIGHT_TOKENS
+        or (left, right) in _DANGLING_PAIRS
+    ):
+        return True
+    if index + 2 < len(tokens) and (right, tokens[index + 2]) in _DANGLING_PAIRS:
+        return True
+    return False
+
+
+def _boundary_priority(units: list[dict[str, object]], index: int, *, pause_ms: int) -> int:
+    text = str(units[index].get("text", "")).rstrip()
+    if text.endswith(_PUNCTUATION):
+        return 0
+    if text.endswith((",", "—")) or pause_ms >= 400:
+        return 1
+    return 2
 
 
 def _next_safe_boundary(units: list[dict[str, object]], cursor: int, min_duration_ms: int) -> int:
@@ -223,7 +278,11 @@ def _normalized_token(text: str) -> str:
 def _cue_from_group(group: list[dict[str, object]], *, max_duration_ms: int) -> dict[str, object]:
     start_ms = int(group[0]["start_ms"])
     end_ms = int(group[-1]["end_ms"])
-    parents = list(dict.fromkeys(str(unit["parent"]) for unit in group))
+    parents = list(dict.fromkeys(
+        str(parent)
+        for unit in group
+        for parent in list(unit.get("parents", []))
+    ))
     source_text = " ".join(str(unit["text"]).strip() for unit in group if str(unit["text"]).strip()).strip()
     source_text_raw = " ".join(
         str(unit.get("raw_text", unit["text"])).strip()

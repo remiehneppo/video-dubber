@@ -76,7 +76,12 @@ def _expand_math_notation(text: str) -> str:
 
 def _normalize_math_tokens(tokens: list[str]) -> list[str]:
     semantic_tokens: list[str] = []
-    for token in tokens:
+    for index, token in enumerate(tokens):
+        next_token = tokens[index + 1] if index + 1 < len(tokens) else ""
+        previous_token = tokens[index - 1] if index > 0 else ""
+        if token == "sắp" and next_token == "xỉ":
+            semantic_tokens.append("xấp")
+            continue
         digit_pr = re.fullmatch(r"(\d+)pr", token)
         if digit_pr is not None:
             semantic_tokens.extend([_normalize_digit(digit_pr.group(1)), "pi", "r"])
@@ -88,6 +93,12 @@ def _normalize_math_tokens(tokens: list[str]) -> list[str]:
         if token == "pr":
             semantic_tokens.extend(["pi", "r"])
             continue
+        if token in {"drx", "trx"}:
+            semantic_tokens.extend(["d", "r", "ít"])
+            continue
+        if token == "x" and _is_math_factor_token(previous_token) and _is_math_factor_token(next_token):
+            semantic_tokens.append("nhân")
+            continue
         if re.fullmatch(r"\d+", token):
             semantic_tokens.append(_normalize_digit(token))
             continue
@@ -97,6 +108,15 @@ def _normalize_math_tokens(tokens: list[str]) -> list[str]:
             continue
         semantic_tokens.append(token)
     return semantic_tokens
+
+
+def _is_math_factor_token(token: str) -> bool:
+    return bool(
+        token in {"pi", "r", "dr", "dx", "dy", "dt", "dm", "pr", "drx", "trx"}
+        or re.fullmatch(r"\d+", token)
+        or re.fullmatch(r"\d+p", token)
+        or re.fullmatch(r"\d+pr", token)
+    )
 
 
 def _normalize_digit(token: str) -> str:

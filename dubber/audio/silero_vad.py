@@ -118,24 +118,57 @@ def post_process_speech_intervals(
         hard_max_chunk_ms=hard_max_chunk_ms,
     )
 
+    if preferred_max_chunk_ms <= 0:
+        raise ValueError("preferred_max_chunk_ms must be positive")
+    if hard_max_chunk_ms <= 0:
+        raise ValueError("hard_max_chunk_ms must be positive")
+    return _split_merged_intervals(
+        merged,
+        speech_intervals=filtered,
+        target_min_chunk_ms=target_min_chunk_ms,
+        preferred_max_chunk_ms=min(preferred_max_chunk_ms, hard_max_chunk_ms),
+        hard_max_chunk_ms=hard_max_chunk_ms,
+    )
+
+
+def _split_merged_intervals(
+    intervals: list[tuple[int, int]],
+    *,
+    speech_intervals: list[tuple[int, int]],
+    target_min_chunk_ms: int,
+    preferred_max_chunk_ms: int,
+    hard_max_chunk_ms: int,
+) -> list[SileroVadSegment]:
     segments: list[SileroVadSegment] = []
-    for start, end in merged:
-        duration = end - start
-        if preferred_max_chunk_ms <= 0:
-            raise ValueError("preferred_max_chunk_ms must be positive")
-        if hard_max_chunk_ms <= 0:
-            raise ValueError("hard_max_chunk_ms must be positive")
-        if duration > hard_max_chunk_ms:
-            segments.append(
-                SileroVadSegment(
-                    start,
-                    end,
-                    "vad_silero_over_hard_max",
-                    ["segment_over_hard_max"],
-                )
-            )
-        else:
-            segments.append(SileroVadSegment(start, end, "vad_silero"))
+    speech = sorted(speech_intervals)
+    for interval_start, interval_end in intervals:
+        start = interval_start
+        while interval_end - start > hard_max_chunk_ms:
+            earliest = start + max(1, min(target_min_chunk_ms, preferred_max_chunk_ms))
+            preferred = start + preferred_max_chunk_ms
+            latest = start + hard_max_chunk_ms
+            gaps = [
+                (left_end, right_start)
+                for (_, left_end), (right_start, _) in zip(speech, speech[1:])
+                if left_end >= start and right_start <= interval_end and left_end < right_start
+            ]
+            candidates = [
+                (gap_start + gap_end) // 2
+                for gap_start, gap_end in gaps
+                if earliest <= (gap_start + gap_end) // 2 <= latest
+            ]
+            if candidates:
+                split_at = min(candidates, key=lambda value: (abs(value - preferred), value))
+                reason = "vad_silero_pause_split"
+                risk_flags: list[str] = []
+            else:
+                split_at = latest
+                reason = "vad_silero_hard_split"
+                risk_flags = ["hard_split"]
+            segments.append(SileroVadSegment(start, split_at, reason, risk_flags))
+            start = split_at
+        if interval_end > start:
+            segments.append(SileroVadSegment(start, interval_end, "vad_silero"))
     return segments
 
 

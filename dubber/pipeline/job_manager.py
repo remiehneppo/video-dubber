@@ -129,7 +129,11 @@ class JobManager:
         self._restore_provider_context(paths, config)
         ctx = self._context(paths, store, manifest, config)
         if from_stage is not None:
-            self._invalidate_from(ctx, from_stage)
+            self._invalidate_from(
+                ctx,
+                from_stage,
+                preserve_checkpoints=from_stage == StageName.TTS,
+            )
             start_stage = from_stage
         else:
             start_stage = self._first_invalid_stage(ctx)

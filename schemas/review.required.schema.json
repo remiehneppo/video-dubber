@@ -6,6 +6,7 @@
   "properties": {
     "schema_version": {"const": "1.0"},
     "domain_profile": {"type": "string", "minLength": 1},
+    "cue_set_checksum": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "status": {"const": "required"},
     "review_scope": {"const": "high_risk_cues"},
     "cues": {
@@ -21,6 +22,9 @@
           "source_text_normalized": {"type": "string"},
           "display_text": {"type": "string"},
           "spoken_text": {"type": "string"},
+          "start_ms": {"type": "integer", "minimum": 0},
+          "end_ms": {"type": "integer", "minimum": 0},
+          "duration_ms": {"type": "integer", "minimum": 0},
           "protected_spans": {"type": "array", "items": {"type": "object"}},
           "normalization_edits": {"type": "array", "items": {"type": "object"}},
           "normalization_suggestions": {"type": "array", "items": {"type": "object"}},

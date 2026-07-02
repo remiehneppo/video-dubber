@@ -35,6 +35,17 @@ def test_semantic_comparison_accepts_common_math_asr_variants() -> None:
 
     assert metrics.ok(max_cer=0.25, min_token_recall=0.60)
 
+def test_semantic_comparison_accepts_collapsed_two_pi_r_dr_less_variant() -> None:
+    metrics = compare_tts_transcript(
+        "phép xấp xỉ 2 pi r nhân d r ít",
+        "Phép sắp xỉ 2PR x DRX",
+    )
+
+    assert metrics.expected_text == "phép xấp xỉ hai pi r nhân d r ít"
+    assert metrics.transcript == "phép xấp xỉ hai pi r nhân d r ít"
+    assert metrics.ok(max_cer=0.25, min_token_recall=0.85), metrics
+
+
 def test_semantic_comparison_accepts_real_calculus_asr_variants() -> None:
     examples = [
         (

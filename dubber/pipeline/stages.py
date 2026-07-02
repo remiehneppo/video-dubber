@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
+import re
 import shutil
 from collections.abc import Awaitable
 from pathlib import Path
@@ -34,9 +36,11 @@ from dubber.transcript.segmentation import build_transcript_segments
 from dubber.transcript.cues import build_dubbing_cues
 from dubber.transcript.normalization import (
     attach_source_normalization_suggestions,
+    build_word_timeline,
     find_source_normalization_candidates,
     normalize_transcript_segments,
 )
+from dubber.transcript.sentences import build_source_sentences
 from dubber.transcript.timeline import build_speech_timeline
 from dubber.translation.block_builder import TranslationContextBlock, build_translation_context_blocks
 from dubber.translation.compressor import compress_segment_translation
@@ -53,8 +57,11 @@ _HIGH_RISK_CUE_FLAGS = frozenset({
     "segment_over_hard_max",
     "segment_over_max_duration",
     "timestamps_missing",
+    "source_normalized_repetitive_asr_loop",
+    "tts_timing_density_high",
     "word_timestamps_missing",
 })
+_BOUNDARY_WORD_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
 
 def _glossary_system_prompt(domain: str, profile: DomainProfile | None = None) -> str:
@@ -713,6 +720,18 @@ def run_asr(ctx: StageContext) -> None:
     )
     publisher.publish_json(
         stage=StageName.ASR,
+        name="word_timeline",
+        filename="word_timeline.v1.json",
+        payload={
+            "schema_version": "1.0",
+            "source": "transcript.v1",
+            "words": build_word_timeline(transcript_segments),
+        },
+        done=len(segments),
+        total=len(segments),
+    )
+    publisher.publish_json(
+        stage=StageName.ASR,
         name="source_normalization",
         filename="source_normalization.v1.json",
         payload={
@@ -929,11 +948,21 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
     glossary = ctx.artifact_json("glossary.locked.json")
     publisher = StageArtifacts(ctx.paths, ctx.store, ctx.manifest)
     cue_config = ctx.config.dubbing_cues
+    source_sentences = build_source_sentences(transcript["segments"]) or list(transcript["segments"])
     cues = build_dubbing_cues(
-        transcript["segments"],
+        source_sentences,
         target_duration_ms=cue_config.target_duration_ms,
         min_duration_ms=cue_config.min_duration_ms,
         max_duration_ms=cue_config.max_duration_ms,
+    )
+    publisher.publish_json(
+        stage=StageName.TRANSLATION,
+        name="source_sentences",
+        filename="source_sentences.v1.json",
+        payload={"schema_version": "1.0", "sentences": source_sentences},
+        status=StageStatus.RUNNING,
+        done=len(source_sentences),
+        total=len(source_sentences),
     )
     transcript_by_id = {str(segment["segment_id"]): segment for segment in transcript["segments"]}
     cue_segments = []
@@ -1181,6 +1210,8 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
         candidate["translation_warnings"] = list(candidate["translation_warnings"]) + compressed.warnings
         translated_cues.append(candidate)
 
+    _trim_repeated_boundary_prefixes(translated_cues, cue_protected_spans)
+
     validation = validate_translations(
         cue_segments,
         translated_cues,
@@ -1201,27 +1232,37 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
         cue["used_terms"] = translated["used_terms"]
         cue["translation_warnings"] = translated["translation_warnings"]
 
+    if ctx.provider_mode == "openai_compatible":
+        _annotate_tts_timing_risks(
+            cues,
+            max_speedup_ratio=ctx.config.tts_service.max_speedup_ratio,
+        )
+
     review_locked = _load_review_locked(ctx)
     if review_locked:
-        _apply_review_locked(cues, review_locked)
+        _apply_review_locked(cues, review_locked, domain_profile=profile.artifact_id)
 
     translated_segments: list[dict[str, object]] = []
+    seen_segment_cues: set[str] = set()
     for source in transcript["segments"]:
         parent_id = str(source["segment_id"])
         children = [cue for cue in cues if parent_id in cue["parent_segment_ids"]]
+        unique_children = [cue for cue in children if str(cue["cue_id"]) not in seen_segment_cues]
+        segment_children = unique_children or children
+        seen_segment_cues.update(str(cue["cue_id"]) for cue in segment_children)
         translated_segments.append({
             "segment_id": parent_id,
             "source_text": source["source_text"],
             "source_text_raw": source.get("source_text_raw", source["source_text"]),
-            "vi_text": " ".join(str(cue["display_text"]).strip() for cue in children).strip(),
-            "display_text": " ".join(str(cue["display_text"]).strip() for cue in children).strip(),
-            "spoken_text": " ".join(str(cue["spoken_text"]).strip() for cue in children).strip(),
-            "protected_spans": [span for cue in children for span in cue.get("protected_spans", [])],
-            "used_terms": list(dict.fromkeys(term for cue in children for term in cue.get("used_terms", []))),
+            "vi_text": " ".join(str(cue["display_text"]).strip() for cue in segment_children).strip(),
+            "display_text": " ".join(str(cue["display_text"]).strip() for cue in segment_children).strip(),
+            "spoken_text": " ".join(str(cue["spoken_text"]).strip() for cue in segment_children).strip(),
+            "protected_spans": [span for cue in segment_children for span in cue.get("protected_spans", [])],
+            "used_terms": list(dict.fromkeys(term for cue in segment_children for term in cue.get("used_terms", []))),
             "length_ratio": 1.0,
-            "translation_warnings": list(dict.fromkeys(warning for cue in children for warning in cue.get("translation_warnings", []))),
+            "translation_warnings": list(dict.fromkeys(warning for cue in segment_children for warning in cue.get("translation_warnings", []))),
         })
-    review_items = [] if review_locked else _review_required_items(cues)
+    review_items = _review_required_items(cues)
     publisher.publish_file(
         stage=StageName.TRANSLATION,
         name="translation_blocks",
@@ -1301,6 +1342,7 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
             payload={
                 "schema_version": "1.0",
                 "domain_profile": profile.artifact_id,
+                "cue_set_checksum": _cue_set_checksum(cues),
                 "status": "required",
                 "review_scope": "high_risk_cues",
                 "cues": review_items,
@@ -1349,6 +1391,8 @@ def _dubbing_cue_v2(cue: dict[str, object]) -> dict[str, object]:
 def _review_required_items(cues: list[dict[str, object]]) -> list[dict[str, object]]:
     items: list[dict[str, object]] = []
     for cue in cues:
+        if cue.get("review_status") == "locked":
+            continue
         normalization_edits = list(cue.get("normalization_edits", []))
         normalization_suggestions = list(cue.get("normalization_suggestions", []))
         risk_flags = list(cue.get("risk_flags", []))
@@ -1368,6 +1412,9 @@ def _review_required_items(cues: list[dict[str, object]]) -> list[dict[str, obje
                 "source_text_normalized": str(cue.get("source_text", "")),
                 "display_text": str(cue.get("display_text") or cue.get("translated_text") or ""),
                 "spoken_text": str(cue.get("spoken_text") or cue.get("translated_text") or ""),
+                "start_ms": int(cue.get("start_ms", 0)),
+                "end_ms": int(cue.get("end_ms", cue.get("start_ms", 0))),
+                "duration_ms": int(cue.get("duration_ms", int(cue.get("end_ms", cue.get("start_ms", 0))) - int(cue.get("start_ms", 0)))),
                 "protected_spans": list(cue.get("protected_spans", [])),
                 "normalization_edits": normalization_edits,
                 "normalization_suggestions": normalization_suggestions,
@@ -1377,10 +1424,52 @@ def _review_required_items(cues: list[dict[str, object]]) -> list[dict[str, obje
                     "display_text": str(cue.get("display_text") or cue.get("translated_text") or ""),
                     "spoken_text": str(cue.get("spoken_text") or cue.get("translated_text") or ""),
                     "protected_spans": list(cue.get("protected_spans", [])),
+                    "start_ms": int(cue.get("start_ms", 0)),
+                    "end_ms": int(cue.get("end_ms", cue.get("start_ms", 0))),
                 },
             }
         )
-    return items
+    return sorted(items, key=_review_item_sort_key)
+
+
+def _review_item_sort_key(item: dict[str, object]) -> tuple[int, int, str]:
+    return (
+        int(item.get("start_ms", 0)),
+        int(item.get("end_ms", item.get("start_ms", 0))),
+        str(item.get("cue_id", "")),
+    )
+
+
+def _annotate_tts_timing_risks(
+    cues: list[dict[str, object]],
+    *,
+    max_speedup_ratio: float,
+    estimated_token_ms: int = 300,
+    guard_ms: int = 100,
+) -> None:
+    for index, cue in enumerate(cues):
+        spoken_text = str(cue.get("spoken_text") or cue.get("translated_text") or "").strip()
+        token_count = len(re.findall(r"\w+", spoken_text, flags=re.UNICODE))
+        if token_count == 0:
+            continue
+        start_ms = int(cue.get("start_ms", 0))
+        end_ms = int(cue.get("end_ms", start_ms))
+        next_start_ms = (
+            int(cues[index + 1].get("start_ms", end_ms))
+            if index + 1 < len(cues)
+            else end_ms
+        )
+        available_ms = max(end_ms - start_ms, next_start_ms - start_ms - guard_ms)
+        estimated_duration_ms = token_count * estimated_token_ms
+        required_ratio = estimated_duration_ms / max(1, available_ms)
+        cue["tts_timing_estimate_ms"] = estimated_duration_ms
+        cue["tts_timing_available_ms"] = available_ms
+        cue["tts_timing_required_speedup_ratio"] = round(required_ratio, 4)
+        if required_ratio > max_speedup_ratio:
+            cue["risk_flags"] = list(dict.fromkeys([
+                *list(cue.get("risk_flags", [])),
+                "tts_timing_density_high",
+            ]))
 
 
 def _load_review_locked(ctx: StageContext) -> dict[str, object]:
@@ -1391,7 +1480,18 @@ def _load_review_locked(ctx: StageContext) -> dict[str, object]:
     return data if isinstance(data, dict) else {}
 
 
-def _apply_review_locked(cues: list[dict[str, object]], review_locked: dict[str, object]) -> None:
+def _apply_review_locked(
+    cues: list[dict[str, object]],
+    review_locked: dict[str, object],
+    *,
+    domain_profile: str = "",
+) -> None:
+    locked_profile = str(review_locked.get("domain_profile", "")).strip()
+    if locked_profile and domain_profile and locked_profile != domain_profile:
+        return
+    expected_checksum = str(review_locked.get("cue_set_checksum", "")).strip()
+    if expected_checksum and expected_checksum != _cue_set_checksum(cues):
+        return
     locked_items = review_locked.get("cues", [])
     if not isinstance(locked_items, list):
         return
@@ -1437,6 +1537,23 @@ def _apply_review_locked(cues: list[dict[str, object]], review_locked: dict[str,
         cue["duration_ms"] = end_ms - start_ms
 
 
+def _cue_set_checksum(cues: list[dict[str, object]]) -> str:
+    payload = [
+        {
+            "cue_id": str(cue.get("cue_id", "")),
+            "start_ms": int(cue.get("start_ms", 0)),
+            "end_ms": int(cue.get("end_ms", 0)),
+            "source_text": str(cue.get("source_text", "")),
+            "display_text": str(cue.get("display_text") or cue.get("translated_text") or ""),
+            "spoken_text": str(cue.get("spoken_text") or cue.get("translated_text") or ""),
+        }
+        for cue in cues
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _review_timing_value(value: object, *, cue_id: str, field: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{cue_id}: review timing override {field} must be a non-negative integer")
@@ -1461,6 +1578,70 @@ def _validate_review_timing_override(cues: list[dict[str, object]], index: int, 
         next_start = int(cues[index + 1]["start_ms"])
         if end_ms > next_start:
             raise ValueError(f"{cue_id}: review timing override overlaps next cue")
+
+
+def _trim_repeated_boundary_prefixes(
+    cues: list[dict[str, object]],
+    cue_protected_spans: dict[str, list[ProtectedSpan]],
+) -> None:
+    previous_text = ""
+    for cue in cues:
+        current_text = str(cue.get("display_text") or "").strip()
+        if previous_text and current_text:
+            trimmed_text, trimmed = _trim_repeated_boundary_prefix(previous_text, current_text)
+            if trimmed and trimmed_text != current_text:
+                cue["display_text"] = trimmed_text
+                cue["vi_text"] = trimmed_text
+                cue["spoken_text"] = normalize_spoken_text(
+                    trimmed_text,
+                    cue_protected_spans.get(str(cue.get("segment_id")), []),
+                )
+                warnings = list(cue.get("translation_warnings", []))
+                warnings.append("boundary_overlap_trimmed")
+                cue["translation_warnings"] = list(dict.fromkeys(warnings))
+                current_text = trimmed_text
+        previous_text = current_text
+
+
+def _trim_repeated_boundary_prefix(previous_text: str, current_text: str) -> tuple[str, bool]:
+    previous_words = _boundary_words(previous_text)
+    current_words = _boundary_words(current_text)
+    if len(previous_words) < 5 or len(current_words) < 5:
+        return current_text, False
+
+    if len(current_words) <= len(previous_words):
+        return current_text, False
+
+    max_overlap = min(len(previous_words), len(current_words))
+    for overlap in range(max_overlap, 4, -1):
+        if previous_words[:overlap] != current_words[:overlap]:
+            continue
+        cutoff = _word_cutoff_after(current_text, overlap)
+        if cutoff is None:
+            continue
+        trimmed = current_text[cutoff:].lstrip(" \t\r\n,;:!?—–-")
+        if len(_boundary_words(trimmed)) < 1:
+            continue
+        return trimmed, True
+    return current_text, False
+
+def _boundary_words(text: str) -> list[str]:
+    return [
+        match.group(0).casefold()
+        for match in _BOUNDARY_WORD_RE.finditer(text)
+        if re.search(r"\w", match.group(0), flags=re.UNICODE)
+    ]
+
+
+def _word_cutoff_after(text: str, word_count: int) -> int | None:
+    seen = 0
+    for match in _BOUNDARY_WORD_RE.finditer(text):
+        if not re.search(r"\w", match.group(0), flags=re.UNICODE):
+            continue
+        seen += 1
+        if seen == word_count:
+            return match.end()
+    return None
 
 
 def _translated_segment_v2(segment: dict[str, object]) -> dict[str, object]:
@@ -1646,13 +1827,20 @@ def run_tts(
             ):
                 raise RuntimeError(f"simulated crash at tts after {completed_count} segments")
 
+        failed_pending = sum(
+            1
+            for _, segment in pending
+            if checkpoint.segments[str(segment["segment_id"])].status == StageStatus.FAILED
+        )
         logger.info(
-            "stage tts provider concurrency tts=%s asr=%s llm=%s cue_workers=%s pending=%s",
+            "stage tts provider concurrency tts=%s asr=%s llm=%s cue_workers=%s reused=%s pending=%s failed_pending=%s",
             concurrency.tts_limit,
             concurrency.asr_limit,
             concurrency.llm_limit,
             worker_count,
+            len(rows_by_id),
             len(pending),
+            failed_pending,
         )
         run_bounded(pending, produce, max_workers=worker_count, on_completion=save_completion)
     else:

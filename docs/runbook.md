@@ -35,10 +35,11 @@ Symptom: job status is `waiting_review` after translation, and `workspace/{job_i
 
 Action:
 
-1. Open `review.required.json`.
-2. For each cue, inspect `reason`, `risk_flags`, `source_text_raw`, `source_text_normalized`, `display_text`, `spoken_text`, and `protected_spans`.
-3. Save `workspace/{job_id}/artifacts/review.locked.json` with `schema_version: "1.0"`, `status: "locked"`, and reviewed `cues`.
-4. Run `python3 cli.py resume --job {job_id}`.
+1. Run `python3 cli.py review --workspace workspace --job {job_id}`.
+2. Inspect each cue's `reason`, `risk_flags`, `source_text_raw`, `source_text_normalized`, `display_text`, `spoken_text`, and `protected_spans`.
+3. Accept or edit each cue interactively.
+4. The command writes `workspace/{job_id}/artifacts/review.locked.json`.
+5. Run `python3 cli.py resume --job {job_id}`.
 
 `review.locked.json` shape:
 

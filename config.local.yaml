@@ -2,17 +2,18 @@ project:
   name: video-dubber
   output_format: mp4
   domain: mathematics
+  domain_profile: calculus
   output_dir: ./output
   workspace_dir: ./workspace
 
 runtime:
   max_parallel_jobs: 1
-  asr_concurrency: 4
-  llm_concurrency: 2
-  tts_concurrency: 4
+  asr_concurrency: 16
+  llm_concurrency: 4
+  tts_concurrency: 16
   retry_max_attempts: 5
   retry_backoff_sec: 2
-  request_timeout_sec: 120
+  request_timeout_sec: 600
 
 input:
   allowed_extensions: [".mp4", ".mkv", ".mov"]
@@ -20,15 +21,67 @@ input:
   max_duration_minutes: 180
 
 vad:
-  frame_ms: 100
-  threshold_ratio: 0.15
-  min_duration_ms: 300
-  max_duration_ms: 25000
-  silence_merge_threshold_ms: 400
-  soft_split_allowed: true
+  mode: silero_vad
+  frame_ms: 150
+  threshold_ratio: 0.85
+  min_duration_ms: 900
+  max_duration_ms: 90000
+  min_speech_duration_ms: 700
+  target_min_chunk_ms: 20000
+  preferred_max_chunk_ms: 45000
+  hard_max_chunk_ms: 90000
+  silence_merge_threshold_ms: 2500
+  context_padding_ms: 1500
+  soft_split_allowed: false
+  silero_model_path: models/silero_vad.onnx
+  silero_model_url: https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx
+  silero_auto_download: true
+  silero_threshold: 0.5
+  min_silence_duration_ms: 500
+  speech_padding_ms: 350
+  max_vad_chunk_ms: 30000
+  merge_gap_ms: 600
 
 translation:
   glossary_review: true
+  min_context_words: 128
+  max_context_words: 256
+  context_overlap_words: 32
+  target_segment_count: 16
+
+source_normalization:
+  llm_adjudication: false
+
+transcript_segmentation:
+  target_min_segment_ms: 16000
+  preferred_max_segment_ms: 32000
+  max_segment_ms: 64000
+  min_pause_split_ms: 600
+  prefer_punctuation_split: true
+
+dubbing_cues:
+  target_duration_ms: 4000
+  min_duration_ms: 1500
+  max_duration_ms: 6000
+
+mixing:
+  original_ducking_db: -20
+  tts_boost_db: 8.0
+  final_loudness_normalization: true
+subtitles:
+  enabled: false
+  mode: burn_in
+  output_sidecar: true
+  max_height_ratio: 0.10
+  background_opacity: 0.50
+  font_family: Arial
+  font_size_ratio: 0.026
+  bottom_margin_ratio: 0.035
+  source_enabled: true
+  translation_enabled: true
+  max_cue_duration_ms: 4000
+  min_cue_duration_ms: 700
+  max_chars_per_line: 48
 
 asr_service:
   provider: openai_compatible
@@ -36,17 +89,31 @@ asr_service:
   api_key: local-asr
   model: Systran/faster-whisper-large-v3
   language: en
+  timestamp_mode: prefer_word
+  require_timestamps: true
+  require_word_timestamps: true
+  allow_chunk_text_fallback: false
+  vad_filter: false
 
 llm_service:
   provider: openai_compatible
-  base_url: ${LLM_BASE_URL}
-  api_key: ${LLM_API_KEY}
-  model: ${LLM_MODEL}
-  temperature: 0.3
+  base_url: http://192.168.2.2:20128/v1
+  api_key: sk-27a006b1db37d100-u4bs54-25449c1e
+  model: common
+  temperature: 0.4
 
 tts_service:
   provider: openai_compatible
   base_url: http://127.0.0.1:23333/v1
   api_key: local-tts
   model: pnnbao-ump/VieNeu-TTS-v2
-  voice: "Trúc Ly"
+  voice: "Mỹ Duyên"
+  max_edge_silence_ms: 1200
+  clause_pause_threshold_ms: 700
+  rephrase_attempts: 3
+  max_speedup_ratio: 1.2
+  # ASR local gộp "2 pi R" thành "2PR" và nghe "dr" thành "doctor"; CER <= 0.25
+  # vẫn bắt sai nội dung tổng thể, còn recall 0.75 cân bằng chất lượng và false negative ký hiệu.
+  semantic_min_token_recall: 0.75
+  # TTS local có biến thiên phát âm giữa các lần synthesize cùng một câu.
+  semantic_retry_attempts: 5

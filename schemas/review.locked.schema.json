@@ -6,6 +6,7 @@
   "properties": {
     "schema_version": {"const": "1.0"},
     "status": {"const": "locked"},
+    "cue_set_checksum": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "cues": {
       "type": "array",
       "minItems": 1,

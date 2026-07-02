@@ -9,7 +9,9 @@ from cli import main
 from dubber.core.enums import StageName, StageStatus
 from dubber.core.io import write_json_atomic
 from dubber.core.paths import WorkspacePaths
+from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.orchestrator.checkpoint_store import CheckpointStore
+from dubber.orchestrator.segment_checkpoint_store import SegmentCheckpointStore
 from dubber.pipeline.job_manager import BatchManager, JobManager
 
 
@@ -60,10 +62,187 @@ def test_resume_reports_missing_job_state(capsys: pytest.CaptureFixture[str]) ->
     assert "resume failed" in capsys.readouterr().out
 
 
+def test_review_interactive_writes_locked_artifacts(tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = tmp_path / "workspace"
+    job_dir = workspace / "job_review"
+    artifacts = job_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    required = {
+        "schema_version": "1.0",
+        "domain_profile": "calculus@1",
+        "cue_set_checksum": "a" * 64,
+        "status": "required",
+        "review_scope": "high_risk_cues",
+        "cues": [
+            {
+                "cue_id": "cue_001",
+                "reason": "asr_timeline_review_required",
+                "risk_flags": ["tts_timing_density_high"],
+                "source_text_raw": "Source one.",
+                "source_text_normalized": "Source one.",
+                "display_text": "Cue one.",
+                "spoken_text": "Cue one.",
+                "protected_spans": [],
+                "review_overrides": {
+                    "source_text_normalized": "Source one.",
+                    "display_text": "Cue one.",
+                    "spoken_text": "Cue one.",
+                    "protected_spans": [],
+                },
+            },
+            {
+                "cue_id": "cue_002",
+                "reason": "asr_timeline_review_required",
+                "risk_flags": ["cue_duration_exceeds_max_for_safe_boundary"],
+                "source_text_raw": "Source two.",
+                "source_text_normalized": "Source two.",
+                "display_text": "Cue two.",
+                "spoken_text": "Cue two.",
+                "protected_spans": [],
+                "review_overrides": {
+                    "source_text_normalized": "Source two.",
+                    "display_text": "Cue two.",
+                    "spoken_text": "Cue two.",
+                    "protected_spans": [],
+                },
+            },
+        ],
+    }
+    (artifacts / "review.required.json").write_text(json.dumps(required, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    responses = iter(["", "e", "", "Đã sửa cue hai.", "Đã sửa spoken cue hai.", "[]"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(responses))
+
+    exit_code = main(["review", "--workspace", str(workspace), "--job", "job_review"])
+
+    assert exit_code == 0
+    captured = capsys.readouterr().out
+    assert "Reviewing 2 cues for job job_review" in captured
+    assert not (artifacts / "review.lock.json").exists()
+    assert (artifacts / "review.locked.json").exists()
+    locked = json.loads((artifacts / "review.locked.json").read_text(encoding="utf-8"))
+    assert locked["status"] == "locked"
+    assert locked["cue_set_checksum"] == "a" * 64
+    assert locked["cues"][0]["review_overrides"]["display_text"] == "Cue one."
+    assert locked["cues"][1]["review_overrides"]["display_text"] == "Đã sửa cue hai."
+    assert locked["cues"][1]["review_overrides"]["spoken_text"] == "Đã sửa spoken cue hai."
+
+
+def test_review_interactive_sorts_legacy_required_cues_by_timeline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = tmp_path / "workspace"
+    job_dir = workspace / "job_review_order"
+    artifacts = job_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    required = {
+        "schema_version": "1.0",
+        "domain_profile": "calculus@1",
+        "cue_set_checksum": "b" * 64,
+        "status": "required",
+        "review_scope": "high_risk_cues",
+        "cues": [
+            {
+                "cue_id": "cue_late",
+                "reason": "asr_timeline_review_required",
+                "risk_flags": ["tts_timing_density_high"],
+                "source_text_raw": "Late source.",
+                "source_text_normalized": "Late source.",
+                "display_text": "Late cue.",
+                "spoken_text": "Late cue.",
+                "protected_spans": [],
+                "normalization_edits": [],
+                "normalization_suggestions": [],
+                "review_overrides": {
+                    "source_text_normalized": "Late source.",
+                    "display_text": "Late cue.",
+                    "spoken_text": "Late cue.",
+                    "protected_spans": [],
+                },
+            },
+            {
+                "cue_id": "cue_early",
+                "reason": "asr_timeline_review_required",
+                "risk_flags": ["tts_timing_density_high"],
+                "source_text_raw": "Early source.",
+                "source_text_normalized": "Early source.",
+                "display_text": "Early cue.",
+                "spoken_text": "Early cue.",
+                "protected_spans": [],
+                "normalization_edits": [],
+                "normalization_suggestions": [],
+                "review_overrides": {
+                    "source_text_normalized": "Early source.",
+                    "display_text": "Early cue.",
+                    "spoken_text": "Early cue.",
+                    "protected_spans": [],
+                },
+            },
+        ],
+    }
+    (artifacts / "review.required.json").write_text(json.dumps(required, ensure_ascii=False), encoding="utf-8")
+    (artifacts / "dubbing_cues.v2.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "2.0",
+                "cues": [
+                    {"cue_id": "cue_early", "start_ms": 1000, "end_ms": 2000, "duration_ms": 1000},
+                    {"cue_id": "cue_late", "start_ms": 3000, "end_ms": 4000, "duration_ms": 1000},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    responses = iter(["", ""])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(responses))
+
+    exit_code = main(["review", "--workspace", str(workspace), "--job", "job_review_order"])
+
+    assert exit_code == 0
+    locked = json.loads((artifacts / "review.locked.json").read_text(encoding="utf-8"))
+    assert [cue["cue_id"] for cue in locked["cues"]] == ["cue_early", "cue_late"]
+    assert locked["cues"][0]["review_overrides"]["start_ms"] == 1000
+    assert locked["cues"][1]["review_overrides"]["start_ms"] == 3000
+
+
 def test_run_openai_compatible_mode_reports_missing_provider_config(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["run", "--input", "video.mp4", "--provider-mode", "openai_compatible"]) == 1
     out = capsys.readouterr().out
     assert "provider config invalid" in out or "Input video does not exist" in out
+
+
+def test_tts_from_stage_invalidation_preserves_tts_checkpoint(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path / "workspace", "job_tts_checkpoint")
+    store = CheckpointStore.create(paths.job_state_file, job_id="job_tts_checkpoint", input_file=Path("input/a.mp4"))
+    manifest = ArtifactManifest.create("job_tts_checkpoint", paths.manifest_file)
+    checkpoint = SegmentCheckpointStore.create(
+        paths.artifact_path("tts_segments.v1.json"),
+        stage="tts",
+        segment_ids=["cue_001", "cue_002"],
+    )
+    audio_path = paths.tts_dir / "cue_001.wav"
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_path.write_bytes(b"audio")
+    checkpoint.mark("cue_001", StageStatus.COMPLETED, artifact="tts/cue_001.wav")
+    checkpoint.mark("cue_002", StageStatus.FAILED, error="tts_semantic_quality_failed")
+    checkpoint.save()
+    manifest.record_artifact(
+        name="tts_segments",
+        version=1,
+        path=checkpoint.path,
+        created_by_stage=StageName.TTS,
+        schema_version="1.0",
+    )
+    manifest.save()
+    ctx = JobManager()._context(paths, store, manifest, None)
+
+    JobManager()._invalidate_from(ctx, StageName.TTS, preserve_checkpoints=True)
+
+    assert paths.artifact_path("tts_segments.v1.json").exists()
+    reloaded_manifest = ArtifactManifest.load(paths.manifest_file)
+    assert reloaded_manifest.get("tts_segments", 1) is not None
+    reloaded_checkpoint = SegmentCheckpointStore.load(paths.artifact_path("tts_segments.v1.json"))
+    assert reloaded_checkpoint.segments["cue_001"].status == StageStatus.COMPLETED
+    assert reloaded_checkpoint.segments["cue_002"].status == StageStatus.FAILED
 
 
 def test_job_manager_loads_resolved_config_path_for_resume(tmp_path: Path) -> None:

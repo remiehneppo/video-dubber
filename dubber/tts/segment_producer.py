@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import ceil
 from pathlib import Path
 from typing import Any
 
@@ -325,43 +326,84 @@ async def produce_provider_tts_segment(
             )
             _write_quality_trace(paths, segment_id, current_text, quality_attempts, status="failed", final_error=error)
             raise ValueError(error)
-        rephrase_count += 1
-
-        async def rephrase() -> str:
-            return await rephrase_tts_text(
-                provider_bundle.llm,
-                text=current_text,
-                target_duration_ms=available_ms,
-                current_duration_ms=tts_duration_ms,
-                segment_id=segment_id,
-                protected_spans=[
-                    dict(span)
-                    for span in segment.get("protected_spans", [])
-                    if isinstance(span, dict)
-                ],
-            )
-
-        rephrased_text = await (rephrase() if concurrency is None else concurrency.run_llm(rephrase))
-        protected_errors = protected_translation_errors(
-            str(segment.get("source_text", source_text)),
-            rephrased_text,
-            [span for span in segment.get("protected_spans", []) if isinstance(span, dict)],
+        required_compression_ratio = min(
+            1.0,
+            (available_ms * max_speedup_ratio) / max(1, tts_duration_ms),
         )
-        if protected_errors:
-            error = (
-                f"{segment_id}: tts_rephrase_protected_span_violation "
-                + "; ".join(protected_errors)
+        max_chars = max(1, ceil(len(current_text) * required_compression_ratio))
+        while True:
+            rephrase_count += 1
+
+            async def rephrase() -> str:
+                return await rephrase_tts_text(
+                    provider_bundle.llm,
+                    text=current_text,
+                    target_duration_ms=available_ms,
+                    current_duration_ms=tts_duration_ms,
+                    segment_id=segment_id,
+                    protected_spans=[
+                        dict(span)
+                        for span in segment.get("protected_spans", [])
+                        if isinstance(span, dict)
+                    ],
+                    max_chars=max_chars,
+                    required_compression_ratio=round(required_compression_ratio, 4),
+                )
+
+            try:
+                rephrased_text = await (rephrase() if concurrency is None else concurrency.run_llm(rephrase))
+            except ValueError as exc:
+                if "tts_rephrase_empty" not in str(exc):
+                    raise
+                if rephrase_count >= rephrase_attempts:
+                    error = f"{segment_id}: tts_rephrase_empty attempts={rephrase_count}"
+                    _write_quality_trace(
+                        paths,
+                        segment_id,
+                        current_text,
+                        quality_attempts,
+                        status="failed",
+                        final_error=error,
+                    )
+                    raise ValueError(error) from exc
+                continue
+            protected_errors = protected_translation_errors(
+                str(segment.get("source_text", source_text)),
+                rephrased_text,
+                [span for span in segment.get("protected_spans", []) if isinstance(span, dict)],
             )
-            _write_quality_trace(
-                paths,
-                segment_id,
-                current_text,
-                quality_attempts,
-                status="failed",
-                final_error=error,
-            )
-            raise ValueError(error)
-        current_text = rephrased_text
+            if protected_errors:
+                error = (
+                    f"{segment_id}: tts_rephrase_protected_span_violation "
+                    + "; ".join(protected_errors)
+                )
+                _write_quality_trace(
+                    paths,
+                    segment_id,
+                    current_text,
+                    quality_attempts,
+                    status="failed",
+                    final_error=error,
+                )
+                raise ValueError(error)
+            if len(rephrased_text) <= max_chars:
+                current_text = rephrased_text
+                break
+            if rephrase_count >= rephrase_attempts:
+                error = (
+                    f"{segment_id}: tts_rephrase_exceeds_char_limit "
+                    f"max_chars={max_chars} actual_chars={len(rephrased_text)} "
+                    f"attempts={rephrase_count}"
+                )
+                _write_quality_trace(
+                    paths,
+                    segment_id,
+                    rephrased_text,
+                    quality_attempts,
+                    status="failed",
+                    final_error=error,
+                )
+                raise ValueError(error)
         waveform_failures = 0
         semantic_failures = 0
         semantic_metrics = None
