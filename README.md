@@ -26,13 +26,14 @@ python3 -m pip install -e .
 
 ## Configure Providers
 
-Copy `.env.example` and set provider values for real ASR, LLM, and TTS services. The mock vertical slice does not require API keys.
+Copy `.env.example` and set provider values for real ASR, LLM, and TTS services. The mock vertical slice does not require API keys. For local OpenAI-compatible services, copy the profile template to an ignored local config and keep secrets in environment variables.
 
 ```bash
 cp .env.example .env
+cp configs/profiles/local-openai-compatible.yaml config.local.yaml
 ```
 
-`config.example.yaml` supports these provider sections:
+`config.example.yaml` stays generic; `config.local.yaml` is intentionally ignored. Both support these provider sections:
 
 - `asr_service`
 - `llm_service`

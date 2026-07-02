@@ -8,7 +8,6 @@ def test_glossary_and_translation_assets_exist_and_are_valid_json() -> None:
     root = Path(__file__).resolve().parents[2]
     schema_paths = [
         root / "schemas" / "glossary.schema.json",
-        root / "schemas" / "translated.schema.json",
         root / "schemas" / "translated.v2.schema.json",
         root / "schemas" / "dubbing_cues.v2.schema.json",
     ]
@@ -33,6 +32,16 @@ def test_pipeline_artifacts_with_public_contracts_have_schema_assets() -> None:
         assert payload["$schema"] == "https://json-schema.org/draft/2020-12/schema"
         assert payload["type"] == "object"
         assert payload["required"]
+
+
+def test_local_provider_profile_is_template_without_real_secret() -> None:
+    root = Path(__file__).resolve().parents[2]
+    profile = (root / "configs" / "profiles" / "local-openai-compatible.yaml").read_text(encoding="utf-8")
+    gitignore = (root / ".gitignore").read_text(encoding="utf-8")
+
+    assert "config.local.yaml" in gitignore
+    assert "${LLM_API_KEY}" in profile
+    assert "sk-" not in profile
 
 
 def test_prompt_templates_exist_with_required_placeholders() -> None:

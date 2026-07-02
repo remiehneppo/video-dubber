@@ -48,10 +48,8 @@ def test_run_mock_vertical_slice_creates_output_video(tmp_path: Path, capsys) ->
         ("transcript", 1),
         ("source_normalization", 1),
         ("glossary", 1),
-        ("translated", 1),
-        ("translated_v2", 1),
-        ("dubbing_cues", 1),
-        ("dubbing_cues_v2", 1),
+        ("translated", 2),
+        ("dubbing_cues", 2),
         ("speech_timeline", 1),
         ("tts_segments", 1),
         ("tts_manifest", 1),
@@ -63,23 +61,25 @@ def test_run_mock_vertical_slice_creates_output_video(tmp_path: Path, capsys) ->
     for name, version in expected_artifacts:
         assert manifest.validate_artifact(name, version), name
 
-    translated = json.loads((job_dir / "artifacts" / "translated.v1.json").read_text(encoding="utf-8"))
+    assert not (job_dir / "artifacts" / "translated.v1.json").exists()
+    assert not (job_dir / "artifacts" / "dubbing_cues.v1.json").exists()
+
+    translated = json.loads((job_dir / "artifacts" / "translated.v2.json").read_text(encoding="utf-8"))
     assert translated["segments"]
     assert "translation_warnings" in translated["segments"][0]
     tts_manifest = json.loads((job_dir / "artifacts" / "tts_manifest.v1.json").read_text(encoding="utf-8"))
     assert tts_manifest["segments"][0]["alignment_action"] == "time_stretch"
     assert "raw_audio_path" in tts_manifest["segments"][0]
-    dubbing_cues = json.loads((job_dir / "artifacts" / "dubbing_cues.v1.json").read_text(encoding="utf-8"))
-    dubbing_cues_v2 = json.loads((job_dir / "artifacts" / "dubbing_cues.v2.json").read_text(encoding="utf-8"))
-    translated_v2 = json.loads((job_dir / "artifacts" / "translated.v2.json").read_text(encoding="utf-8"))
+    dubbing_cues = json.loads((job_dir / "artifacts" / "dubbing_cues.v2.json").read_text(encoding="utf-8"))
     spoken_cues = json.loads((job_dir / "artifacts" / "spoken_cues.v1.json").read_text(encoding="utf-8"))
-    assert spoken_cues["cues"][0]["final_text"] == dubbing_cues["cues"][0]["translated_text"]
-    assert dubbing_cues_v2["schema_version"] == "2.0"
-    assert "display_text" in dubbing_cues_v2["cues"][0]
-    assert "spoken_text" in dubbing_cues_v2["cues"][0]
-    assert translated_v2["schema_version"] == "2.0"
-    assert "protected_spans" in translated_v2["segments"][0]
+    assert spoken_cues["cues"][0]["final_text"] == dubbing_cues["cues"][0]["spoken_text"]
+    assert dubbing_cues["schema_version"] == "2.0"
+    assert "display_text" in dubbing_cues["cues"][0]
+    assert "spoken_text" in dubbing_cues["cues"][0]
+    assert translated["schema_version"] == "2.0"
+    assert "protected_spans" in translated["segments"][0]
     speech_timeline = json.loads((job_dir / "artifacts" / "speech_timeline.v1.json").read_text(encoding="utf-8"))
+    assert speech_timeline["source"] == "dubbing_cues.v2"
     assert speech_timeline["speech_intervals"]
     assert "silence_intervals" in speech_timeline
     assert speech_timeline["total_duration_ms"] == 1000
@@ -159,11 +159,11 @@ def test_rerun_translation_repairs_corrupt_translated_artifact(tmp_path: Path, c
     )
     summary = json.loads(capsys.readouterr().out)
     job_dir = workspace / summary["job_id"]
-    translated_path = job_dir / "artifacts" / "translated.v1.json"
+    translated_path = job_dir / "artifacts" / "translated.v2.json"
     translated_path.write_text('{"corrupt": true}', encoding="utf-8")
 
     assert main(["validate", "--workspace", str(workspace), "--job", summary["job_id"]]) == 1
-    assert "translated.v1" in capsys.readouterr().out
+    assert "translated.v2" in capsys.readouterr().out
 
     assert (
         main(
@@ -242,7 +242,7 @@ def test_resume_repairs_earliest_invalid_artifact_and_completed_resume_is_noop(t
     assert main(["run", "--input", str(input_video), "--workspace", str(workspace), "--provider-mode", "mock", "--no-glossary-review"]) == 0
     initial = json.loads(capsys.readouterr().out)
     job_dir = workspace / initial["job_id"]
-    translated = job_dir / "artifacts" / "translated.v1.json"
+    translated = job_dir / "artifacts" / "translated.v2.json"
     translated.write_text("{}", encoding="utf-8")
 
     assert main(["resume", "--workspace", str(workspace), "--job", initial["job_id"]]) == 0

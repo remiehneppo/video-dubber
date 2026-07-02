@@ -102,7 +102,7 @@ Action:
 
 ## Corrupt artifact
 
-Symptom: `python3 cli.py validate --job {job_id}` reports an invalid artifact such as `translated.v1`.
+Symptom: `python3 cli.py validate --job {job_id}` reports an invalid artifact such as `translated.v2`.
 
 Action:
 

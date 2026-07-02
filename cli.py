@@ -337,7 +337,7 @@ def _chronological_review_cues(job_dir: Path, cues: list[object]) -> list[object
 
 
 def _review_timing_by_cue_id(job_dir: Path) -> dict[str, dict[str, int]]:
-    for filename in ("dubbing_cues.v2.json", "dubbing_cues.v1.json"):
+    for filename in ("dubbing_cues.v2.json",):
         path = job_dir / "artifacts" / filename
         if not path.exists():
             continue

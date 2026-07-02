@@ -9,3 +9,4 @@ models/*.onnx
 workspace/
 workspace_*/
 output/
+config.local.yaml

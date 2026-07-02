@@ -299,21 +299,19 @@ class JobManager:
 
     def _first_invalid_stage(self, ctx: StageContext) -> StageName | None:
         required = {
-            StageName.JOB_INIT: ("input_metadata",),
-            StageName.AUDIO_EXTRACT: ("audio_analysis",),
-            StageName.VAD: ("segments",),
-            StageName.ASR: ("asr_segments", "transcript", "source_normalization"),
-            StageName.GLOSSARY: ("glossary",),
+            StageName.JOB_INIT: (("input_metadata", 1),),
+            StageName.AUDIO_EXTRACT: (("audio_analysis", 1),),
+            StageName.VAD: (("segments", 1),),
+            StageName.ASR: (("asr_segments", 1), ("transcript", 1), ("source_normalization", 1)),
+            StageName.GLOSSARY: (("glossary", 1),),
             StageName.TRANSLATION: (
-                "translation_blocks",
-                "dubbing_cues",
-                "dubbing_cues_v2",
-                "speech_timeline",
-                "translated",
-                "translated_v2",
+                ("translation_blocks", 1),
+                ("dubbing_cues", 2),
+                ("speech_timeline", 1),
+                ("translated", 2),
             ),
-            StageName.TTS: ("tts_segments", "tts_manifest", "spoken_cues"),
-            StageName.MIXING: ("output_video",),
+            StageName.TTS: (("tts_segments", 1), ("tts_manifest", 1), ("spoken_cues", 1)),
+            StageName.MIXING: (("output_video", 1),),
         }
         for stage in StageName:
             progress = ctx.store.state.stages[stage]
@@ -321,7 +319,7 @@ class JobManager:
                 return stage
             if progress.status != StageStatus.COMPLETED:
                 return stage
-            if any(not ctx.manifest.validate_artifact(name, 1) for name in required[stage]):
+            if any(not ctx.manifest.validate_artifact(name, version) for name, version in required[stage]):
                 self._invalidate_from(ctx, stage, preserve_checkpoints=True)
                 return stage
             if stage == StageName.AUDIO_EXTRACT and not all(
@@ -387,7 +385,7 @@ class JobManager:
         )
         copied_input = paths.resolve_relative(store.state.input_file)
         duration_ms = self.ffmpeg.duration_ms(copied_input)
-        cues = read_json(paths.artifact_path("dubbing_cues.v1.json"))["cues"]
+        cues = read_json(paths.artifact_path("dubbing_cues.v2.json"))["cues"]
         matching = [cue for cue in cues if str(cue["cue_id"]) == segment_id]
         if not matching:
             raise ValueError(f"Unknown segment_id: {segment_id}")

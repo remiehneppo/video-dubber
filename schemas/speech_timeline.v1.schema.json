@@ -5,7 +5,7 @@
   "required": ["schema_version", "source", "guard_ms", "total_duration_ms", "speech_intervals", "silence_intervals"],
   "properties": {
     "schema_version": {"const": "1.0"},
-    "source": {"const": "dubbing_cues.v1"},
+    "source": {"const": "dubbing_cues.v2"},
     "guard_ms": {"type": "integer", "minimum": 0},
     "total_duration_ms": {"type": ["integer", "null"], "minimum": 0},
     "speech_intervals": {

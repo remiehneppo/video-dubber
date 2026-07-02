@@ -150,7 +150,7 @@ def _mixing_context(tmp_path: Path, config: DubberConfig) -> tuple[StageContext,
         },
     )
     _write_json(
-        paths.artifact_path("translated.v1.json"),
+        paths.artifact_path("translated.v2.json"),
         {"segments": [{"segment_id": "seg_000001", "vi_text": "Dòng dịch"}]},
     )
     _write_json(

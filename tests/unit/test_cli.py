@@ -245,6 +245,44 @@ def test_tts_from_stage_invalidation_preserves_tts_checkpoint(tmp_path: Path) ->
     assert reloaded_checkpoint.segments["cue_002"].status == StageStatus.FAILED
 
 
+def test_first_invalid_stage_accepts_versioned_translation_artifacts(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path / "workspace", "job_versioned_translation")
+    store = CheckpointStore.create(paths.job_state_file, job_id="job_versioned_translation", input_file=Path("input/a.mp4"))
+    manifest = ArtifactManifest.create("job_versioned_translation", paths.manifest_file)
+    artifacts = paths.artifacts_dir
+    artifacts.mkdir(parents=True, exist_ok=True)
+    for stage in StageName:
+        store.mark_stage(stage, StageStatus.COMPLETED)
+    for name, version, filename, stage in [
+        ("input_metadata", 1, "input_metadata.v1.json", StageName.JOB_INIT),
+        ("audio_analysis", 1, "audio_analysis.v1.json", StageName.AUDIO_EXTRACT),
+        ("segments", 1, "segments.v1.json", StageName.VAD),
+        ("asr_segments", 1, "asr_segments.v1.json", StageName.ASR),
+        ("transcript", 1, "transcript.v1.json", StageName.ASR),
+        ("source_normalization", 1, "source_normalization.v1.json", StageName.ASR),
+        ("glossary", 1, "glossary.locked.json", StageName.GLOSSARY),
+        ("translation_blocks", 1, "translation_blocks.v1.json", StageName.TRANSLATION),
+        ("dubbing_cues", 2, "dubbing_cues.v2.json", StageName.TRANSLATION),
+        ("speech_timeline", 1, "speech_timeline.v1.json", StageName.TRANSLATION),
+        ("translated", 2, "translated.v2.json", StageName.TRANSLATION),
+        ("tts_segments", 1, "tts_segments.v1.json", StageName.TTS),
+        ("tts_manifest", 1, "tts_manifest.v1.json", StageName.TTS),
+        ("spoken_cues", 1, "spoken_cues.v1.json", StageName.TTS),
+        ("output_video", 1, "output.mp4", StageName.MIXING),
+    ]:
+        path = artifacts / filename
+        path.write_text('{"ok": true}', encoding="utf-8")
+        manifest.record_artifact(name=name, version=version, path=path, created_by_stage=stage, schema_version="2.0" if version == 2 else "1.0")
+    (paths.audio_dir / "original.wav").parent.mkdir(parents=True, exist_ok=True)
+    (paths.audio_dir / "original.wav").write_bytes(b"wav")
+    (paths.audio_dir / "vocals.wav").write_bytes(b"wav")
+    (paths.tts_dir / "mix.wav").parent.mkdir(parents=True, exist_ok=True)
+    (paths.tts_dir / "mix.wav").write_bytes(b"wav")
+    ctx = JobManager()._context(paths, store, manifest, None)
+
+    assert JobManager()._first_invalid_stage(ctx) is None
+
+
 def test_job_manager_loads_resolved_config_path_for_resume(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     paths = WorkspacePaths.create(workspace, "job_config")

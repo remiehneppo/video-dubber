@@ -1,3 +1,4 @@
+# Local OpenAI-compatible services profile. Copy to config.local.yaml and set env vars.
 project:
   name: video-dubber
   output_format: mp4
@@ -86,7 +87,7 @@ subtitles:
 asr_service:
   provider: openai_compatible
   base_url: http://127.0.0.1:23334/v1
-  api_key: local-asr
+  api_key: ${ASR_API_KEY}
   model: Systran/faster-whisper-large-v3
   language: en
   timestamp_mode: prefer_word
@@ -98,14 +99,14 @@ asr_service:
 llm_service:
   provider: openai_compatible
   base_url: http://192.168.2.2:20128/v1
-  api_key: sk-27a006b1db37d100-u4bs54-25449c1e
+  api_key: ${LLM_API_KEY}
   model: common
   temperature: 0.4
 
 tts_service:
   provider: openai_compatible
   base_url: http://127.0.0.1:23333/v1
-  api_key: local-tts
+  api_key: ${TTS_API_KEY}
   model: pnnbao-ump/VieNeu-TTS-v2
   voice: "Mỹ Duyên"
   max_edge_silence_ms: 1200

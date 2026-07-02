@@ -1274,21 +1274,13 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
     publisher.publish_json(
         stage=StageName.TRANSLATION,
         name="dubbing_cues",
-        filename="dubbing_cues.v1.json",
-        payload={"schema_version": "1.0", "cues": cues},
-        status=StageStatus.RUNNING,
-        done=len(cues),
-        total=len(cues),
-    )
-    publisher.publish_json(
-        stage=StageName.TRANSLATION,
-        name="dubbing_cues_v2",
         filename="dubbing_cues.v2.json",
         payload={
             "schema_version": "2.0",
             "domain_profile": profile.artifact_id,
             "cues": [_dubbing_cue_v2(cue) for cue in cues],
         },
+        version=2,
         schema_version="2.0",
         status=StageStatus.RUNNING,
         done=len(cues),
@@ -1310,19 +1302,6 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
     publisher.publish_json(
         stage=StageName.TRANSLATION,
         name="translated",
-        filename="translated.v1.json",
-        payload={
-            "schema_version": "1.0",
-            "domain_profile": profile.artifact_id,
-            "segments": translated_segments,
-            "validation_warnings": validation.warnings,
-        },
-        done=len(cues),
-        total=len(cues),
-    )
-    publisher.publish_json(
-        stage=StageName.TRANSLATION,
-        name="translated_v2",
         filename="translated.v2.json",
         payload={
             "schema_version": "2.0",
@@ -1330,6 +1309,7 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
             "segments": [_translated_segment_v2(segment) for segment in translated_segments],
             "validation_warnings": validation.warnings,
         },
+        version=2,
         schema_version="2.0",
         done=len(cues),
         total=len(cues),
@@ -1683,7 +1663,7 @@ def run_tts(
     crash_stage: str | None = None,
     crash_after_segments: int | None = None,
 ) -> Path:
-    cues = ctx.artifact_json("dubbing_cues.v1.json")["cues"]
+    cues = ctx.artifact_json("dubbing_cues.v2.json")["cues"]
     timeline_overflow_by_cue = _timeline_overflow_by_cue(ctx.artifact_json("speech_timeline.v1.json"))
     segments = [
         {

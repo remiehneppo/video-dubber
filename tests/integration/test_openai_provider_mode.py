@@ -135,7 +135,7 @@ def test_openai_compatible_provider_mode_runs_with_injected_providers(tmp_path: 
 
     job_dir = workspace / summary.job_id
     transcript = json.loads((job_dir / "artifacts" / "transcript.v1.json").read_text(encoding="utf-8"))
-    translated = json.loads((job_dir / "artifacts" / "translated.v1.json").read_text(encoding="utf-8"))
+    translated = json.loads((job_dir / "artifacts" / "translated.v2.json").read_text(encoding="utf-8"))
     glossary = json.loads((job_dir / "artifacts" / "glossary.locked.json").read_text(encoding="utf-8"))
     resolved = json.loads((job_dir / "config.resolved.json").read_text(encoding="utf-8"))
 
@@ -145,7 +145,7 @@ def test_openai_compatible_provider_mode_runs_with_injected_providers(tmp_path: 
     assert glossary["terms"][0]["vietnamese"] == "vectơ riêng"
     assert resolved["domain"] == "seo"
     assert resolved["provider_mode"] == "openai_compatible"
-    assert translated["segments"][0]["vi_text"] == "Hãy nói về vectơ riêng."
+    assert translated["segments"][0]["display_text"] == "Hãy nói về vectơ riêng."
     assert (job_dir / summary.output_video).exists()
 
 

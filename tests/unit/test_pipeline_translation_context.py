@@ -140,7 +140,7 @@ def test_translation_uses_blocks_and_domain_context(tmp_path: Path) -> None:
     run_translation(ctx)
 
     glossary = json.loads((paths.artifact_path("glossary.locked.json")).read_text(encoding="utf-8"))
-    translated = json.loads((paths.artifact_path("translated.v1.json")).read_text(encoding="utf-8"))
+    translated = json.loads((paths.artifact_path("translated.v2.json")).read_text(encoding="utf-8"))
 
     assert [call["segment_count"] for call in llm.calls[:2]] == [9, 9]
     assert [call["segment_count"] for call in llm.calls[2:]] == [2]
@@ -148,9 +148,9 @@ def test_translation_uses_blocks_and_domain_context(tmp_path: Path) -> None:
     assert glossary["domain"] == "seo"
     assert len(glossary["terms"]) == 1
     assert len(translated["segments"]) == 9
-    cues = json.loads(paths.artifact_path("dubbing_cues.v1.json").read_text(encoding="utf-8"))["cues"]
-    assert all(cue["translated_text"] == f"seo::{cue['cue_id']}" for cue in cues)
-    assert translated["segments"][0]["vi_text"].startswith("seo::cue_")
+    cues = json.loads(paths.artifact_path("dubbing_cues.v2.json").read_text(encoding="utf-8"))["cues"]
+    assert all(cue["display_text"] == f"seo::{cue['cue_id']}" for cue in cues)
+    assert translated["segments"][0]["display_text"].startswith("seo::cue_")
 
 
 class OmitsSecondBlockOnceLLMProvider:
@@ -205,10 +205,10 @@ def test_translation_retries_block_when_target_segments_are_missing(tmp_path: Pa
 
     run_translation(ctx)
 
-    translated = json.loads((paths.artifact_path("translated.v1.json")).read_text(encoding="utf-8"))
+    translated = json.loads((paths.artifact_path("translated.v2.json")).read_text(encoding="utf-8"))
     assert any(llm.calls.count(target_ids) >= 2 for target_ids in llm.calls)
     assert [segment["segment_id"] for segment in translated["segments"]] == [segment["segment_id"] for segment in segments]
-    assert translated["segments"][-1]["vi_text"].startswith("retry::cue_")
+    assert translated["segments"][-1]["display_text"].startswith("retry::cue_")
 
 
 
@@ -264,7 +264,7 @@ def test_translation_retries_only_missing_segments_and_merges_partial_result(tmp
 
     assert len(llm.target_ids_by_call[0]) == 4
     assert llm.target_ids_by_call[1] == llm.target_ids_by_call[0][2:]
-    translated = json.loads(paths.artifact_path("translated.v1.json").read_text(encoding="utf-8"))
+    translated = json.loads(paths.artifact_path("translated.v2.json").read_text(encoding="utf-8"))
     assert [item["segment_id"] for item in translated["segments"]] == [item["segment_id"] for item in segments]
 
 
@@ -326,8 +326,8 @@ def test_translation_trims_repeated_boundary_prefix_before_cue_assembly(tmp_path
 
     run_translation(ctx)
 
-    translated = json.loads(paths.artifact_path("translated.v1.json").read_text(encoding="utf-8"))
-    cues = json.loads(paths.artifact_path("dubbing_cues.v1.json").read_text(encoding="utf-8"))["cues"]
+    translated = json.loads(paths.artifact_path("translated.v2.json").read_text(encoding="utf-8"))
+    cues = json.loads(paths.artifact_path("dubbing_cues.v2.json").read_text(encoding="utf-8"))["cues"]
     assert translated["segments"][0]["display_text"] == "Cụm mở đầu. Phần tiếp theo."
     assert translated["segments"][1]["display_text"] == "mở rộng."
     assert cues[0]["display_text"] == "Cụm mở đầu. Phần tiếp theo."
@@ -433,16 +433,16 @@ def test_translation_retries_once_for_calculus_protected_span_violation(tmp_path
     run_translation(ctx)
 
     assert len(llm.calls) == 2
-    cues = json.loads(paths.artifact_path("dubbing_cues.v1.json").read_text(encoding="utf-8"))["cues"]
+    cues = json.loads(paths.artifact_path("dubbing_cues.v2.json").read_text(encoding="utf-8"))["cues"]
     assert cues[0]["display_text"] == "Diện tích là 2 pi r nhân d r."
     assert cues[0]["spoken_text"] == "Diện tích là 2 pi r nhân d r."
-    assert "doctor" not in cues[0]["translated_text"].lower()
-    translated = json.loads(paths.artifact_path("translated.v1.json").read_text(encoding="utf-8"))
-    translated_v2 = json.loads(paths.artifact_path("translated.v2.json").read_text(encoding="utf-8"))
+    assert "doctor" not in cues[0]["display_text"].lower()
+    translated = json.loads(paths.artifact_path("translated.v2.json").read_text(encoding="utf-8"))
+    translated_artifact = json.loads(paths.artifact_path("translated.v2.json").read_text(encoding="utf-8"))
     assert translated["domain_profile"] == "calculus@1"
     assert translated["segments"][0]["protected_spans"][0]["canonical"] == "dr"
-    assert translated_v2["schema_version"] == "2.0"
-    assert translated_v2["segments"][0]["display_text"] == "Diện tích là 2 pi r nhân d r."
+    assert translated_artifact["schema_version"] == "2.0"
+    assert translated_artifact["segments"][0]["display_text"] == "Diện tích là 2 pi r nhân d r."
 
 
 class ReviewCueLLMProvider:

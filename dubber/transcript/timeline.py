@@ -14,7 +14,7 @@ def build_speech_timeline(
     """Build a voice-first timeline with explicit speech and silence intervals.
 
     This artifact is intentionally derived from the cue artifact for this slice:
-    cue generation remains the compatibility boundary, while TTS scheduling can
+    cue generation remains the scheduling boundary, while TTS scheduling can
     consume explicit silence gaps in the next slice.
     """
 
@@ -42,7 +42,7 @@ def build_speech_timeline(
         source_timing_quality = "cue_fallback"
     return {
         "schema_version": "1.0",
-        "source": "dubbing_cues.v1",
+        "source": "dubbing_cues.v2",
         "guard_ms": guard_ms,
         "total_duration_ms": total_duration_ms,
         "speech_intervals": speech_intervals,
