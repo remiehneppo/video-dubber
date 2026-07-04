@@ -104,3 +104,66 @@ def test_ffmpeg_assemble_commentary_track_disables_amix_normalization(tmp_path: 
     assert isinstance(command, list)
     filter_graph = command[command.index("-filter_complex") + 1]
     assert "amix=inputs=2:duration=longest:dropout_transition=0:normalize=0" in filter_graph
+
+
+class RecordingFFmpeg:
+    def __init__(self) -> None:
+        self.normalized: list[tuple[Path, Path]] = []
+        self.assembled: list[tuple[Path, int]] = []
+
+    def duration_ms(self, audio_path: Path) -> int:
+        return 100
+
+    def normalize_loudness(self, input_audio: Path, output_audio: Path) -> None:
+        self.normalized.append((input_audio, output_audio))
+        synthesize_tone_wav(output_audio, 100)
+
+    def assemble_commentary_track(self, segments: list[tuple[Path, int]], output_audio: Path) -> None:
+        self.assembled = list(segments)
+        synthesize_tone_wav(output_audio, 250)
+
+
+def test_assemble_commentary_track_normalizes_each_tts_segment_before_mix(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_test")
+    ffmpeg = RecordingFFmpeg()
+    first = paths.tts_dir / "seg_000001.wav"
+    second = paths.tts_dir / "seg_000002.wav"
+    synthesize_tone_wav(first, 100)
+    synthesize_tone_wav(second, 100)
+
+    output = paths.tts_dir / "mix.wav"
+    assemble_commentary_track(
+        paths=paths,
+        ffmpeg=ffmpeg,  # type: ignore[arg-type]
+        tts_segments=[
+            {"segment_id": "seg_000001", "audio_path": "tts/seg_000001.wav", "target_start_ms": 0},
+            {"segment_id": "seg_000002", "audio_path": "tts/seg_000002.wav", "target_start_ms": 150},
+        ],
+        output_audio=output,
+    )
+
+    assert ffmpeg.normalized == [
+        (first, paths.tts_dir / "seg_000001.loudnorm.wav"),
+        (second, paths.tts_dir / "seg_000002.loudnorm.wav"),
+    ]
+    assert ffmpeg.assembled == [
+        (paths.tts_dir / "seg_000001.loudnorm.wav", 0),
+        (paths.tts_dir / "seg_000002.loudnorm.wav", 150),
+    ]
+
+
+def test_ffmpeg_normalize_loudness_uses_loudnorm_filter(tmp_path: Path, monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_run(command, check, stdout, stderr):
+        seen["command"] = command
+
+    monkeypatch.setattr("dubber.providers.ffmpeg.subprocess.run", fake_run)
+
+    FFmpegAdapter().normalize_loudness(tmp_path / "input.wav", tmp_path / "output.wav")
+
+    command = seen["command"]
+    assert isinstance(command, list)
+    assert command[command.index("-af") + 1] == "loudnorm=I=-16:TP=-1.5:LRA=11"
+    assert "-ar" in command
+    assert str(tmp_path / "output.wav") == command[-1]

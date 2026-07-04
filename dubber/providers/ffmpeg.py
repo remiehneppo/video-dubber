@@ -124,6 +124,29 @@ class FFmpegAdapter:
             stderr=subprocess.DEVNULL,
         )
 
+    def normalize_loudness(self, input_audio: Path, output_audio: Path) -> None:
+        output_audio.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_audio),
+                "-af",
+                "loudnorm=I=-16:TP=-1.5:LRA=11",
+                "-ac",
+                "1",
+                "-ar",
+                "44100",
+                "-c:a",
+                "pcm_s16le",
+                str(output_audio),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
     def assemble_commentary_track(self, segments: list[tuple[Path, int]], output_audio: Path) -> None:
         if not segments:
             raise ValueError("segments must not be empty")

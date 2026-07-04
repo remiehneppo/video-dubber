@@ -50,6 +50,9 @@ class FakeLLMProvider:
         assert "context_before and context_after only" in system_prompt
         assert "Do not output translations for context-only segments" in system_prompt
         assert "mid-sentence" in system_prompt
+        assert "Do not translate word by word" in system_prompt
+        assert "rephrase the idea" in system_prompt
+        assert "natural Vietnamese explanation" in system_prompt
         assert "no objects for context-only IDs" in payload["instruction"]
         record = {
             "system_prompt": system_prompt,

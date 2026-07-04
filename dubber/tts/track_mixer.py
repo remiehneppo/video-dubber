@@ -59,5 +59,11 @@ def assemble_commentary_track(
                     audio_path,
                     mixed_audio_path,
                 )
-        inputs.append((mixed_audio_path, start_ms))
+        normalized_audio_path = _loudness_normalized_path(mixed_audio_path)
+        ffmpeg.normalize_loudness(mixed_audio_path, normalized_audio_path)
+        inputs.append((normalized_audio_path, start_ms))
     ffmpeg.assemble_commentary_track(inputs, output_audio)
+
+
+def _loudness_normalized_path(audio_path: Path) -> Path:
+    return audio_path.with_name(f"{audio_path.stem}.loudnorm.wav")

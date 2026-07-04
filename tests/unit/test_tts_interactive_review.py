@@ -20,6 +20,7 @@ from dubber.tts.interactive_review import (
     TTSReviewDecision,
     TTSReviewRequest,
     TerminalTTSReviewHandler,
+    is_manual_tts_review_error,
     load_tts_interactive_overrides,
     save_tts_interactive_override,
     suspicious_unicode,
@@ -209,6 +210,81 @@ def test_terminal_tts_review_requires_tty(tmp_path: Path) -> None:
         TerminalTTSReviewHandler(stdin=NonTTY(), stdout=NonTTY()).review(request)
 
 
+def test_duration_exceeds_max_speedup_requires_manual_review() -> None:
+    error = ValueError(
+        "cue_1: tts_duration_exceeds_max_speedup duration_ms=7060 "
+        "source_window_ms=4580 required_speedup_ratio=1.541 max_speedup_ratio=1.200"
+    )
+
+    assert is_manual_tts_review_error(error)
+
+
+def test_terminal_tts_review_explains_duration_failure(tmp_path: Path) -> None:
+    ctx = _context(tmp_path, [_cue("cue_1", start_ms=0, spoken_text="Đoạn này quá dài để đọc")])
+    request = TTSReviewRequest(
+        paths=ctx.paths,
+        cue=dict(ctx.artifact_json("dubbing_cues.v2.json")["cues"][0], segment_id="cue_1"),
+        all_cues=ctx.artifact_json("dubbing_cues.v2.json")["cues"],
+        failed_row={
+            "final_text": "Đoạn này quá dài để đọc",
+            "final_error": (
+                "cue_1: tts_duration_exceeds_max_speedup duration_ms=7060 "
+                "source_window_ms=4580 available_overflow_ms=0 target_window_ms=4580 "
+                "required_speedup_ratio=1.541 max_speedup_ratio=1.200"
+            ),
+        },
+    )
+    stdin = FakeTTYInput("q\n")
+    stdout = CapturingTTYOutput()
+
+    decision = TerminalTTSReviewHandler(stdin=stdin, stdout=stdout).review(request)
+
+    assert decision.action == "quit"
+    report = stdout.text
+    assert "tts_duration_exceeds_max_speedup" in report
+    assert "audio is too long for this cue" in report
+    assert "shorten spoken_text" in report
+    assert "silence" in report
+
+
+def test_terminal_tts_review_prints_heard_asr_from_quality_attempts(tmp_path: Path) -> None:
+    ctx = _context(tmp_path, [_cue("cue_1", start_ms=0, spoken_text="d sin của h")])
+    request = TTSReviewRequest(
+        paths=ctx.paths,
+        cue=dict(ctx.artifact_json("dubbing_cues.v2.json")["cues"][0], segment_id="cue_1"),
+        all_cues=ctx.artifact_json("dubbing_cues.v2.json")["cues"],
+        failed_row={
+            "final_error": "cue_1: tts_semantic_quality_failed cer=0.2 token_recall=0.7 attempts=2",
+            "quality_attempts": [
+                {
+                    "attempt": 1,
+                    "audio_path": "raw/tts/cue_1.attempt_001.wav",
+                    "asr_transcript": "d sinh của hát",
+                    "cer": 0.4,
+                    "token_recall": 0.6,
+                },
+                {
+                    "attempt": 2,
+                    "audio_path": "raw/tts/cue_1.attempt_002.wav",
+                    "asr_transcript": "d sinh của hát này",
+                    "cer": 0.2,
+                    "token_recall": 0.7,
+                },
+            ],
+        },
+    )
+    stdin = FakeTTYInput("q\n")
+    stdout = CapturingTTYOutput()
+
+    decision = TerminalTTSReviewHandler(stdin=stdin, stdout=stdout).review(request)
+
+    assert decision.action == "quit"
+    report = stdout.text
+    assert "metrics: cer=0.2 token_recall=0.7 attempts=2" in report
+    assert "heard_asr: d sinh của hát này" in report
+    assert "audio_attempts: raw/tts/cue_1.attempt_001.wav, raw/tts/cue_1.attempt_002.wav" in report
+
+
 def test_suspicious_unicode_flags_mixed_script_vietnamese() -> None:
     assert suspicious_unicode("đரờng") == ["Tamil"]
     assert suspicious_unicode("đường") == []
@@ -224,3 +300,30 @@ class NonTTY:
     def flush(self) -> None:
         return None
 
+
+class FakeTTYInput:
+    def __init__(self, text: str) -> None:
+        self.lines = text.splitlines(keepends=True)
+
+    def isatty(self) -> bool:
+        return True
+
+    def readline(self) -> str:
+        if not self.lines:
+            return ""
+        return self.lines.pop(0)
+
+
+class CapturingTTYOutput:
+    def __init__(self) -> None:
+        self.text = ""
+
+    def isatty(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        self.text += text
+        return len(text)
+
+    def flush(self) -> None:
+        return None

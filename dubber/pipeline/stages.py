@@ -114,6 +114,8 @@ def _translation_system_prompt(domain: str, profile: DomainProfile | None = None
         "Do not output translations for context-only segments.\n"
         "Preserve every required target segment_id exactly and return exactly one output object per required_target_segment_id.\n"
         "If a target segment begins or ends mid-sentence, translate it as a natural Vietnamese continuation that fits the neighboring context without duplicating the context.\n"
+        "Do not translate word by word or preserve awkward English syntax. First understand the speaker's intent, then rephrase the idea as a natural Vietnamese explanation.\n"
+        "Prefer smooth, idiomatic Vietnamese that a teacher would actually say aloud; combine, reorder, or simplify clauses when that makes the meaning clearer.\n"
         "Use locked glossary terms when their originals appear or clearly apply; preserve names, formulas, symbols, variables, units, and numbers accurately.\n"
         "Optimize for spoken Vietnamese: clear, concise, educational, and easy for TTS to read. Avoid overly literal English word order.\n"
         "Keep vi_text short enough for the segment duration when possible, but never drop technical meaning.\n"

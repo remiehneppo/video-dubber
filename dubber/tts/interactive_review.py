@@ -13,6 +13,7 @@ OVERRIDES_FILENAME = "tts_interactive_overrides.v1.json"
 MANUAL_TTS_ERROR_CODES = frozenset({
     "tts_semantic_quality_failed",
     "tts_rephrase_empty",
+    "tts_duration_exceeds_max_speedup",
 })
 
 
@@ -90,8 +91,8 @@ class TerminalTTSReviewHandler:
             if neighbor is not None:
                 text = neighbor.get("display_text") or neighbor.get("spoken_text") or neighbor.get("source_text")
                 print(f"  {label}: {neighbor.get('cue_id')} | {text}", file=self.stdout)
-        attempts = failed.get("attempts", [])
-        if isinstance(attempts, list) and attempts:
+        attempts = _quality_attempts(failed)
+        if attempts:
             last = attempts[-1] if isinstance(attempts[-1], dict) else {}
             print(
                 "  metrics: "
@@ -110,9 +111,15 @@ class TerminalTTSReviewHandler:
             ]
             if audio_paths:
                 print(f"  audio_attempts: {', '.join(audio_paths)}", file=self.stdout)
+        final_text = failed.get("final_text")
+        if final_text and final_text not in {cue.get("display_text"), cue.get("spoken_text")}:
+            print(f"  final_text: {final_text}", file=self.stdout)
         final_error = failed.get("final_error")
         if final_error:
             print(f"  error: {final_error}", file=self.stdout)
+            hint = _manual_review_hint(str(final_error))
+            if hint:
+                print(f"  action_needed: {hint}", file=self.stdout)
         suspicious = sorted(set(suspicious_unicode(" ".join(str(cue.get(key, "")) for key in ("display_text", "spoken_text")))))
         if suspicious:
             print(f"  suspicious_unicode: {', '.join(suspicious)}", file=self.stdout)
@@ -134,6 +141,16 @@ class TerminalTTSReviewHandler:
             raise RuntimeError("manual TTS review input closed")
         value = line.rstrip("\n")
         return current if value == "" else value
+
+
+def _quality_attempts(failed: dict[str, object]) -> list[object]:
+    attempts = failed.get("attempts")
+    if isinstance(attempts, list):
+        return attempts
+    attempts = failed.get("quality_attempts")
+    if isinstance(attempts, list):
+        return attempts
+    return []
 
 
 def is_manual_tts_review_error(error: BaseException) -> bool:
@@ -190,6 +207,19 @@ def suspicious_unicode(text: str) -> list[str]:
             continue
         scripts.add(name.split()[0].title())
     return sorted(scripts)
+
+
+def _manual_review_hint(final_error: str) -> str:
+    if "tts_duration_exceeds_max_speedup" in final_error:
+        return (
+            "audio is too long for this cue; choose edit and shorten spoken_text, "
+            "or choose silence/fail/quit after the checkpoint is saved"
+        )
+    if "tts_semantic_quality_failed" in final_error:
+        return "ASR heard different content; choose edit to correct display_text/spoken_text or choose silence/fail/quit"
+    if "tts_rephrase_empty" in final_error:
+        return "automatic shortening returned empty text; choose edit and provide a shorter spoken_text or choose silence/fail/quit"
+    return ""
 
 
 def _neighbor_cue(all_cues: list[dict[str, object]], cue_id: str, *, offset: int) -> dict[str, object] | None:
