@@ -64,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     jobs_parser.add_argument("--workspace", default="workspace")
     jobs_parser.set_defaults(handler=cmd_jobs)
 
+    workspace_status_parser = subparsers.add_parser("workspace-status")
+    workspace_status_parser.add_argument("workspace")
+    workspace_status_parser.set_defaults(handler=cmd_workspace_status)
+
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("--job", required=True)
     validate_parser.add_argument("--workspace", default="workspace")
@@ -266,6 +270,137 @@ def cmd_jobs(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_workspace_status(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace)
+    if not workspace.exists():
+        print(f"workspace missing: {workspace}")
+        return 1
+
+    lines = _format_workspace_status(workspace)
+    if not lines:
+        print(f"No jobs found in workspace: {workspace}")
+        return 0
+    print("\n".join(lines))
+    return 0
+
+
+def _format_workspace_status(workspace: Path) -> list[str]:
+    workspace = workspace.expanduser()
+    lines: list[str] = [f"Workspace: {workspace}"]
+    entries = _workspace_status_entries(workspace)
+    if not entries:
+        return []
+
+    for index, entry in enumerate(entries):
+        if index:
+            lines.append("")
+        if entry["type"] == "batch":
+            lines.extend(_format_batch_status_entry(workspace, entry))
+        else:
+            lines.extend(_format_job_status_entry(workspace, entry))
+    return lines
+
+
+def _workspace_status_entries(workspace: Path) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+
+    if (workspace / "job_state.json").exists():
+        entries.append({"type": "job", "root": workspace, "state": read_json(workspace / "job_state.json")})
+    if (workspace / "batch_state.json").exists():
+        entries.append({"type": "batch", "root": workspace, "state": read_json(workspace / "batch_state.json")})
+
+    for child in sorted(workspace.iterdir(), key=lambda path: path.name.casefold()):
+        if not child.is_dir():
+            continue
+        if (child / "batch_state.json").exists():
+            entries.append({"type": "batch", "root": child, "state": read_json(child / "batch_state.json")})
+        elif (child / "job_state.json").exists():
+            entries.append({"type": "job", "root": child, "state": read_json(child / "job_state.json")})
+    return entries
+
+
+def _format_batch_status_entry(workspace: Path, entry: dict[str, object]) -> list[str]:
+    root = entry["root"]
+    state = entry["state"]
+    if not isinstance(root, Path) or not isinstance(state, dict):
+        return []
+    batch_id = str(state.get("batch_id") or root.name)
+    jobs = state.get("jobs", [])
+    job_count = len(jobs) if isinstance(jobs, list) else 0
+    lines = [
+        f"Batch {batch_id} | status={state.get('status', 'unknown')} | jobs={job_count}",
+        f"Resume batch: python cli.py batch resume --workspace {workspace} --batch {batch_id}",
+    ]
+    if not isinstance(jobs, list):
+        return lines
+    for item in jobs:
+        if not isinstance(item, dict):
+            continue
+        job_id = str(item.get("job_id", ""))
+        state_path = root / "jobs" / job_id / "job_state.json"
+        job_state = read_json(state_path) if state_path.exists() else {}
+        video = _video_name(item.get("input_name") or item.get("input_file") or job_state.get("input_file"))
+        status = str(item.get("status") or job_state.get("status") or "unknown")
+        progress = _job_progress(job_state) if isinstance(job_state, dict) and job_state else "-"
+        error = (
+            str(item.get("error") or job_state.get("last_error") or "")
+            if isinstance(job_state, dict)
+            else str(item.get("error") or "")
+        )
+        lines.append(_format_status_row(job_id, video, status, progress, error))
+    return lines
+
+
+def _format_job_status_entry(workspace: Path, entry: dict[str, object]) -> list[str]:
+    root = entry["root"]
+    state = entry["state"]
+    if not isinstance(root, Path) or not isinstance(state, dict):
+        return []
+    job_id = str(state.get("job_id") or root.name)
+    lines = [
+        "Jobs:",
+        _format_status_row(
+            job_id,
+            _video_name(state.get("input_file")),
+            str(state.get("status", "unknown")),
+            _job_progress(state),
+            str(state.get("last_error") or ""),
+        ),
+        f"Resume job: python cli.py resume --workspace {workspace} --job {job_id}",
+    ]
+    return lines
+
+
+def _format_status_row(job_id: str, video: str, status: str, progress: str, error: str) -> str:
+    row = f"  {job_id} | {video} | {status} | {progress}"
+    if error:
+        row = f"{row} | error: {error}"
+    return row
+
+
+def _job_progress(state: dict[str, object]) -> str:
+    current_stage = str(state.get("current_stage") or "")
+    stages = state.get("stages", {})
+    if not current_stage or not isinstance(stages, dict):
+        return "-"
+    progress = stages.get(current_stage, {})
+    if not isinstance(progress, dict):
+        return current_stage
+    done = progress.get("done")
+    total = progress.get("total")
+    if done is not None and total is not None:
+        return f"{current_stage} {done}/{total}"
+    status = progress.get("status")
+    return f"{current_stage} {status}" if status else current_stage
+
+
+def _video_name(value: object) -> str:
+    if value is None:
+        return "-"
+    name = Path(str(value)).name
+    return name or str(value)
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     job_dir = _job_dir(args.workspace, args.job)
     manifest_path = job_dir / "manifest.json"
@@ -439,7 +574,7 @@ def _interactive_review_lock(required: dict[str, object], cues: list[object], *,
 
         overrides = _cue_review_overrides(cue)
         while True:
-            action = input("  action [Enter=a/accept, e=edit, q=quit]: ").strip().lower()
+            action = _prompt_line("  action [Enter=a/accept, e=edit, q=quit]: ").strip().lower()
             if action in {"", "a", "accept"}:
                 break
             if action in {"e", "edit"}:
@@ -496,9 +631,26 @@ def _copy_review_overrides(overrides: dict[str, object]) -> dict[str, object]:
 
 
 
+def _prompt_line(prompt: str) -> str:
+    print(prompt, end="")
+    sys.stdout.flush()
+    stdin_buffer = getattr(sys.stdin, "buffer", None)
+    if stdin_buffer is not None:
+        raw = stdin_buffer.readline()
+        if raw == b"":
+            raise EOFError("interactive review input closed")
+        encoding = getattr(sys.stdin, "encoding", None) or "utf-8"
+        return raw.decode(encoding, errors="replace").rstrip("\r\n")
+
+    line = sys.stdin.readline()
+    if line == "":
+        raise EOFError("interactive review input closed")
+    return line.rstrip("\r\n")
+
+
 def _prompt_text(label: str, current: str) -> str:
     prompt = f"{label} [{current}]: " if current else f"{label}: "
-    value = input(prompt).strip()
+    value = _prompt_line(prompt).strip()
     return current if value == "" else value
 
 
@@ -506,7 +658,7 @@ def _prompt_text(label: str, current: str) -> str:
 def _prompt_int(label: str, current: object) -> int:
     while True:
         prompt = f"{label} [{current}]: " if current is not None else f"{label}: "
-        value = input(prompt).strip()
+        value = _prompt_line(prompt).strip()
         if value == "":
             return int(current) if current is not None else 0
         try:
@@ -519,7 +671,7 @@ def _prompt_int(label: str, current: object) -> int:
 def _prompt_json_list(label: str, current: object) -> list[object]:
     while True:
         current_text = json.dumps(current, ensure_ascii=False) if current is not None else "[]"
-        value = input(f"{label} [{current_text}]: ").strip()
+        value = _prompt_line(f"{label} [{current_text}]: ").strip()
         if value == "":
             return list(current) if isinstance(current, list) else []
         try:

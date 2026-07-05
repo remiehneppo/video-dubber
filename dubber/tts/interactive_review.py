@@ -127,20 +127,28 @@ class TerminalTTSReviewHandler:
     def _prompt(self, message: str) -> str:
         print(message, end="", file=self.stdout)
         self.stdout.flush()
-        line = self.stdin.readline()
-        if line == "":
-            raise RuntimeError("manual TTS review input closed")
-        return line
+        return self._readline()
 
     def _prompt_text(self, label: str, current: str) -> str:
         print(f"Current {label}: {current}", file=self.stdout)
         print(f"New {label} (blank keeps current): ", end="", file=self.stdout)
         self.stdout.flush()
+        value = self._readline().rstrip("\r\n")
+        return current if value == "" else value
+
+    def _readline(self) -> str:
+        stdin_buffer = getattr(self.stdin, "buffer", None)
+        if stdin_buffer is not None:
+            raw = stdin_buffer.readline()
+            if raw == b"":
+                raise RuntimeError("manual TTS review input closed")
+            encoding = getattr(self.stdin, "encoding", None) or "utf-8"
+            return raw.decode(encoding, errors="replace")
+
         line = self.stdin.readline()
         if line == "":
             raise RuntimeError("manual TTS review input closed")
-        value = line.rstrip("\n")
-        return current if value == "" else value
+        return line
 
 
 def _quality_attempts(failed: dict[str, object]) -> list[object]:

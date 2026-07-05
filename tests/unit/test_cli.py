@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import io
+import sys
 import json
 from pathlib import Path
 
 import pytest
 
+import cli
 from cli import main
-from dubber.core.enums import StageName, StageStatus
+from dubber.core.enums import JobStatus, StageName, StageStatus
 from dubber.core.io import write_json_atomic
 from dubber.core.paths import WorkspacePaths
 from dubber.orchestrator.artifact_manifest import ArtifactManifest
@@ -39,6 +42,86 @@ def test_status_prints_job_state_json(tmp_path: Path, capsys: pytest.CaptureFixt
     payload = json.loads(capsys.readouterr().out)
     assert payload["job_id"] == "job_status"
     assert payload["stages"]["job_init"]["status"] == "completed"
+
+
+def test_workspace_status_reports_single_job_with_video_and_resume_hint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.create(workspace, "job_failed")
+    store = CheckpointStore.create(
+        paths.job_state_file, job_id="job_failed", input_file=Path("input/calculus.mp4")
+    )
+    store.mark_stage(StageName.ASR, StageStatus.COMPLETED, artifact="transcript.v1.json", done=3, total=3)
+    store.mark_stage(StageName.TTS, StageStatus.FAILED, done=4, total=5, error="tts_semantic_quality_failed")
+    store.mark_job(JobStatus.FAILED, error="cue_123: tts_semantic_quality_failed")
+    store.save()
+
+    exit_code = main(["workspace-status", str(workspace)])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "job_failed" in out
+    assert "calculus.mp4" in out
+    assert "failed" in out
+    assert "tts 4/5" in out
+    assert "cue_123: tts_semantic_quality_failed" in out
+    assert f"python cli.py resume --workspace {workspace} --job job_failed" in out
+
+
+def test_workspace_status_reports_batch_jobs_with_video_names_and_batch_resume_hint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace = tmp_path / "workspace"
+    batch_root = workspace / "batch_demo"
+    job_root = batch_root / "jobs"
+    first_paths = WorkspacePaths.create(job_root, "job_one")
+    first_store = CheckpointStore.create(
+        first_paths.job_state_file, job_id="job_one", input_file=Path("input/lesson-one.mp4")
+    )
+    first_store.mark_job(JobStatus.COMPLETED)
+    first_store.save()
+    second_paths = WorkspacePaths.create(job_root, "job_two")
+    second_store = CheckpointStore.create(
+        second_paths.job_state_file, job_id="job_two", input_file=Path("input/lesson-two.mp4")
+    )
+    second_store.mark_stage(StageName.TRANSLATION, StageStatus.WAITING_REVIEW, done=1, total=2)
+    second_store.mark_job(JobStatus.WAITING_REVIEW)
+    second_store.save()
+    write_json_atomic(
+        batch_root / "batch_state.json",
+        {
+            "schema_version": "1.0",
+            "batch_id": "batch_demo",
+            "status": "waiting_review",
+            "jobs": [
+                {"job_id": "job_one", "input_name": "lesson-one.mp4", "status": "completed", "error": None},
+                {"job_id": "job_two", "input_name": "lesson-two.mp4", "status": "waiting_review", "error": None},
+            ],
+        },
+    )
+
+    exit_code = main(["workspace-status", str(workspace)])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "batch_demo" in out
+    assert "lesson-one.mp4" in out
+    assert "lesson-two.mp4" in out
+    assert "translation 1/2" in out
+    assert f"python cli.py batch resume --workspace {workspace} --batch batch_demo" in out
+
+
+def test_prompt_text_replaces_invalid_terminal_bytes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    raw_stdin = io.TextIOWrapper(io.BytesIO(b"quy tac chu\xc6oi\n"), encoding="utf-8", errors="strict")
+    monkeypatch.setattr(sys, "stdin", raw_stdin)
+
+    value = cli._prompt_text("  display_text", "old")
+
+    assert value == "quy tac chu�oi"
+    assert "display_text [old]:" in capsys.readouterr().out
 
 
 def test_validate_returns_nonzero_for_missing_manifest(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -110,8 +193,8 @@ def test_review_interactive_writes_locked_artifacts(tmp_path: Path, capsys: pyte
     }
     (artifacts / "review.required.json").write_text(json.dumps(required, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    responses = iter(["", "e", "", "Đã sửa cue hai.", "Đã sửa spoken cue hai.", "[]"])
-    monkeypatch.setattr("builtins.input", lambda prompt="": next(responses))
+    responses = "\n".join(["", "e", "", "Đã sửa cue hai.", "Đã sửa spoken cue hai.", "[]"]) + "\n"
+    monkeypatch.setattr(sys, "stdin", io.StringIO(responses))
 
     exit_code = main(["review", "--workspace", str(workspace), "--job", "job_review"])
 
@@ -192,8 +275,7 @@ def test_review_interactive_sorts_legacy_required_cues_by_timeline(tmp_path: Pat
         ),
         encoding="utf-8",
     )
-    responses = iter(["", ""])
-    monkeypatch.setattr("builtins.input", lambda prompt="": next(responses))
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\n\n"))
 
     exit_code = main(["review", "--workspace", str(workspace), "--job", "job_review_order"])
 

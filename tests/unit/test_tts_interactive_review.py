@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -197,6 +198,24 @@ def test_saved_tts_override_is_applied_on_later_resume(tmp_path: Path, monkeypat
     assert manifest["segments"][0]["spoken_text"] == "saved spoken"
 
 
+def test_terminal_tts_review_replaces_invalid_terminal_bytes(tmp_path: Path) -> None:
+    ctx = _context(tmp_path, [_cue("cue_1", start_ms=0, spoken_text="bad text")])
+    request = TTSReviewRequest(
+        paths=ctx.paths,
+        cue=dict(ctx.artifact_json("dubbing_cues.v2.json")["cues"][0], segment_id="cue_1"),
+        all_cues=ctx.artifact_json("dubbing_cues.v2.json")["cues"],
+        failed_row={"final_error": "cue_1: tts_semantic_quality_failed"},
+    )
+    stdin = BinaryTTYInput(b"e\nDisplay \xc6 text\nSpoken text\n")
+    stdout = CapturingTTYOutput()
+
+    decision = TerminalTTSReviewHandler(stdin=stdin, stdout=stdout).review(request)
+
+    assert decision.action == "edit"
+    assert decision.display_text == "Display � text"
+    assert decision.spoken_text == "Spoken text"
+
+
 def test_terminal_tts_review_requires_tty(tmp_path: Path) -> None:
     ctx = _context(tmp_path, [_cue("cue_1", start_ms=0, spoken_text="bad text")])
     request = TTSReviewRequest(
@@ -288,6 +307,15 @@ def test_terminal_tts_review_prints_heard_asr_from_quality_attempts(tmp_path: Pa
 def test_suspicious_unicode_flags_mixed_script_vietnamese() -> None:
     assert suspicious_unicode("đரờng") == ["Tamil"]
     assert suspicious_unicode("đường") == []
+
+
+class BinaryTTYInput:
+    def __init__(self, data: bytes) -> None:
+        self.buffer = io.BytesIO(data)
+        self.encoding = "utf-8"
+
+    def isatty(self) -> bool:
+        return True
 
 
 class NonTTY:
