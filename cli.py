@@ -53,6 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("--job", required=True)
     resume_parser.add_argument("--workspace", default="workspace")
     resume_parser.add_argument("--from-stage", choices=[stage.value for stage in StageName])
+    resume_parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=False,
+        help="ignore reusable segment checkpoints and TTS overrides; completed jobs default to restarting from tts",
+    )
     resume_parser.set_defaults(handler=cmd_resume)
 
     status_parser = subparsers.add_parser("status")
@@ -110,6 +116,12 @@ def build_parser() -> argparse.ArgumentParser:
     batch_resume.add_argument("--workspace", default="workspace")
     batch_resume.add_argument("--job", action="append", dest="jobs")
     batch_resume.add_argument("--from-stage", choices=[stage.value for stage in StageName])
+    batch_resume.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=False,
+        help="ignore reusable segment checkpoints and TTS overrides; completed jobs default to restarting from tts",
+    )
     batch_resume.set_defaults(handler=cmd_batch_resume)
 
     batch_status = batch_commands.add_parser("status")
@@ -159,6 +171,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
             Path(args.workspace),
             args.job,
             from_stage=StageName(args.from_stage) if args.from_stage else None,
+            no_cache=bool(args.no_cache),
         )
     except Exception as exc:
         print(f"resume failed: {exc}")
@@ -214,6 +227,7 @@ def cmd_batch_resume(args: argparse.Namespace) -> int:
             args.batch,
             job_ids=args.jobs,
             from_stage=StageName(args.from_stage) if args.from_stage else None,
+            no_cache=bool(args.no_cache),
         )
     except Exception as exc:
         print(f"batch resume failed: {exc}")

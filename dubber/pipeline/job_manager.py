@@ -123,6 +123,7 @@ class JobManager:
         *,
         from_stage: StageName | None = None,
         stop_after: StageName | None = None,
+        no_cache: bool = False,
     ) -> RunSummary:
         paths = WorkspacePaths.create(workspace_dir, job_id)
         store = CheckpointStore.load(paths.job_state_file)
@@ -136,13 +137,18 @@ class JobManager:
             self._invalidate_from(
                 ctx,
                 from_stage,
-                preserve_checkpoints=from_stage == StageName.TTS,
+                preserve_checkpoints=from_stage == StageName.TTS and not no_cache,
+                no_cache=no_cache,
             )
             start_stage = from_stage
         else:
             start_stage = self._first_invalid_stage(ctx)
             if start_stage is None:
-                return self._summary(ctx, JobStatus.COMPLETED)
+                if not no_cache:
+                    return self._summary(ctx, JobStatus.COMPLETED)
+                start_stage = StageName.TTS
+            if no_cache:
+                self._invalidate_from(ctx, start_stage, preserve_checkpoints=False, no_cache=True)
 
         resolved = read_json(paths.root / "config.resolved.json") if (paths.root / "config.resolved.json").exists() else {}
         glossary_review = bool(resolved.get("glossary_review", False))
@@ -166,13 +172,13 @@ class JobManager:
             stop_after=stop_after,
         )
 
-    def invalidate(self, workspace_dir: Path, job_id: str, stage: StageName) -> None:
+    def invalidate(self, workspace_dir: Path, job_id: str, stage: StageName, *, no_cache: bool = False) -> None:
         paths = WorkspacePaths.create(workspace_dir, job_id)
         store = CheckpointStore.load(paths.job_state_file)
         manifest = ArtifactManifest.load(paths.manifest_file)
         config = self._load_resolved_config(paths)
         self._restore_provider_context(paths, config)
-        self._invalidate_from(self._context(paths, store, manifest, config), stage)
+        self._invalidate_from(self._context(paths, store, manifest, config), stage, no_cache=no_cache)
 
     def rerun_stage(self, workspace_dir: Path, job_id: str, stage: StageName) -> RunSummary:
         return self.resume(workspace_dir, job_id, from_stage=stage)
@@ -343,6 +349,7 @@ class JobManager:
         stage: StageName,
         *,
         preserve_checkpoints: bool = False,
+        no_cache: bool = False,
     ) -> None:
         checkpoint_names = {
             StageName.ASR: "asr_segments",
@@ -355,9 +362,41 @@ class JobManager:
         if preserve_checkpoints and checkpoint_name and ctx.manifest.validate_artifact(checkpoint_name, 1):
             preserve.add(checkpoint_name)
         ctx.manifest.remove_from_stage(stage, preserve_names=preserve)
+        if no_cache:
+            self._remove_stage_caches(ctx, stage)
         ctx.manifest.save()
         ctx.store.reset_from(stage)
         ctx.store.save()
+
+    def _remove_stage_caches(self, ctx: StageContext, stage: StageName) -> None:
+        affected = set(list(StageName)[list(StageName).index(stage):])
+        checkpoint_files = {
+            StageName.ASR: "asr_segments.v1.json",
+            StageName.GLOSSARY: "glossary_blocks.v1.json",
+            StageName.TRANSLATION: "translation_blocks.v1.json",
+            StageName.TTS: "tts_segments.v1.json",
+        }
+        for checkpoint_stage, filename in checkpoint_files.items():
+            if checkpoint_stage not in affected:
+                continue
+            path = ctx.paths.artifact_path(filename)
+            if path.exists():
+                path.unlink()
+        if StageName.TTS in affected:
+            for filename in (
+                "tts_interactive_overrides.v1.json",
+                "tts_manifest.v1.json",
+                "spoken_cues.v1.json",
+            ):
+                path = ctx.paths.artifact_path(filename)
+                if path.exists():
+                    path.unlink()
+            for directory in (ctx.paths.tts_dir, ctx.paths.raw_dir / "tts"):
+                if directory.exists():
+                    shutil.rmtree(directory)
+            ctx.paths.tts_dir.mkdir(parents=True, exist_ok=True)
+            ctx.paths.raw_dir.mkdir(parents=True, exist_ok=True)
+
 
     def _summary(self, ctx: StageContext, status: JobStatus) -> RunSummary:
         output = ""
@@ -593,6 +632,7 @@ class BatchManager:
         *,
         job_ids: list[str] | None = None,
         from_stage: StageName | None = None,
+        no_cache: bool = False,
     ) -> BatchSummary:
         root, state = self._load(workspace_dir, batch_id)
         config = self._batch_config(state)
@@ -657,9 +697,9 @@ class BatchManager:
                     and list(StageName).index(job_state.current_stage) <= list(StageName).index(StageName.ASR)
                 )
                 if needs_asr:
-                    manager.resume(root / "jobs", job_id, from_stage=from_stage, stop_after=StageName.ASR)
+                    manager.resume(root / "jobs", job_id, from_stage=from_stage, stop_after=StageName.ASR, no_cache=no_cache)
                 elif from_stage == StageName.GLOSSARY:
-                    manager.invalidate(root / "jobs", job_id, StageName.GLOSSARY)
+                    manager.invalidate(root / "jobs", job_id, StageName.GLOSSARY, no_cache=no_cache)
                 manager.publish_shared_glossary(root / "jobs", job_id, locked, locked=True)
                 ready.append(job)
                 job["status"] = "ready"
@@ -676,6 +716,7 @@ class BatchManager:
             self._batch_config(state).runtime.max_parallel_jobs,
             concurrency=concurrency,
             from_stage=from_stage if from_stage not in {StageName.JOB_INIT, StageName.AUDIO_EXTRACT, StageName.VAD, StageName.ASR, StageName.GLOSSARY} else None,
+            no_cache=no_cache,
             publish_glossary=False,
         )
         state["glossary"] = "artifacts/glossary.locked.json"
@@ -742,13 +783,14 @@ class BatchManager:
         *,
         concurrency: ProviderConcurrency,
         from_stage: StageName | None = None,
+        no_cache: bool = False,
         publish_glossary: bool = True,
     ) -> None:
         def complete(job: dict[str, Any]) -> RunSummary:
             manager = JobManager(concurrency=concurrency)
             if publish_glossary:
                 manager.publish_shared_glossary(root / "jobs", str(job["job_id"]), glossary, locked=True)
-            return manager.resume(root / "jobs", str(job["job_id"]), from_stage=from_stage)
+            return manager.resume(root / "jobs", str(job["job_id"]), from_stage=from_stage, no_cache=no_cache)
 
         self._run_jobs(state, root, jobs, complete, max_workers, success_status=JobStatus.COMPLETED.value)
         for job in jobs:

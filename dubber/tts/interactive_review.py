@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 import unicodedata
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ MANUAL_TTS_ERROR_CODES = frozenset({
     "tts_semantic_quality_failed",
     "tts_rephrase_empty",
     "tts_duration_exceeds_max_speedup",
+    "tts_rephrase_exceeds_char_limit",
 })
 
 
@@ -131,10 +133,27 @@ class TerminalTTSReviewHandler:
 
     def _prompt_text(self, label: str, current: str) -> str:
         print(f"Current {label}: {current}", file=self.stdout)
-        print(f"New {label} (blank keeps current): ", end="", file=self.stdout)
-        self.stdout.flush()
-        value = self._readline().rstrip("\r\n")
-        return current if value == "" else value
+        current_has_replacement = _has_replacement_character(current)
+        while True:
+            suffix = "blank keeps current" if not current_has_replacement else "current has invalid characters; enter clean text"
+            print(f"New {label} ({suffix}): ", end="", file=self.stdout)
+            self.stdout.flush()
+            value = self._readline().rstrip("\r\n")
+            if value == "" and not current_has_replacement:
+                return current
+            if value == "":
+                print(
+                    f"  current {label} contains replacement characters; enter clean text instead of keeping it",
+                    file=self.stdout,
+                )
+                continue
+            if _has_replacement_character(value):
+                print(
+                    f"  {label} still contains the replacement character �; re-enter it using clean UTF-8 text",
+                    file=self.stdout,
+                )
+                continue
+            return value
 
     def _readline(self) -> str:
         stdin_buffer = getattr(self.stdin, "buffer", None)
@@ -142,13 +161,20 @@ class TerminalTTSReviewHandler:
             raw = stdin_buffer.readline()
             if raw == b"":
                 raise RuntimeError("manual TTS review input closed")
-            encoding = getattr(self.stdin, "encoding", None) or "utf-8"
-            return raw.decode(encoding, errors="replace")
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError:
+                encoding = getattr(self.stdin, "encoding", None) or "utf-8"
+                return raw.decode(encoding, errors="replace")
 
         line = self.stdin.readline()
         if line == "":
             raise RuntimeError("manual TTS review input closed")
         return line
+
+
+def _has_replacement_character(text: str) -> bool:
+    return "�" in text
 
 
 def _quality_attempts(failed: dict[str, object]) -> list[object]:
@@ -227,7 +253,30 @@ def _manual_review_hint(final_error: str) -> str:
         return "ASR heard different content; choose edit to correct display_text/spoken_text or choose silence/fail/quit"
     if "tts_rephrase_empty" in final_error:
         return "automatic shortening returned empty text; choose edit and provide a shorter spoken_text or choose silence/fail/quit"
+    if "tts_rephrase_exceeds_char_limit" in final_error:
+        max_chars = _error_int(final_error, "max_chars")
+        actual_chars = _error_int(final_error, "actual_chars")
+        if max_chars is not None and actual_chars is not None:
+            return (
+                f"automatic shortening is still too long; choose edit and shorten "
+                f"display_text/spoken_text to {max_chars} characters or fewer "
+                f"(currently {actual_chars} characters), or choose silence/fail/quit"
+            )
+        if max_chars is not None:
+            return (
+                f"automatic shortening is still too long; choose edit and shorten "
+                f"display_text/spoken_text to {max_chars} characters or fewer, "
+                f"or choose silence/fail/quit"
+            )
+        return "automatic shortening is still too long; choose edit and shorten display_text/spoken_text or choose silence/fail/quit"
     return ""
+
+
+def _error_int(final_error: str, key: str) -> int | None:
+    match = re.search(rf"(?:^|\s){re.escape(key)}=(\d+)(?:\s|$)", final_error)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def _neighbor_cue(all_cues: list[dict[str, object]], cue_id: str, *, offset: int) -> dict[str, object] | None:

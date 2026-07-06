@@ -145,6 +145,44 @@ def test_resume_reports_missing_job_state(capsys: pytest.CaptureFixture[str]) ->
     assert "resume failed" in capsys.readouterr().out
 
 
+class FakeSummary:
+    def __init__(self, job_id: str = "job_1") -> None:
+        self.job_id = job_id
+
+    def to_dict(self) -> dict[str, str]:
+        return {"job_id": self.job_id, "status": "completed", "workspace": "workspace", "output_video": ""}
+
+
+def test_resume_no_cache_is_passed_to_job_manager(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_resume(self: JobManager, workspace_dir: Path, job_id: str, **kwargs: object) -> FakeSummary:
+        calls.append({"workspace_dir": workspace_dir, "job_id": job_id, **kwargs})
+        return FakeSummary(job_id)
+
+    monkeypatch.setattr(JobManager, "resume", fake_resume)
+
+    assert main(["resume", "--workspace", "workspace", "--job", "job_1", "--from-stage", "tts", "--no-cache"]) == 0
+
+    assert calls == [{"workspace_dir": Path("workspace"), "job_id": "job_1", "from_stage": StageName.TTS, "no_cache": True}]
+    assert "job_1" in capsys.readouterr().out
+
+
+def test_batch_resume_no_cache_is_passed_to_batch_manager(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_resume(self: BatchManager, workspace_dir: Path, batch_id: str, **kwargs: object) -> FakeSummary:
+        calls.append({"workspace_dir": workspace_dir, "batch_id": batch_id, **kwargs})
+        return FakeSummary(batch_id)
+
+    monkeypatch.setattr(BatchManager, "resume", fake_resume)
+
+    assert main(["batch", "resume", "--workspace", "workspace", "--batch", "batch_1", "--from-stage", "tts", "--no-cache"]) == 0
+
+    assert calls == [{"workspace_dir": Path("workspace"), "batch_id": "batch_1", "job_ids": None, "from_stage": StageName.TTS, "no_cache": True}]
+    assert "batch_1" in capsys.readouterr().out
+
+
 def test_review_interactive_writes_locked_artifacts(tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
     workspace = tmp_path / "workspace"
     job_dir = workspace / "job_review"
@@ -325,6 +363,109 @@ def test_tts_from_stage_invalidation_preserves_tts_checkpoint(tmp_path: Path) ->
     reloaded_checkpoint = SegmentCheckpointStore.load(paths.artifact_path("tts_segments.v1.json"))
     assert reloaded_checkpoint.segments["cue_001"].status == StageStatus.COMPLETED
     assert reloaded_checkpoint.segments["cue_002"].status == StageStatus.FAILED
+
+
+def test_tts_from_stage_no_cache_removes_tts_checkpoint_and_overrides(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path / "workspace", "job_tts_no_cache")
+    store = CheckpointStore.create(paths.job_state_file, job_id="job_tts_no_cache", input_file=Path("input/a.mp4"))
+    manifest = ArtifactManifest.create("job_tts_no_cache", paths.manifest_file)
+    checkpoint = SegmentCheckpointStore.create(
+        paths.artifact_path("tts_segments.v1.json"),
+        stage="tts",
+        segment_ids=["cue_001"],
+    )
+    audio_path = paths.tts_dir / "cue_001.wav"
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_path.write_bytes(b"audio")
+    quality_dir = paths.raw_dir / "tts"
+    quality_dir.mkdir(parents=True, exist_ok=True)
+    (quality_dir / "cue_001.quality.json").write_text("{}", encoding="utf-8")
+    checkpoint.mark("cue_001", StageStatus.COMPLETED, artifact="tts/cue_001.wav")
+    checkpoint.save()
+    write_json_atomic(
+        paths.artifact_path("tts_interactive_overrides.v1.json"),
+        {"schema_version": "1.0", "overrides": {"cue_001": {"spoken_text": "stale"}}},
+    )
+    manifest.record_artifact(
+        name="tts_segments",
+        version=1,
+        path=checkpoint.path,
+        created_by_stage=StageName.TTS,
+        schema_version="1.0",
+    )
+    manifest.save()
+    ctx = JobManager()._context(paths, store, manifest, None)
+
+    JobManager()._invalidate_from(ctx, StageName.TTS, preserve_checkpoints=False, no_cache=True)
+
+    assert not paths.artifact_path("tts_segments.v1.json").exists()
+    assert not paths.artifact_path("tts_interactive_overrides.v1.json").exists()
+    assert not audio_path.exists()
+    assert not quality_dir.exists()
+    reloaded_manifest = ArtifactManifest.load(paths.manifest_file)
+    assert reloaded_manifest.get("tts_segments", 1) is None
+
+
+def test_resume_no_cache_defaults_to_tts_for_completed_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.create(workspace, "job_completed_no_cache")
+    store = CheckpointStore.create(paths.job_state_file, job_id="job_completed_no_cache", input_file=Path("input/a.mp4"))
+    manifest = ArtifactManifest.create("job_completed_no_cache", paths.manifest_file)
+    artifacts = paths.artifacts_dir
+    artifacts.mkdir(parents=True, exist_ok=True)
+    for stage in StageName:
+        store.mark_stage(stage, StageStatus.COMPLETED)
+    store.mark_job(JobStatus.COMPLETED)
+    store.save()
+    for name, version, filename, stage in [
+        ("input_metadata", 1, "input_metadata.v1.json", StageName.JOB_INIT),
+        ("audio_analysis", 1, "audio_analysis.v1.json", StageName.AUDIO_EXTRACT),
+        ("segments", 1, "segments.v1.json", StageName.VAD),
+        ("asr_segments", 1, "asr_segments.v1.json", StageName.ASR),
+        ("transcript", 1, "transcript.v1.json", StageName.ASR),
+        ("source_normalization", 1, "source_normalization.v1.json", StageName.ASR),
+        ("glossary", 1, "glossary.locked.json", StageName.GLOSSARY),
+        ("translation_blocks", 1, "translation_blocks.v1.json", StageName.TRANSLATION),
+        ("dubbing_cues", 2, "dubbing_cues.v2.json", StageName.TRANSLATION),
+        ("speech_timeline", 1, "speech_timeline.v1.json", StageName.TRANSLATION),
+        ("translated", 2, "translated.v2.json", StageName.TRANSLATION),
+        ("tts_segments", 1, "tts_segments.v1.json", StageName.TTS),
+        ("tts_manifest", 1, "tts_manifest.v1.json", StageName.TTS),
+        ("spoken_cues", 1, "spoken_cues.v1.json", StageName.TTS),
+        ("output_video", 1, "dubbed.mp4", StageName.MIXING),
+    ]:
+        path = artifacts / filename if filename.endswith(".json") else paths.output_dir / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+        manifest.record_artifact(
+            name=name,
+            version=version,
+            path=path,
+            created_by_stage=stage,
+            schema_version="1.0",
+        )
+    manifest.save()
+    for audio_name in ("original.wav", "vocals.wav"):
+        (paths.audio_dir / audio_name).write_bytes(b"audio")
+    (paths.tts_dir / "mix.wav").write_bytes(b"mix")
+    write_json_atomic(
+        paths.artifact_path("tts_interactive_overrides.v1.json"),
+        {"schema_version": "1.0", "overrides": {"cue_001": {"spoken_text": "stale"}}},
+    )
+    calls: list[StageName] = []
+
+    def fake_execute(self: JobManager, ctx, *, start_stage: StageName, **kwargs: object):
+        calls.append(start_stage)
+        return FakeSummary(ctx.store.state.job_id)
+
+    monkeypatch.setattr(JobManager, "_execute", fake_execute)
+
+    summary = JobManager().resume(workspace, "job_completed_no_cache", no_cache=True)
+
+    assert summary.job_id == "job_completed_no_cache"
+    assert calls == [StageName.TTS]
+    assert not paths.artifact_path("tts_segments.v1.json").exists()
+    assert not paths.artifact_path("tts_interactive_overrides.v1.json").exists()
 
 
 def test_first_invalid_stage_accepts_versioned_translation_artifacts(tmp_path: Path) -> None:

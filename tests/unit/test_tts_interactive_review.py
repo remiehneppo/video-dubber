@@ -198,7 +198,7 @@ def test_saved_tts_override_is_applied_on_later_resume(tmp_path: Path, monkeypat
     assert manifest["segments"][0]["spoken_text"] == "saved spoken"
 
 
-def test_terminal_tts_review_replaces_invalid_terminal_bytes(tmp_path: Path) -> None:
+def test_terminal_tts_review_prefers_utf8_for_terminal_bytes(tmp_path: Path) -> None:
     ctx = _context(tmp_path, [_cue("cue_1", start_ms=0, spoken_text="bad text")])
     request = TTSReviewRequest(
         paths=ctx.paths,
@@ -206,14 +206,57 @@ def test_terminal_tts_review_replaces_invalid_terminal_bytes(tmp_path: Path) -> 
         all_cues=ctx.artifact_json("dubbing_cues.v2.json")["cues"],
         failed_row={"final_error": "cue_1: tts_semantic_quality_failed"},
     )
-    stdin = BinaryTTYInput(b"e\nDisplay \xc6 text\nSpoken text\n")
+    stdin = BinaryTTYInput(
+        "e\nđạo hàm và mối quan hệ đối nghịch giữa chúng\nđạo hàm, mối quan hệ đối nghịch giữa chúng\n".encode("utf-8"),
+        encoding="ascii",
+    )
     stdout = CapturingTTYOutput()
 
     decision = TerminalTTSReviewHandler(stdin=stdin, stdout=stdout).review(request)
 
     assert decision.action == "edit"
-    assert decision.display_text == "Display � text"
+    assert decision.display_text == "đạo hàm và mối quan hệ đối nghịch giữa chúng"
+    assert decision.spoken_text == "đạo hàm, mối quan hệ đối nghịch giữa chúng"
+    assert "�" not in decision.display_text
+    assert "�" not in decision.spoken_text
+
+
+def test_terminal_tts_review_reprompts_invalid_terminal_bytes(tmp_path: Path) -> None:
+    ctx = _context(tmp_path, [_cue("cue_1", start_ms=0, spoken_text="bad text")])
+    request = TTSReviewRequest(
+        paths=ctx.paths,
+        cue=dict(ctx.artifact_json("dubbing_cues.v2.json")["cues"][0], segment_id="cue_1"),
+        all_cues=ctx.artifact_json("dubbing_cues.v2.json")["cues"],
+        failed_row={"final_error": "cue_1: tts_semantic_quality_failed"},
+    )
+    stdin = BinaryTTYInput(b"e\nDisplay \xc6 text\nClean display\nSpoken text\n")
+    stdout = CapturingTTYOutput()
+
+    decision = TerminalTTSReviewHandler(stdin=stdin, stdout=stdout).review(request)
+
+    assert decision.action == "edit"
+    assert decision.display_text == "Clean display"
     assert decision.spoken_text == "Spoken text"
+    assert "replacement character" in stdout.text
+
+
+def test_terminal_tts_review_requires_replacing_corrupt_current_text(tmp_path: Path) -> None:
+    ctx = _context(tmp_path, [_cue("cue_1", start_ms=0, spoken_text="m�ối quan h�ệ")])
+    request = TTSReviewRequest(
+        paths=ctx.paths,
+        cue=dict(ctx.artifact_json("dubbing_cues.v2.json")["cues"][0], segment_id="cue_1"),
+        all_cues=ctx.artifact_json("dubbing_cues.v2.json")["cues"],
+        failed_row={"final_error": "cue_1: tts_semantic_quality_failed"},
+    )
+    stdin = FakeTTYInput("e\n\nmối quan hệ\nmối quan hệ\n")
+    stdout = CapturingTTYOutput()
+
+    decision = TerminalTTSReviewHandler(stdin=stdin, stdout=stdout).review(request)
+
+    assert decision.action == "edit"
+    assert decision.display_text == "mối quan hệ"
+    assert decision.spoken_text == "mối quan hệ"
+    assert "current display_text contains replacement characters" in stdout.text
 
 
 def test_terminal_tts_review_requires_tty(tmp_path: Path) -> None:
@@ -233,6 +276,15 @@ def test_duration_exceeds_max_speedup_requires_manual_review() -> None:
     error = ValueError(
         "cue_1: tts_duration_exceeds_max_speedup duration_ms=7060 "
         "source_window_ms=4580 required_speedup_ratio=1.541 max_speedup_ratio=1.200"
+    )
+
+    assert is_manual_tts_review_error(error)
+
+
+def test_rephrase_exceeds_char_limit_requires_manual_review() -> None:
+    error = ValueError(
+        "cue_1: tts_rephrase_exceeds_char_limit max_chars=78 "
+        "actual_chars=84 attempts=3"
     )
 
     assert is_manual_tts_review_error(error)
@@ -264,6 +316,29 @@ def test_terminal_tts_review_explains_duration_failure(tmp_path: Path) -> None:
     assert "audio is too long for this cue" in report
     assert "shorten spoken_text" in report
     assert "silence" in report
+
+
+def test_terminal_tts_review_explains_char_limit_failure(tmp_path: Path) -> None:
+    ctx = _context(tmp_path, [_cue("cue_1", start_ms=0, spoken_text="Một câu tiếng Việt vẫn còn hơi dài")])
+    request = TTSReviewRequest(
+        paths=ctx.paths,
+        cue=dict(ctx.artifact_json("dubbing_cues.v2.json")["cues"][0], segment_id="cue_1"),
+        all_cues=ctx.artifact_json("dubbing_cues.v2.json")["cues"],
+        failed_row={
+            "final_text": "Một câu tiếng Việt vẫn còn hơi dài",
+            "final_error": "cue_1: tts_rephrase_exceeds_char_limit max_chars=78 actual_chars=84 attempts=3",
+        },
+    )
+    stdin = FakeTTYInput("q\n")
+    stdout = CapturingTTYOutput()
+
+    decision = TerminalTTSReviewHandler(stdin=stdin, stdout=stdout).review(request)
+
+    assert decision.action == "quit"
+    report = stdout.text
+    assert "tts_rephrase_exceeds_char_limit" in report
+    assert "shorten display_text/spoken_text to 78 characters or fewer" in report
+    assert "currently 84 characters" in report
 
 
 def test_terminal_tts_review_prints_heard_asr_from_quality_attempts(tmp_path: Path) -> None:
@@ -310,9 +385,9 @@ def test_suspicious_unicode_flags_mixed_script_vietnamese() -> None:
 
 
 class BinaryTTYInput:
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes, *, encoding: str = "utf-8") -> None:
         self.buffer = io.BytesIO(data)
-        self.encoding = "utf-8"
+        self.encoding = encoding
 
     def isatty(self) -> bool:
         return True
