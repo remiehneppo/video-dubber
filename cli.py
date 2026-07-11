@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import logging
 import sys
 import json
@@ -8,7 +9,7 @@ import os
 from pathlib import Path
 from typing import Sequence
 
-from dubber.core.enums import StageName
+from dubber.core.enums import JobStatus, StageName
 from dubber.core.io import read_json, write_json_atomic
 from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.pipeline.job_manager import BatchManager, BatchOptions, JobManager, RunOptions
@@ -144,8 +145,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    manager = JobManager(tts_review_handler=TerminalTTSReviewHandler().review)
     try:
-        summary = JobManager(tts_review_handler=TerminalTTSReviewHandler().review).run(
+        summary = manager.run(
             RunOptions(
                 input_path=Path(args.input),
                 workspace_dir=Path(args.workspace),
@@ -158,6 +160,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 crash_after_segments=args.crash_after_segments,
             )
         )
+        summary = _complete_interactive_reviews(manager, Path(args.workspace), summary)
     except Exception as exc:
         print(f"run failed: {exc}")
         return 1
@@ -166,18 +169,48 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
+    manager = JobManager(tts_review_handler=TerminalTTSReviewHandler().review)
     try:
-        summary = JobManager(tts_review_handler=TerminalTTSReviewHandler().review).resume(
+        summary = manager.resume(
             Path(args.workspace),
             args.job,
             from_stage=StageName(args.from_stage) if args.from_stage else None,
             no_cache=bool(args.no_cache),
         )
+        summary = _complete_interactive_reviews(manager, Path(args.workspace), summary)
     except Exception as exc:
         print(f"resume failed: {exc}")
         return 1
     print(json.dumps(summary.to_dict(), ensure_ascii=False, sort_keys=True))
     return 0
+
+
+def _complete_interactive_reviews(manager: JobManager, workspace_dir: Path, summary):
+    while getattr(summary, "status", "") == JobStatus.WAITING_REVIEW.value:
+        job_id = str(getattr(summary, "job_id"))
+        job_dir = workspace_dir / job_id
+        required_path = job_dir / "artifacts" / "review.required.json"
+        if not required_path.exists():
+            break
+        if not sys.stdin.isatty():
+            raise RuntimeError("manual review requires an interactive terminal")
+        locked = _build_locked_review(job_dir, job_id)
+        if locked is None:
+            raise RuntimeError("manual review cancelled")
+        write_json_atomic(job_dir / "artifacts" / "review.locked.json", locked)
+        summary = manager.resume(workspace_dir, job_id)
+    return summary
+
+
+def _build_locked_review(job_dir: Path, job_id: str) -> dict[str, object] | None:
+    required_path = job_dir / "artifacts" / "review.required.json"
+    required = read_json(required_path)
+    if not isinstance(required, dict):
+        raise RuntimeError(f"review.required.json is invalid for job {job_id}")
+    cues = required.get("cues", [])
+    if not isinstance(cues, list) or not cues:
+        raise RuntimeError(f"No review cues found for job {job_id}")
+    return _interactive_review_lock(required, _chronological_review_cues(job_dir, cues), job_id=job_id)
 
 
 def cmd_rerun(args: argparse.Namespace) -> int:
@@ -570,6 +603,10 @@ def _interactive_review_lock(required: dict[str, object], cues: list[object], *,
         reason = str(cue.get("reason", ""))
         if reason:
             print(f"  reason: {reason}")
+        error = str(cue.get("error", ""))
+        if error:
+            print(f"  error: {error}")
+            print("  action_needed: choose edit and correct the cue so the error condition is satisfied")
         risk_flags = cue.get("risk_flags", [])
         if isinstance(risk_flags, list) and risk_flags:
             print(f"  risk_flags: {', '.join(str(flag) for flag in risk_flags)}")
@@ -587,9 +624,11 @@ def _interactive_review_lock(required: dict[str, object], cues: list[object], *,
             print(f"  protected_spans: {json.dumps(protected_spans, ensure_ascii=False)}")
 
         overrides = _cue_review_overrides(cue)
+        has_error = bool(str(cue.get("error", "")).strip())
         while True:
-            action = _prompt_line("  action [Enter=a/accept, e=edit, q=quit]: ").strip().lower()
-            if action in {"", "a", "accept"}:
+            prompt = "  action [e=edit, q=quit]: " if has_error else "  action [Enter=a/accept, e=edit, q=quit]: "
+            action = _prompt_line(prompt).strip().lower()
+            if not has_error and action in {"", "a", "accept"}:
                 break
             if action in {"e", "edit"}:
                 print("  entering edit mode")
@@ -597,7 +636,7 @@ def _interactive_review_lock(required: dict[str, object], cues: list[object], *,
                 break
             if action in {"q", "quit"}:
                 return None
-            print("  enter a, e, or q")
+            print("  enter e or q" if has_error else "  enter a, e, or q")
 
         lock["cues"].append({"cue_id": cue_id, "review_overrides": overrides})
         print()
@@ -648,18 +687,39 @@ def _copy_review_overrides(overrides: dict[str, object]) -> dict[str, object]:
 def _prompt_line(prompt: str) -> str:
     print(prompt, end="")
     sys.stdout.flush()
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        _enable_terminal_line_editing()
+        try:
+            return builtins.input("").rstrip("\r\n")
+        except EOFError as exc:
+            raise EOFError("interactive review input closed") from exc
     stdin_buffer = getattr(sys.stdin, "buffer", None)
     if stdin_buffer is not None:
         raw = stdin_buffer.readline()
         if raw == b"":
             raise EOFError("interactive review input closed")
-        encoding = getattr(sys.stdin, "encoding", None) or "utf-8"
-        return raw.decode(encoding, errors="replace").rstrip("\r\n")
+        try:
+            return raw.decode("utf-8").rstrip("\r\n")
+        except UnicodeDecodeError:
+            encoding = getattr(sys.stdin, "encoding", None) or "utf-8"
+            return raw.decode(encoding, errors="replace").rstrip("\r\n")
 
     line = sys.stdin.readline()
     if line == "":
         raise EOFError("interactive review input closed")
     return line.rstrip("\r\n")
+
+
+def _enable_terminal_line_editing() -> None:
+    try:
+        import readline  # type: ignore[import-not-found]
+    except ImportError:
+        return
+    parse_and_bind = getattr(readline, "parse_and_bind", None)
+    if not callable(parse_and_bind):
+        return
+    parse_and_bind("set editing-mode emacs")
+    parse_and_bind("set enable-keypad on")
 
 
 def _prompt_text(label: str, current: str) -> str:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import re
 import sys
 import unicodedata
@@ -156,6 +157,13 @@ class TerminalTTSReviewHandler:
             return value
 
     def _readline(self) -> str:
+        if self.stdin is sys.stdin and self.stdout is sys.stdout:
+            _enable_terminal_line_editing()
+            try:
+                return builtins.input("") + "\n"
+            except EOFError as exc:
+                raise RuntimeError("manual TTS review input closed") from exc
+
         stdin_buffer = getattr(self.stdin, "buffer", None)
         if stdin_buffer is not None:
             raw = stdin_buffer.readline()
@@ -171,6 +179,18 @@ class TerminalTTSReviewHandler:
         if line == "":
             raise RuntimeError("manual TTS review input closed")
         return line
+
+
+def _enable_terminal_line_editing() -> None:
+    try:
+        import readline  # type: ignore[import-not-found]
+    except ImportError:
+        return
+    parse_and_bind = getattr(readline, "parse_and_bind", None)
+    if not callable(parse_and_bind):
+        return
+    parse_and_bind("set editing-mode emacs")
+    parse_and_bind("set enable-keypad on")
 
 
 def _has_replacement_character(text: str) -> bool:

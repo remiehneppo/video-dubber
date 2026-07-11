@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import sys
+import types
 from dataclasses import replace
 from pathlib import Path
 
@@ -259,6 +261,43 @@ def test_terminal_tts_review_requires_replacing_corrupt_current_text(tmp_path: P
     assert "current display_text contains replacement characters" in stdout.text
 
 
+def test_terminal_tts_review_uses_input_for_real_stdio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _context(tmp_path, [_cue("cue_1", start_ms=0, spoken_text="bad text")])
+    request = TTSReviewRequest(
+        paths=ctx.paths,
+        cue=dict(ctx.artifact_json("dubbing_cues.v2.json")["cues"][0], segment_id="cue_1"),
+        all_cues=ctx.artifact_json("dubbing_cues.v2.json")["cues"],
+        failed_row={"final_error": "cue_1: tts_semantic_quality_failed"},
+    )
+    calls: list[str] = []
+    answers = iter(["e", "display", "spoken"])
+
+    def fake_input(prompt: str = "") -> str:
+        calls.append(prompt)
+        return next(answers)
+
+    readline_calls: list[str] = []
+    fake_readline = types.ModuleType("readline")
+    fake_readline.parse_and_bind = readline_calls.append  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "readline", fake_readline)
+    monkeypatch.setattr("builtins.input", fake_input)
+    stdin = RealTTYInputTrap()
+    stdout = CapturingTTYOutput()
+    monkeypatch.setattr("sys.stdin", stdin)
+    monkeypatch.setattr("sys.stdout", stdout)
+
+    decision = TerminalTTSReviewHandler().review(request)
+
+    assert decision == TTSReviewDecision(action="edit", display_text="display", spoken_text="spoken")
+    assert calls == ["", "", ""]
+    assert stdin.buffer_read_count == 0
+    assert "set editing-mode emacs" in readline_calls
+    assert "set enable-keypad on" in readline_calls
+
+
 def test_terminal_tts_review_requires_tty(tmp_path: Path) -> None:
     ctx = _context(tmp_path, [_cue("cue_1", start_ms=0, spoken_text="bad text")])
     request = TTSReviewRequest(
@@ -402,6 +441,28 @@ class NonTTY:
 
     def flush(self) -> None:
         return None
+
+
+class _TrapBuffer:
+    def __init__(self, owner: "RealTTYInputTrap") -> None:
+        self.owner = owner
+
+    def readline(self) -> bytes:
+        self.owner.buffer_read_count += 1
+        raise AssertionError("real terminal input should use input(), not stdin.buffer.readline()")
+
+
+class RealTTYInputTrap:
+    def __init__(self) -> None:
+        self.buffer_read_count = 0
+        self.buffer = _TrapBuffer(self)
+        self.encoding = "utf-8"
+
+    def isatty(self) -> bool:
+        return True
+
+    def readline(self) -> str:
+        raise AssertionError("real terminal input should use input(), not stdin.readline()")
 
 
 class FakeTTYInput:

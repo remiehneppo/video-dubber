@@ -221,6 +221,7 @@ def _calculus_profile_fallback() -> dict[str, Any]:
         {"original": "dx", "vietnamese": "d x", "category": "calculus_notation", "spoken": "d x", "display": "dx"},
         {"original": "dy", "vietnamese": "d y", "category": "calculus_notation", "spoken": "d y", "display": "dy"},
         {"original": "dt", "vietnamese": "d t", "category": "calculus_notation", "spoken": "d t", "display": "dt"},
+        {"original": "dx squared", "vietnamese": "d x bình phương", "category": "calculus_notation", "spoken": "d x bình phương", "display": "dx²"},
         {"original": "dy/dx", "vietnamese": "d y trên d x", "category": "calculus_notation", "spoken": "d y trên d x", "display": "dy/dx"},
         {"original": "d/dx", "vietnamese": "d trên d x", "category": "calculus_notation", "spoken": "d trên d x", "display": "d/dx"},
         {"original": "πr²", "vietnamese": "pi r bình phương", "category": "formula", "spoken": "pi r bình phương", "display": "πr²"},
@@ -241,6 +242,7 @@ def _detect_calculus_spans(text: str) -> list[ProtectedSpan]:
         (r"dy\s*/\s*dx", "dy/dx", "d y trên d x", "dy/dx", "calculus_notation", "calculus.dy_dx"),
         (r"d\s*/\s*dx", "d/dx", "d trên d x", "d/dx", "calculus_notation", "calculus.d_dx"),
         (r"d\s*/\s*dt", "d/dt", "d trên d t", "d/dt", "calculus_notation", "calculus.d_dt"),
+        (r"\bdx\s+squared\b", "dx²", "d x bình phương", "dx²", "calculus_notation", "calculus.dx_squared_words"),
         (r"π\s*r\s*(?:²|\^2)", "πr²", "pi r bình phương", "πr²", "formula", "calculus.pi_r_squared"),
         (r"\bpi\s+r\s+squared\b", "πr²", "pi r bình phương", "πr²", "formula", "calculus.pi_r_squared_words"),
         (r"½|\b1\s*/\s*2\b|\bone\s+half\b", "½", "một phần hai", "½", "fraction", "calculus.one_half"),
@@ -255,6 +257,9 @@ def _detect_calculus_spans(text: str) -> list[ProtectedSpan]:
     for match in re.finditer(r"(?<![A-Za-zÀ-ỹ])([A-Za-z])(?:²|\^2)(?![A-Za-zÀ-ỹ])", text):
         variable = match.group(1)
         spans.append(_span(match, "power", f"{variable}²", f"{variable} bình phương", f"{variable}²", "calculus.variable_squared"))
+    for match in re.finditer(r"(?<![A-Za-zÀ-ỹ])([A-Za-z])\s+squared\b", text, flags=re.IGNORECASE):
+        variable = match.group(1)
+        spans.append(_span(match, "power", f"{variable}²", f"{variable} bình phương", f"{variable}²", "calculus.variable_squared_words"))
     return spans
 
 

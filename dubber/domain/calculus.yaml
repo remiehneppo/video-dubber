@@ -26,6 +26,11 @@ glossary_seeds:
     category: calculus_notation
     spoken: d t
     display: dt
+  - original: dx squared
+    vietnamese: d x bình phương
+    category: calculus_notation
+    spoken: d x bình phương
+    display: dx²
   - original: dy/dx
     vietnamese: d y trên d x
     category: calculus_notation

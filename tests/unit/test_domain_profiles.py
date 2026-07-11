@@ -41,6 +41,21 @@ def test_calculus_spans_seed_locked_glossary_terms() -> None:
     assert "doctor" in dr["forbidden"]
 
 
+def test_calculus_profile_protects_dx_squared_as_single_notation() -> None:
+    profile = load_domain_profile("mathematics", explicit_profile="calculus")
+    source_text = "plus whatever the change to x squared is, dx squared."
+
+    spans = detect_protected_spans(source_text, profile)
+
+    assert [span.canonical for span in spans] == ["x²", "dx²"]
+    assert normalize_spoken_text("dx²", spans) == "d x bình phương"
+    assert protected_translation_errors(source_text, "cộng với thay đổi của x bình phương", spans) == [
+        "protected span dx² must be represented as d x bình phương"
+    ]
+    assert protected_translation_errors(source_text, "cộng với thay đổi dx²", spans) == []
+    assert protected_translation_errors(source_text, "cộng với thay đổi d x bình phương", spans) == []
+
+
 def test_calculus_profile_loads_without_pyyaml(monkeypatch: pytest.MonkeyPatch) -> None:
     real_import = builtins.__import__
 

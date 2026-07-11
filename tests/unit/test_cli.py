@@ -146,11 +146,24 @@ def test_resume_reports_missing_job_state(capsys: pytest.CaptureFixture[str]) ->
 
 
 class FakeSummary:
-    def __init__(self, job_id: str = "job_1") -> None:
+    def __init__(self, job_id: str = "job_1", *, status: str = "completed", workspace: str = "workspace") -> None:
         self.job_id = job_id
+        self.status = status
+        self.workspace = workspace
 
     def to_dict(self) -> dict[str, str]:
-        return {"job_id": self.job_id, "status": "completed", "workspace": "workspace", "output_video": ""}
+        return {"job_id": self.job_id, "status": self.status, "workspace": self.workspace, "output_video": ""}
+
+
+class FakeTTY:
+    def __init__(self, text: str) -> None:
+        self.lines = io.StringIO(text)
+
+    def isatty(self) -> bool:
+        return True
+
+    def readline(self) -> str:
+        return self.lines.readline()
 
 
 def test_resume_no_cache_is_passed_to_job_manager(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -166,6 +179,66 @@ def test_resume_no_cache_is_passed_to_job_manager(monkeypatch: pytest.MonkeyPatc
 
     assert calls == [{"workspace_dir": Path("workspace"), "job_id": "job_1", "from_stage": StageName.TTS, "no_cache": True}]
     assert "job_1" in capsys.readouterr().out
+
+
+def test_resume_auto_reviews_waiting_review_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace = tmp_path / "workspace"
+    job_dir = workspace / "job_review"
+    artifacts = job_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    required = {
+        "schema_version": "1.0",
+        "domain_profile": "calculus@1",
+        "cue_set_checksum": "c" * 64,
+        "status": "required",
+        "review_scope": "translation_error",
+        "cues": [
+            {
+                "cue_id": "cue_001",
+                "reason": "translation_protected_span_review_required",
+                "error": "protected span t² must be represented as t bình phương",
+                "source_text_raw": "The graph is t squared.",
+                "source_text_normalized": "The graph is t squared.",
+                "display_text": "đồ thị theo thời gian bình phương",
+                "spoken_text": "đồ thị theo thời gian bình phương",
+                "protected_spans": [],
+                "review_overrides": {
+                    "source_text_normalized": "The graph is t squared.",
+                    "display_text": "đồ thị theo thời gian bình phương",
+                    "spoken_text": "đồ thị theo thời gian bình phương",
+                    "protected_spans": [],
+                },
+            }
+        ],
+    }
+    (artifacts / "review.required.json").write_text(json.dumps(required, ensure_ascii=False), encoding="utf-8")
+    calls: list[dict[str, object]] = []
+
+    def fake_resume(self: JobManager, workspace_dir: Path, job_id: str, **kwargs: object) -> FakeSummary:
+        calls.append({"workspace_dir": workspace_dir, "job_id": job_id, **kwargs})
+        if len(calls) == 1:
+            return FakeSummary(job_id, status=JobStatus.WAITING_REVIEW.value, workspace=str(job_dir))
+        return FakeSummary(job_id, status=JobStatus.COMPLETED.value, workspace=str(job_dir))
+
+    monkeypatch.setattr(JobManager, "resume", fake_resume)
+    monkeypatch.setattr(sys, "stdin", FakeTTY("e\n\nĐồ thị là t².\nĐồ thị là t bình phương.\n[]\n"))
+
+    assert main(["resume", "--workspace", str(workspace), "--job", "job_review"]) == 0
+
+    assert len(calls) == 2
+    output = capsys.readouterr().out
+    assert "reason: translation_protected_span_review_required" in output
+    assert "error: protected span t² must be represented as t bình phương" in output
+    assert "action [e=edit, q=quit]:" in output
+    locked = json.loads((artifacts / "review.locked.json").read_text(encoding="utf-8"))
+    assert locked["status"] == "locked"
+    assert locked["cues"][0]["review_overrides"]["display_text"] == "Đồ thị là t²."
+    assert locked["cues"][0]["review_overrides"]["spoken_text"] == "Đồ thị là t bình phương."
+    assert '"status": "completed"' in output
 
 
 def test_batch_resume_no_cache_is_passed_to_batch_manager(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:

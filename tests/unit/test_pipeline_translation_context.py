@@ -375,6 +375,27 @@ class ProtectedSpanRetryLLMProvider:
         }
 
 
+class PersistentProtectedSpanFailureLLMProvider:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def complete_json(self, system_prompt: str, user_prompt: str, schema: dict) -> dict:
+        payload = json.loads(user_prompt)
+        self.calls.append({"system_prompt": system_prompt, "payload": payload})
+        segment_id = payload["target_segments"][0]["segment_id"]
+        return {
+            "segments": [
+                {
+                    "segment_id": segment_id,
+                    "vi_text": "sự thay đổi theo thời gian bình phương",
+                    "used_terms": [],
+                    "length_ratio": 1.0,
+                    "translation_warnings": [],
+                }
+            ]
+        }
+
+
 def test_translation_retries_once_for_calculus_protected_span_violation(tmp_path: Path) -> None:
     paths = WorkspacePaths.create(tmp_path, "job_protected_retry")
     segments = [{"segment_id": "seg_000001", "start_ms": 0, "end_ms": 4000}]
@@ -446,6 +467,67 @@ def test_translation_retries_once_for_calculus_protected_span_violation(tmp_path
     assert translated["segments"][0]["protected_spans"][0]["canonical"] == "dr"
     assert translated_artifact["schema_version"] == "2.0"
     assert translated_artifact["segments"][0]["display_text"] == "Diện tích là 2 pi r nhân d r."
+
+
+def test_translation_protected_span_failure_requires_manual_review_then_uses_locked_override(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_protected_manual")
+    _write_segments(paths, [{"segment_id": "seg_000001", "start_ms": 0, "end_ms": 4000}])
+    paths.artifact_path("transcript.v1.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "segments": [
+                    {
+                        "segment_id": "seg_000001",
+                        "start_ms": 0,
+                        "end_ms": 4000,
+                        "duration_ms": 4000,
+                        "source_text": "The graph is t squared.",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    paths.artifact_path("glossary.locked.json").write_text(
+        json.dumps({"schema_version": "1.0", "domain": "mathematics", "status": "locked", "terms": []}),
+        encoding="utf-8",
+    )
+    store = CheckpointStore.create(paths.job_state_file, job_id="job_protected_manual", input_file=Path("input/video.mp4"))
+    manifest = ArtifactManifest.create("job_protected_manual", paths.manifest_file)
+    llm = PersistentProtectedSpanFailureLLMProvider()
+    ctx = StageContext(
+        paths=paths,
+        store=store,
+        manifest=manifest,
+        ffmpeg=None,
+        provider_mode="openai_compatible",
+        provider_bundle=ProviderBundle(asr=object(), llm=llm, tts=object()),
+        config=DubberConfig(
+            project=ProjectConfig(domain="mathematics", domain_profile="calculus"),
+            dubbing_cues=DubbingCueConfig(4000, 1000, 6000),
+        ),
+    )
+
+    assert run_translation(ctx) is True
+
+    required = json.loads(paths.artifact_path("review.required.json").read_text(encoding="utf-8"))
+    assert required["status"] == "required"
+    assert required["review_scope"] == "translation_error"
+    assert required["cues"][0]["reason"] == "translation_protected_span_review_required"
+    assert required["cues"][0]["error"] == "protected span t² must be represented as t bình phương"
+    assert required["cues"][0]["review_overrides"]["display_text"] == "sự thay đổi theo thời gian bình phương"
+
+    required["status"] = "locked"
+    required["cues"][0]["review_overrides"]["display_text"] = "Đồ thị là t²."
+    required["cues"][0]["review_overrides"]["spoken_text"] = "Đồ thị là t bình phương."
+    paths.artifact_path("review.locked.json").write_text(json.dumps(required, ensure_ascii=False), encoding="utf-8")
+
+    assert run_translation(ctx) is False
+    cues = json.loads(paths.artifact_path("dubbing_cues.v2.json").read_text(encoding="utf-8"))["cues"]
+    assert cues[0]["display_text"] == "Đồ thị là t²."
+    assert cues[0]["spoken_text"] == "Đồ thị là t bình phương."
 
 
 class ReviewCueLLMProvider:

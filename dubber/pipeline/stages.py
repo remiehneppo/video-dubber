@@ -71,6 +71,14 @@ _HIGH_RISK_CUE_FLAGS = frozenset({
 _BOUNDARY_WORD_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
 
+class TranslationProtectedSpanManualReviewRequired(ValueError):
+    def __init__(self, *, segment_id: str, errors: list[str], review_item: dict[str, object]) -> None:
+        super().__init__(f"protected span violation for {segment_id}: {'; '.join(errors)}")
+        self.segment_id = segment_id
+        self.errors = errors
+        self.review_item = review_item
+
+
 def _glossary_system_prompt(domain: str, profile: DomainProfile | None = None) -> str:
     profile_text = (
         f"Domain profile {profile.artifact_id}: {profile.prompt_summary}\n"
@@ -1022,6 +1030,8 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
                 "protected_spans": [span.to_dict() for span in spans],
             }
         )
+    review_locked = _load_review_locked(ctx)
+    locked_translation_overrides = _locked_review_overrides_by_cue_id(review_locked, cues, domain_profile=profile.artifact_id)
     blocks = _translation_blocks(ctx, cue_segments)
     block_ids = [f"block_{index:06d}" for index in range(1, len(blocks) + 1)]
     checkpoint = SegmentCheckpointStore.load_or_create(
@@ -1060,6 +1070,10 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
             target_ids = [str(segment["segment_id"]) for segment in block.target_segments]
             collected: dict[str, dict[str, object]] = {}
             targets_by_id = {str(item["segment_id"]): item for item in block.target_segments}
+            for segment_id in target_ids:
+                override = locked_translation_overrides.get(segment_id)
+                if override is not None and _review_override_has_translation_text(override):
+                    collected[segment_id] = _translation_item_from_review_override(segment_id, override)
             protected_retry_used: set[str] = set()
             protected_retry_messages: dict[str, list[str]] = {}
             max_attempts = max(2, ctx.config.runtime.retry_max_attempts)
@@ -1079,7 +1093,7 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
                         retry_instruction += (
                             "\nProtected notation correction required: "
                             + " | ".join(protected_details)
-                            + ". Keep calculus notation such as dr as d r; never translate it as doctor/bác sĩ/tiến sĩ."
+                            + ". Keep every listed protected notation in the requested display/spoken form; do not translate symbols into ordinary words."
                         )
                 result = asyncio.run(
                     concurrency.run_llm(
@@ -1121,8 +1135,21 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
                         cue_protected_spans.get(segment_id, []),
                     )
                     if errors:
+                        override = locked_translation_overrides.get(segment_id)
+                        if override is not None and _review_override_has_translation_text(override):
+                            collected[segment_id] = _translation_item_from_review_override(segment_id, override)
+                            continue
                         if segment_id in protected_retry_used:
-                            raise ValueError(f"protected span violation for {segment_id}: {'; '.join(errors)}")
+                            raise TranslationProtectedSpanManualReviewRequired(
+                                segment_id=segment_id,
+                                errors=errors,
+                                review_item=_translation_error_review_item(
+                                    targets_by_id[segment_id],
+                                    item,
+                                    errors=errors,
+                                    protected_spans=cue_protected_spans.get(segment_id, []),
+                                ),
+                            )
                         protected_retry_used.add(segment_id)
                         protected_retry_messages[segment_id] = errors
                         continue
@@ -1161,12 +1188,23 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
             ctx.store.save()
 
         logger.info("stage translation provider concurrency=%s pending=%s", concurrency.llm_limit, len(pending_blocks))
-        run_bounded(
-            pending_blocks,
-            translate_block,
-            max_workers=concurrency.llm_limit,
-            on_completion=save_completion,
-        )
+        try:
+            run_bounded(
+                pending_blocks,
+                translate_block,
+                max_workers=concurrency.llm_limit,
+                on_completion=save_completion,
+            )
+        except TranslationProtectedSpanManualReviewRequired as exc:
+            _publish_translation_error_review_required(
+                publisher,
+                profile=profile,
+                cues=cues,
+                review_item=exc.review_item,
+                done=checkpoint.done_count,
+                total=checkpoint.total_count,
+            )
+            return True
     else:
         for block_index, block in pending_blocks:
             block_id = block_ids[block_index - 1]
@@ -1247,7 +1285,6 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
             max_speedup_ratio=ctx.config.tts_service.max_speedup_ratio,
         )
 
-    review_locked = _load_review_locked(ctx)
     if review_locked:
         _apply_review_locked(cues, review_locked, domain_profile=profile.artifact_id)
 
@@ -1427,6 +1464,117 @@ def _review_item_sort_key(item: dict[str, object]) -> tuple[int, int, str]:
         int(item.get("end_ms", item.get("start_ms", 0))),
         str(item.get("cue_id", "")),
     )
+
+
+def _translation_error_review_item(
+    source: dict[str, object],
+    provider_item: dict[str, object],
+    *,
+    errors: list[str],
+    protected_spans: list[ProtectedSpan],
+) -> dict[str, object]:
+    cue_id = str(source["segment_id"])
+    display_text = str(provider_item.get("display_text") or provider_item.get("vi_text") or "")
+    spoken_text = normalize_spoken_text(display_text, protected_spans) if display_text else ""
+    protected = [span.to_dict() for span in protected_spans]
+    start_ms = int(source.get("start_ms", 0))
+    end_ms = int(source.get("end_ms", start_ms))
+    return {
+        "cue_id": cue_id,
+        "reason": "translation_protected_span_review_required",
+        "error": "; ".join(errors),
+        "source_text_raw": str(source.get("source_text_raw", source.get("source_text", ""))),
+        "source_text_normalized": str(source.get("source_text", "")),
+        "display_text": display_text,
+        "spoken_text": spoken_text,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "duration_ms": int(source.get("duration_ms", end_ms - start_ms)),
+        "protected_spans": protected,
+        "risk_flags": list(dict.fromkeys([*list(source.get("risk_flags", [])), "translation_protected_span_violation"])),
+        "review_overrides": {
+            "source_text_normalized": str(source.get("source_text", "")),
+            "display_text": display_text,
+            "spoken_text": spoken_text,
+            "protected_spans": protected,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+        },
+    }
+
+
+def _publish_translation_error_review_required(
+    publisher: StageArtifacts,
+    *,
+    profile: DomainProfile,
+    cues: list[dict[str, object]],
+    review_item: dict[str, object],
+    done: int,
+    total: int,
+) -> None:
+    publisher.publish_json(
+        stage=StageName.TRANSLATION,
+        name="review_required",
+        filename="review.required.json",
+        payload={
+            "schema_version": "1.0",
+            "domain_profile": profile.artifact_id,
+            "cue_set_checksum": _cue_set_checksum(cues),
+            "status": "required",
+            "review_scope": "translation_error",
+            "cues": [review_item],
+        },
+        status=StageStatus.WAITING_REVIEW,
+        done=done,
+        total=total,
+    )
+
+
+def _locked_review_overrides_by_cue_id(
+    review_locked: dict[str, object],
+    cues: list[dict[str, object]],
+    *,
+    domain_profile: str = "",
+) -> dict[str, dict[str, object]]:
+    locked_profile = str(review_locked.get("domain_profile", "")).strip()
+    if locked_profile and domain_profile and locked_profile != domain_profile:
+        return {}
+    expected_checksum = str(review_locked.get("cue_set_checksum", "")).strip()
+    if expected_checksum and expected_checksum != _cue_set_checksum(cues):
+        return {}
+    locked_items = review_locked.get("cues", [])
+    if not isinstance(locked_items, list):
+        return {}
+    result: dict[str, dict[str, object]] = {}
+    for item in locked_items:
+        if not isinstance(item, dict):
+            continue
+        cue_id = str(item.get("cue_id", ""))
+        overrides = item.get("review_overrides", item)
+        if cue_id and isinstance(overrides, dict):
+            result[cue_id] = dict(overrides)
+    return result
+
+
+def _review_override_has_translation_text(override: dict[str, object]) -> bool:
+    return any(str(override.get(key, "")).strip() for key in ("display_text", "vi_text", "spoken_text"))
+
+
+def _translation_item_from_review_override(segment_id: str, override: dict[str, object]) -> dict[str, object]:
+    display_text = str(override.get("display_text") or override.get("vi_text") or "")
+    warnings = override.get("translation_warnings", [])
+    return {
+        "segment_id": segment_id,
+        "vi_text": display_text,
+        "display_text": display_text,
+        "spoken_text": str(override.get("spoken_text") or display_text),
+        "used_terms": list(override.get("used_terms", [])) if isinstance(override.get("used_terms", []), list) else [],
+        "length_ratio": float(override.get("length_ratio", 1.0) or 1.0),
+        "translation_warnings": list(dict.fromkeys([
+            *(warnings if isinstance(warnings, list) else []),
+            "manual_review_locked",
+        ])),
+    }
 
 
 def _annotate_tts_timing_risks(
