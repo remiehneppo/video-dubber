@@ -18,7 +18,7 @@ class WorkspacePaths:
     manifest_file: Path
 
     @classmethod
-    def create(cls, workspace_dir: Path, job_id: str) -> WorkspacePaths:
+    def create(cls, workspace_dir: Path, job_id: str, *, create_dirs: bool = True) -> WorkspacePaths:
         root = workspace_dir / job_id
         paths = cls(
             root=root,
@@ -32,6 +32,8 @@ class WorkspacePaths:
             job_state_file=root / "job_state.json",
             manifest_file=root / "manifest.json",
         )
+        if not create_dirs:
+            return paths
         for directory in (
             paths.input_dir,
             paths.audio_dir,

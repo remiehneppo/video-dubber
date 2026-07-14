@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from dubber.core.models import ASRServiceConfig, DubberConfig, DubbingCueConfig, InputConfig, LLMServiceConfig, MixingConfig, ProjectConfig, RuntimeConfig, SourceNormalizationConfig, SubtitleConfig, TranslationConfig, TranscriptSegmentationConfig, TTSServiceConfig, VadConfig
+from dubber.core.models import ASRChunkingConfig, ASRServiceConfig, DubberConfig, DubbingCueConfig, InputConfig, LLMServiceConfig, MixingConfig, ProjectConfig, RuntimeConfig, SourceNormalizationConfig, SubtitleConfig, TranslationConfig, TranscriptSegmentationConfig, TTSServiceConfig, VadConfig
 
 
 def load_config(path: Path | str) -> DubberConfig:
@@ -20,7 +20,9 @@ def load_config(path: Path | str) -> DubberConfig:
     subtitles = raw.get("subtitles", {})
     vad = raw.get("vad", {})
     asr_service = raw.get("asr_service", {})
+    asr_chunking = raw.get("asr_chunking", {})
     transcript_segmentation = raw.get("transcript_segmentation", {})
+    asr_chunking_config = _load_asr_chunking_config(asr_chunking)
     llm_service = raw.get("llm_service", {})
     tts_service = raw.get("tts_service", {})
     return DubberConfig(
@@ -115,6 +117,7 @@ def load_config(path: Path | str) -> DubberConfig:
             allow_chunk_text_fallback=bool(asr_service.get("allow_chunk_text_fallback", False)),
             vad_filter=bool(asr_service.get("vad_filter", False)),
         ),
+        asr_chunking=asr_chunking_config,
         transcript_segmentation=TranscriptSegmentationConfig(
             target_min_segment_ms=int(transcript_segmentation.get("target_min_segment_ms", 8_000)),
             preferred_max_segment_ms=int(transcript_segmentation.get("preferred_max_segment_ms", 25_000)),
@@ -156,10 +159,28 @@ def load_config(path: Path | str) -> DubberConfig:
     )
 
 
+def _load_asr_chunking_config(values: dict[str, Any]) -> ASRChunkingConfig:
+    config = ASRChunkingConfig(
+        enabled=bool(values.get("enabled", False)),
+        max_chunk_duration_ms=_positive_int_field(values, "max_chunk_duration_ms", 60_000, "asr_chunking"),
+        initial_silence_ms=_positive_int_field(values, "initial_silence_ms", 5_000, "asr_chunking"),
+        min_silence_ms=_positive_int_field(values, "min_silence_ms", 500, "asr_chunking"),
+        silence_step_ms=_positive_int_field(values, "silence_step_ms", 500, "asr_chunking"),
+        trailing_silence_cap_ms=_positive_int_field(values, "trailing_silence_cap_ms", 5_000, "asr_chunking"),
+    )
+    if config.initial_silence_ms < config.min_silence_ms:
+        raise ValueError("asr_chunking.initial_silence_ms must be >= asr_chunking.min_silence_ms")
+    return config
+
+
 def _positive_int(values: dict[str, Any], name: str, default: int) -> int:
+    return _positive_int_field(values, name, default, "runtime")
+
+
+def _positive_int_field(values: dict[str, Any], name: str, default: int, section: str) -> int:
     value = values.get(name, default)
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"runtime.{name} must be an integer >= 1, got {value!r}")
+        raise ValueError(f"{section}.{name} must be an integer >= 1, got {value!r}")
     return value
 
 

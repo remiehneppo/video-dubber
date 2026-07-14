@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import builtins
 import logging
 import sys
 import json
@@ -13,6 +12,7 @@ from dubber.core.enums import JobStatus, StageName
 from dubber.core.io import read_json, write_json_atomic
 from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.pipeline.job_manager import BatchManager, BatchOptions, JobManager, RunOptions
+from dubber.pipeline.review_session import TerminalReviewSession, _chronological_review_cues
 from dubber.tts.interactive_review import TerminalTTSReviewHandler
 
 
@@ -60,6 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="ignore reusable segment checkpoints and TTS overrides; completed jobs default to restarting from tts",
     )
+    resume_parser.add_argument("--dry-run", action="store_true", default=False, help="print the resume plan without changing artifacts")
     resume_parser.set_defaults(handler=cmd_resume)
 
     status_parser = subparsers.add_parser("status")
@@ -123,7 +124,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="ignore reusable segment checkpoints and TTS overrides; completed jobs default to restarting from tts",
     )
+    batch_resume.add_argument("--dry-run", action="store_true", default=False, help="print selected job resume plans without changing artifacts")
     batch_resume.set_defaults(handler=cmd_batch_resume)
+
+    batch_review = batch_commands.add_parser("review")
+    batch_review.add_argument("--batch", required=True)
+    batch_review.add_argument("--workspace", default="workspace")
+    batch_review.add_argument("--job", action="append", dest="jobs")
+    batch_review.set_defaults(handler=cmd_batch_review)
 
     batch_status = batch_commands.add_parser("status")
     batch_status.add_argument("--batch", required=True)
@@ -160,7 +168,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 crash_after_segments=args.crash_after_segments,
             )
         )
-        summary = _complete_interactive_reviews(manager, Path(args.workspace), summary)
+        summary = TerminalReviewSession().complete_waiting_reviews(manager, Path(args.workspace), summary)
     except Exception as exc:
         print(f"run failed: {exc}")
         return 1
@@ -171,46 +179,28 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_resume(args: argparse.Namespace) -> int:
     manager = JobManager(tts_review_handler=TerminalTTSReviewHandler().review)
     try:
+        from_stage = StageName(args.from_stage) if args.from_stage else None
+        if bool(getattr(args, "dry_run", False)):
+            plan = manager.plan_resume(
+                Path(args.workspace),
+                args.job,
+                from_stage=from_stage,
+                no_cache=bool(args.no_cache),
+            )
+            print(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
         summary = manager.resume(
             Path(args.workspace),
             args.job,
-            from_stage=StageName(args.from_stage) if args.from_stage else None,
+            from_stage=from_stage,
             no_cache=bool(args.no_cache),
         )
-        summary = _complete_interactive_reviews(manager, Path(args.workspace), summary)
+        summary = TerminalReviewSession().complete_waiting_reviews(manager, Path(args.workspace), summary)
     except Exception as exc:
         print(f"resume failed: {exc}")
         return 1
     print(json.dumps(summary.to_dict(), ensure_ascii=False, sort_keys=True))
     return 0
-
-
-def _complete_interactive_reviews(manager: JobManager, workspace_dir: Path, summary):
-    while getattr(summary, "status", "") == JobStatus.WAITING_REVIEW.value:
-        job_id = str(getattr(summary, "job_id"))
-        job_dir = workspace_dir / job_id
-        required_path = job_dir / "artifacts" / "review.required.json"
-        if not required_path.exists():
-            break
-        if not sys.stdin.isatty():
-            raise RuntimeError("manual review requires an interactive terminal")
-        locked = _build_locked_review(job_dir, job_id)
-        if locked is None:
-            raise RuntimeError("manual review cancelled")
-        write_json_atomic(job_dir / "artifacts" / "review.locked.json", locked)
-        summary = manager.resume(workspace_dir, job_id)
-    return summary
-
-
-def _build_locked_review(job_dir: Path, job_id: str) -> dict[str, object] | None:
-    required_path = job_dir / "artifacts" / "review.required.json"
-    required = read_json(required_path)
-    if not isinstance(required, dict):
-        raise RuntimeError(f"review.required.json is invalid for job {job_id}")
-    cues = required.get("cues", [])
-    if not isinstance(cues, list) or not cues:
-        raise RuntimeError(f"No review cues found for job {job_id}")
-    return _interactive_review_lock(required, _chronological_review_cues(job_dir, cues), job_id=job_id)
 
 
 def cmd_rerun(args: argparse.Namespace) -> int:
@@ -255,17 +245,38 @@ def cmd_batch_run(args: argparse.Namespace) -> int:
 
 def cmd_batch_resume(args: argparse.Namespace) -> int:
     try:
+        from_stage = StageName(args.from_stage) if args.from_stage else None
+        if bool(getattr(args, "dry_run", False)):
+            plans = BatchManager().plan_resume(
+                Path(args.workspace),
+                args.batch,
+                job_ids=args.jobs,
+                from_stage=from_stage,
+                no_cache=bool(args.no_cache),
+            )
+            print(json.dumps(plans, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
         summary = BatchManager().resume(
             Path(args.workspace),
             args.batch,
             job_ids=args.jobs,
-            from_stage=StageName(args.from_stage) if args.from_stage else None,
+            from_stage=from_stage,
             no_cache=bool(args.no_cache),
         )
     except Exception as exc:
         print(f"batch resume failed: {exc}")
         return 1
     print(json.dumps(summary.to_dict(), ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_batch_review(args: argparse.Namespace) -> int:
+    try:
+        reviewed = _review_batch_jobs(Path(args.workspace), args.batch, args.jobs)
+    except Exception as exc:
+        print(f"batch review failed: {exc}")
+        return 1
+    print(json.dumps(reviewed, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
 
@@ -374,10 +385,13 @@ def _format_batch_status_entry(workspace: Path, entry: dict[str, object]) -> lis
     batch_id = str(state.get("batch_id") or root.name)
     jobs = state.get("jobs", [])
     job_count = len(jobs) if isinstance(jobs, list) else 0
+    status = str(state.get("status", "unknown"))
     lines = [
-        f"Batch {batch_id} | status={state.get('status', 'unknown')} | jobs={job_count}",
+        f"Batch {batch_id} | status={status} | jobs={job_count}",
         f"Resume batch: python cli.py batch resume --workspace {workspace} --batch {batch_id}",
     ]
+    if status == JobStatus.WAITING_REVIEW.value:
+        lines.append(f"Review batch: python cli.py batch review --workspace {workspace} --batch {batch_id}")
     if not isinstance(jobs, list):
         return lines
     for item in jobs:
@@ -404,17 +418,20 @@ def _format_job_status_entry(workspace: Path, entry: dict[str, object]) -> list[
     if not isinstance(root, Path) or not isinstance(state, dict):
         return []
     job_id = str(state.get("job_id") or root.name)
+    status = str(state.get("status", "unknown"))
     lines = [
         "Jobs:",
         _format_status_row(
             job_id,
             _video_name(state.get("input_file")),
-            str(state.get("status", "unknown")),
+            status,
             _job_progress(state),
             str(state.get("last_error") or ""),
         ),
         f"Resume job: python cli.py resume --workspace {workspace} --job {job_id}",
     ]
+    if status == JobStatus.WAITING_REVIEW.value:
+        lines.append(f"Review job: python cli.py review --workspace {workspace} --job {job_id}")
     return lines
 
 
@@ -485,9 +502,11 @@ def cmd_review(args: argparse.Namespace) -> int:
     if not isinstance(cues, list) or not cues:
         print(f"No review cues found for job {args.job}")
         return 1
-    cues = _chronological_review_cues(job_dir, cues)
-
-    locked = _interactive_review_lock(required, cues, job_id=args.job)
+    locked = TerminalReviewSession().interactive_review_lock(
+        required,
+        _chronological_review_cues(job_dir, cues),
+        job_id=args.job,
+    )
     if locked is None:
         print("review cancelled")
         return 1
@@ -497,265 +516,52 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
-def _chronological_review_cues(job_dir: Path, cues: list[object]) -> list[object]:
-    timing_by_id = _review_timing_by_cue_id(job_dir)
-    enriched: list[object] = []
-    for cue in cues:
-        if not isinstance(cue, dict):
-            enriched.append(cue)
-            continue
-        cue_copy = dict(cue)
-        timing = timing_by_id.get(str(cue_copy.get("cue_id", "")))
-        if timing is not None:
-            for key in ("start_ms", "end_ms", "duration_ms"):
-                cue_copy.setdefault(key, timing[key])
-            overrides = cue_copy.get("review_overrides")
-            if isinstance(overrides, dict):
-                override_copy = dict(overrides)
-                override_copy.setdefault("start_ms", timing["start_ms"])
-                override_copy.setdefault("end_ms", timing["end_ms"])
-                cue_copy["review_overrides"] = override_copy
-        enriched.append(cue_copy)
-    return sorted(enriched, key=_review_cue_sort_key)
+def _review_batch_jobs(workspace: Path, batch_id: str, job_ids: list[str] | None) -> dict[str, object]:
+    batch_root = workspace / batch_id
+    state_path = batch_root / "batch_state.json"
+    if not state_path.exists():
+        raise FileNotFoundError(f"Batch state not found: {batch_id}")
+    state = read_json(state_path)
+    jobs = state.get("jobs", []) if isinstance(state, dict) else []
+    if not isinstance(jobs, list):
+        raise RuntimeError(f"batch_state.json is invalid for batch {batch_id}")
+    selected = [
+        job for job in jobs
+        if isinstance(job, dict)
+        and ((job_ids is None and str(job.get("status")) == JobStatus.WAITING_REVIEW.value)
+             or (job_ids is not None and str(job.get("job_id")) in job_ids))
+    ]
+    if job_ids is not None:
+        known = {str(job.get("job_id")) for job in jobs if isinstance(job, dict)}
+        missing = sorted(set(job_ids) - known)
+        if missing:
+            raise ValueError(f"Unknown batch job ids: {', '.join(missing)}")
+    if not selected:
+        return {
+            "batch_id": batch_id,
+            "reviewed": [],
+            "next": f"python cli.py batch resume --workspace {workspace} --batch {batch_id}",
+        }
 
-
-def _review_timing_by_cue_id(job_dir: Path) -> dict[str, dict[str, int]]:
-    for filename in ("dubbing_cues.v2.json",):
-        path = job_dir / "artifacts" / filename
-        if not path.exists():
-            continue
-        payload = read_json(path)
-        cues = payload.get("cues", []) if isinstance(payload, dict) else []
-        if not isinstance(cues, list):
-            continue
-        timing: dict[str, dict[str, int]] = {}
-        for cue in cues:
-            if not isinstance(cue, dict):
-                continue
-            cue_id = str(cue.get("cue_id", ""))
-            if not cue_id:
-                continue
-            start_ms = _review_int(cue.get("start_ms", 0))
-            end_ms = _review_int(cue.get("end_ms", start_ms))
-            timing[cue_id] = {
-                "start_ms": start_ms,
-                "end_ms": end_ms,
-                "duration_ms": _review_int(cue.get("duration_ms", end_ms - start_ms)),
-            }
-        if timing:
-            return timing
-    return {}
-
-
-def _review_cue_sort_key(cue: object) -> tuple[int, int, str]:
-    if not isinstance(cue, dict):
-        return (0, 0, "")
-    start_ms = _review_int(cue.get("start_ms", 0))
-    return (
-        start_ms,
-        _review_int(cue.get("end_ms", start_ms)),
-        str(cue.get("cue_id", "")),
-    )
-
-
-def _format_review_time(ms: int) -> str:
-    total_seconds = max(0, ms) // 1000
-    milliseconds = max(0, ms) % 1000
-    minutes, seconds = divmod(total_seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
-    return f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
-
-
-def _review_int(value: object) -> int:
-    if isinstance(value, bool):
-        return 0
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _interactive_review_lock(required: dict[str, object], cues: list[object], *, job_id: str) -> dict[str, object] | None:
-    lock: dict[str, object] = {
-        "schema_version": "1.0",
-        "status": "locked",
-        "cues": [],
+    session = TerminalReviewSession()
+    reviewed: list[dict[str, str]] = []
+    for job in selected:
+        job_id = str(job["job_id"])
+        job_dir = batch_root / "jobs" / job_id
+        required_path = job_dir / "artifacts" / "review.required.json"
+        if not required_path.exists():
+            raise FileNotFoundError(f"review.required.json missing for job {job_id}")
+        locked = session.build_locked_review(job_dir, job_id)
+        if locked is None:
+            raise RuntimeError("manual review cancelled")
+        output_path = job_dir / "artifacts" / "review.locked.json"
+        write_json_atomic(output_path, locked)
+        reviewed.append({"job_id": job_id, "status": "locked", "output": str(output_path)})
+    return {
+        "batch_id": batch_id,
+        "reviewed": reviewed,
+        "next": f"python cli.py batch resume --workspace {workspace} --batch {batch_id}",
     }
-    for key in ("domain_profile", "review_scope", "cue_set_checksum"):
-        if key in required and required[key] is not None:
-            lock[key] = required[key]
-
-    print(f"Reviewing {len(cues)} cues for job {job_id}")
-    print("Press Enter to accept a suggestion, e to edit, or q to quit without saving.")
-    print()
-    for index, raw_cue in enumerate(cues, start=1):
-        if not isinstance(raw_cue, dict):
-            continue
-        cue = raw_cue
-        cue_id = str(cue.get("cue_id", f"cue_{index:06d}"))
-        print(f"[{index}/{len(cues)}] {cue_id}")
-        if "start_ms" in cue or "end_ms" in cue:
-            start_ms = _review_int(cue.get("start_ms", 0))
-            end_ms = _review_int(cue.get("end_ms", start_ms))
-            print(f"  time: {_format_review_time(start_ms)} -> {_format_review_time(end_ms)}")
-        reason = str(cue.get("reason", ""))
-        if reason:
-            print(f"  reason: {reason}")
-        error = str(cue.get("error", ""))
-        if error:
-            print(f"  error: {error}")
-            print("  action_needed: choose edit and correct the cue so the error condition is satisfied")
-        risk_flags = cue.get("risk_flags", [])
-        if isinstance(risk_flags, list) and risk_flags:
-            print(f"  risk_flags: {', '.join(str(flag) for flag in risk_flags)}")
-        for label, key in (
-            ("source_text_raw", "source_text_raw"),
-            ("source_text_normalized", "source_text_normalized"),
-            ("display_text", "display_text"),
-            ("spoken_text", "spoken_text"),
-        ):
-            value = cue.get(key, "")
-            if value:
-                print(f"  {label}: {value}")
-        protected_spans = cue.get("protected_spans", [])
-        if isinstance(protected_spans, list) and protected_spans:
-            print(f"  protected_spans: {json.dumps(protected_spans, ensure_ascii=False)}")
-
-        overrides = _cue_review_overrides(cue)
-        has_error = bool(str(cue.get("error", "")).strip())
-        while True:
-            prompt = "  action [e=edit, q=quit]: " if has_error else "  action [Enter=a/accept, e=edit, q=quit]: "
-            action = _prompt_line(prompt).strip().lower()
-            if not has_error and action in {"", "a", "accept"}:
-                break
-            if action in {"e", "edit"}:
-                print("  entering edit mode")
-                overrides = _edit_review_overrides(overrides)
-                break
-            if action in {"q", "quit"}:
-                return None
-            print("  enter e or q" if has_error else "  enter a, e, or q")
-
-        lock["cues"].append({"cue_id": cue_id, "review_overrides": overrides})
-        print()
-    return lock
-
-
-
-def _cue_review_overrides(cue: dict[str, object]) -> dict[str, object]:
-    overrides = cue.get("review_overrides")
-    if isinstance(overrides, dict) and overrides:
-        return _copy_review_overrides(overrides)
-    result: dict[str, object] = {
-        "source_text_normalized": str(cue.get("source_text_normalized", cue.get("source_text_raw", cue.get("source_text", "")))),
-        "display_text": str(cue.get("display_text", "")),
-        "spoken_text": str(cue.get("spoken_text", cue.get("display_text", ""))),
-        "protected_spans": list(cue.get("protected_spans", []) if isinstance(cue.get("protected_spans", []), list) else []),
-    }
-    if "start_ms" in cue:
-        result["start_ms"] = int(cue["start_ms"])
-    if "end_ms" in cue:
-        result["end_ms"] = int(cue["end_ms"])
-    return result
-
-
-
-def _edit_review_overrides(overrides: dict[str, object]) -> dict[str, object]:
-    edited = _copy_review_overrides(overrides)
-    edited["source_text_normalized"] = _prompt_text("  source_text_normalized", str(edited.get("source_text_normalized", "")))
-    edited["display_text"] = _prompt_text("  display_text", str(edited.get("display_text", "")))
-    edited["spoken_text"] = _prompt_text("  spoken_text", str(edited.get("spoken_text", edited.get("display_text", ""))))
-    edited["protected_spans"] = _prompt_json_list("  protected_spans", edited.get("protected_spans", []))
-    if "start_ms" in edited:
-        edited["start_ms"] = _prompt_int("  start_ms", edited["start_ms"])
-    if "end_ms" in edited:
-        edited["end_ms"] = _prompt_int("  end_ms", edited["end_ms"])
-    return edited
-
-
-
-def _copy_review_overrides(overrides: dict[str, object]) -> dict[str, object]:
-    copied = dict(overrides)
-    if "protected_spans" in copied and isinstance(copied["protected_spans"], list):
-        copied["protected_spans"] = [dict(span) if isinstance(span, dict) else span for span in copied["protected_spans"]]
-    return copied
-
-
-
-def _prompt_line(prompt: str) -> str:
-    print(prompt, end="")
-    sys.stdout.flush()
-    if sys.stdin.isatty() and sys.stdout.isatty():
-        _enable_terminal_line_editing()
-        try:
-            return builtins.input("").rstrip("\r\n")
-        except EOFError as exc:
-            raise EOFError("interactive review input closed") from exc
-    stdin_buffer = getattr(sys.stdin, "buffer", None)
-    if stdin_buffer is not None:
-        raw = stdin_buffer.readline()
-        if raw == b"":
-            raise EOFError("interactive review input closed")
-        try:
-            return raw.decode("utf-8").rstrip("\r\n")
-        except UnicodeDecodeError:
-            encoding = getattr(sys.stdin, "encoding", None) or "utf-8"
-            return raw.decode(encoding, errors="replace").rstrip("\r\n")
-
-    line = sys.stdin.readline()
-    if line == "":
-        raise EOFError("interactive review input closed")
-    return line.rstrip("\r\n")
-
-
-def _enable_terminal_line_editing() -> None:
-    try:
-        import readline  # type: ignore[import-not-found]
-    except ImportError:
-        return
-    parse_and_bind = getattr(readline, "parse_and_bind", None)
-    if not callable(parse_and_bind):
-        return
-    parse_and_bind("set editing-mode emacs")
-    parse_and_bind("set enable-keypad on")
-
-
-def _prompt_text(label: str, current: str) -> str:
-    prompt = f"{label} [{current}]: " if current else f"{label}: "
-    value = _prompt_line(prompt).strip()
-    return current if value == "" else value
-
-
-
-def _prompt_int(label: str, current: object) -> int:
-    while True:
-        prompt = f"{label} [{current}]: " if current is not None else f"{label}: "
-        value = _prompt_line(prompt).strip()
-        if value == "":
-            return int(current) if current is not None else 0
-        try:
-            return int(value)
-        except ValueError:
-            print(f"  invalid integer: {value}")
-
-
-
-def _prompt_json_list(label: str, current: object) -> list[object]:
-    while True:
-        current_text = json.dumps(current, ensure_ascii=False) if current is not None else "[]"
-        value = _prompt_line(f"{label} [{current_text}]: ").strip()
-        if value == "":
-            return list(current) if isinstance(current, list) else []
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError as exc:
-            print(f"  invalid JSON: {exc}")
-            continue
-        if isinstance(parsed, list):
-            return parsed
-        print("  value must be a JSON array")
 
 
 def _job_dir(workspace: str | Path, job_id: str) -> Path:

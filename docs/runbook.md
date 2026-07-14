@@ -41,6 +41,8 @@ Action:
 4. The command writes `workspace/{job_id}/artifacts/review.locked.json`.
 5. Run `python3 cli.py resume --job {job_id}`.
 
+For a batch waiting on one or more job reviews, run `python3 cli.py batch review --workspace workspace --batch {batch_id}`. The command reviews only batch jobs currently marked `waiting_review`, writes each job's `review.locked.json`, and prints the matching `batch resume` command.
+
 `review.locked.json` shape:
 
 ```json
@@ -89,6 +91,7 @@ Review notes:
 - Preserve protected spans and forbidden translations for technical notation.
 - Timing overrides (`start_ms`, `end_ms`) should be rare and must not overlap adjacent cues.
 - Prefer `resume` after creating lock files. Use `--from-stage` only when you intentionally invalidate that stage and downstream artifacts.
+- Use `python3 cli.py resume --job {job_id} --dry-run` to inspect the start stage and cache behavior before changing artifacts. For batches, use `python3 cli.py batch resume --batch {batch_id} --dry-run`.
 
 ## Crash during TTS
 

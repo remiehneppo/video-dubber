@@ -111,6 +111,23 @@ source_normalization:
   # source, chỉ ghi suggestion để review trước TTS.
   llm_adjudication: false
 
+asr_chunking:
+  # false: giữ behavior cũ, transcript được build trực tiếp từ chunk VAD/Silero.
+  # true: VAD/Silero vẫn chỉ dùng để chia request ASR bootstrap; sau khi có
+  # word timestamps, pipeline rechunk transcript theo khoảng không có word.
+  # Nên bật khi provider trả word timestamps đáng tin cậy.
+  enabled: false
+  # Nếu chunk word dài hơn ngưỡng này, giảm dần ngưỡng silence để tìm điểm cắt.
+  max_chunk_duration_ms: 60000
+  # Split đầu tiên tại khoảng trống giữa hai word >= 5 giây.
+  initial_silence_ms: 5000
+  # Không giảm ngưỡng silence thấp hơn giá trị này trước khi hard split.
+  min_silence_ms: 500
+  # Mỗi vòng giảm ngưỡng silence từng bước này.
+  silence_step_ms: 500
+  # Silence sau word cuối được giữ trong cửa sổ debug/provenance nhưng bị cap.
+  trailing_silence_cap_ms: 5000
+
 transcript_segmentation:
   # Thời lượng mục tiêu tối thiểu. Short tail vẫn có thể ngắn hơn tại cuối ASR
   # chunk hoặc ranh giới câu tự nhiên; TTS sẽ tận dụng silence kế tiếp.

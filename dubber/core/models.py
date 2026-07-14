@@ -123,6 +123,16 @@ class ASRServiceConfig:
 
 
 @dataclass(frozen=True)
+class ASRChunkingConfig:
+    enabled: bool = False
+    max_chunk_duration_ms: int = 60_000
+    initial_silence_ms: int = 5_000
+    min_silence_ms: int = 500
+    silence_step_ms: int = 500
+    trailing_silence_cap_ms: int = 5_000
+
+
+@dataclass(frozen=True)
 class TranscriptSegmentationConfig:
     target_min_segment_ms: int = 8_000
     preferred_max_segment_ms: int = 25_000
@@ -178,6 +188,7 @@ class DubberConfig:
     subtitles: SubtitleConfig = field(default_factory=SubtitleConfig)
     vad: VadConfig = field(default_factory=VadConfig)
     asr_service: ASRServiceConfig = field(default_factory=ASRServiceConfig)
+    asr_chunking: ASRChunkingConfig = field(default_factory=ASRChunkingConfig)
     transcript_segmentation: TranscriptSegmentationConfig = field(default_factory=TranscriptSegmentationConfig)
     llm_service: LLMServiceConfig = field(default_factory=LLMServiceConfig)
     tts_service: TTSServiceConfig = field(default_factory=TTSServiceConfig)

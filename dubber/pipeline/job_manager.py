@@ -18,6 +18,7 @@ from dubber.core.models import utc_now_iso
 from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.orchestrator.checkpoint_store import CheckpointStore
 from dubber.orchestrator.segment_checkpoint_store import SegmentCheckpointStore
+from dubber.pipeline.resume_plan import ResumePlan
 from dubber.pipeline.stage_context import StageContext
 from dubber.pipeline.stages import (
     run_asr,
@@ -133,22 +134,24 @@ class JobManager:
             self.concurrency = ProviderConcurrency(config.runtime)
         self._restore_provider_context(paths, config)
         ctx = self._context(paths, store, manifest, config)
+        plan = self._build_resume_plan(
+            ctx,
+            from_stage=from_stage,
+            no_cache=no_cache,
+            invalidate_missing_artifacts=True,
+        )
+        if plan.already_completed or plan.start_stage is None:
+            return self._summary(ctx, JobStatus.COMPLETED)
+        start_stage = plan.start_stage
         if from_stage is not None:
             self._invalidate_from(
                 ctx,
-                from_stage,
-                preserve_checkpoints=from_stage == StageName.TTS and not no_cache,
+                start_stage,
+                preserve_checkpoints=plan.preserve_checkpoints,
                 no_cache=no_cache,
             )
-            start_stage = from_stage
-        else:
-            start_stage = self._first_invalid_stage(ctx)
-            if start_stage is None:
-                if not no_cache:
-                    return self._summary(ctx, JobStatus.COMPLETED)
-                start_stage = StageName.TTS
-            if no_cache:
-                self._invalidate_from(ctx, start_stage, preserve_checkpoints=False, no_cache=True)
+        elif no_cache:
+            self._invalidate_from(ctx, start_stage, preserve_checkpoints=False, no_cache=True)
 
         resolved = read_json(paths.root / "config.resolved.json") if (paths.root / "config.resolved.json").exists() else {}
         glossary_review = bool(resolved.get("glossary_review", False))
@@ -170,6 +173,27 @@ class JobManager:
             start_stage=start_stage,
             glossary_review=glossary_review,
             stop_after=stop_after,
+        )
+
+    def plan_resume(
+        self,
+        workspace_dir: Path,
+        job_id: str,
+        *,
+        from_stage: StageName | None = None,
+        no_cache: bool = False,
+    ) -> ResumePlan:
+        paths = WorkspacePaths.create(workspace_dir, job_id, create_dirs=False)
+        store = CheckpointStore.load(paths.job_state_file)
+        manifest = ArtifactManifest.load(paths.manifest_file)
+        config = self._load_resolved_config(paths)
+        self._restore_provider_context(paths, config)
+        ctx = self._context(paths, store, manifest, config)
+        return self._build_resume_plan(
+            ctx,
+            from_stage=from_stage,
+            no_cache=no_cache,
+            invalidate_missing_artifacts=False,
         )
 
     def invalidate(self, workspace_dir: Path, job_id: str, stage: StageName, *, no_cache: bool = False) -> None:
@@ -309,6 +333,66 @@ class JobManager:
         )
 
     def _first_invalid_stage(self, ctx: StageContext) -> StageName | None:
+        return self._find_first_invalid_stage(ctx, invalidate_missing_artifacts=True)
+
+    def _build_resume_plan(
+        self,
+        ctx: StageContext,
+        *,
+        from_stage: StageName | None,
+        no_cache: bool,
+        invalidate_missing_artifacts: bool,
+    ) -> ResumePlan:
+        if from_stage is not None:
+            return ResumePlan(
+                job_id=ctx.store.state.job_id,
+                start_stage=from_stage,
+                from_stage=from_stage,
+                no_cache=no_cache,
+                preserve_checkpoints=from_stage == StageName.TTS and not no_cache,
+                already_completed=False,
+                reason="from_stage_requested",
+            )
+        start_stage = self._find_first_invalid_stage(
+            ctx,
+            invalidate_missing_artifacts=invalidate_missing_artifacts,
+        )
+        if start_stage is None:
+            if not no_cache:
+                return ResumePlan(
+                    job_id=ctx.store.state.job_id,
+                    start_stage=None,
+                    from_stage=None,
+                    no_cache=False,
+                    preserve_checkpoints=False,
+                    already_completed=True,
+                    reason="all_stages_valid",
+                )
+            return ResumePlan(
+                job_id=ctx.store.state.job_id,
+                start_stage=StageName.TTS,
+                from_stage=None,
+                no_cache=True,
+                preserve_checkpoints=False,
+                already_completed=False,
+                reason="completed_job_no_cache_defaults_to_tts",
+            )
+        return ResumePlan(
+            job_id=ctx.store.state.job_id,
+            start_stage=start_stage,
+            from_stage=None,
+            no_cache=no_cache,
+            preserve_checkpoints=not no_cache,
+            already_completed=False,
+            reason="first_invalid_stage",
+        )
+
+    def _find_first_invalid_stage(
+        self,
+        ctx: StageContext,
+        *,
+        invalidate_missing_artifacts: bool,
+    ) -> StageName | None:
         required = {
             StageName.JOB_INIT: (("input_metadata", 1),),
             StageName.AUDIO_EXTRACT: (("audio_analysis", 1),),
@@ -331,15 +415,18 @@ class JobManager:
             if progress.status != StageStatus.COMPLETED:
                 return stage
             if any(not ctx.manifest.validate_artifact(name, version) for name, version in required[stage]):
-                self._invalidate_from(ctx, stage, preserve_checkpoints=True)
+                if invalidate_missing_artifacts:
+                    self._invalidate_from(ctx, stage, preserve_checkpoints=True)
                 return stage
             if stage == StageName.AUDIO_EXTRACT and not all(
                 (ctx.paths.audio_dir / name).exists() for name in ("original.wav", "vocals.wav")
             ):
-                self._invalidate_from(ctx, stage, preserve_checkpoints=True)
+                if invalidate_missing_artifacts:
+                    self._invalidate_from(ctx, stage, preserve_checkpoints=True)
                 return stage
             if stage == StageName.TTS and not (ctx.paths.tts_dir / "mix.wav").exists():
-                self._invalidate_from(ctx, stage, preserve_checkpoints=True)
+                if invalidate_missing_artifacts:
+                    self._invalidate_from(ctx, stage, preserve_checkpoints=True)
                 return stage
         return None
 
@@ -723,6 +810,53 @@ class BatchManager:
         self._set_final_status(state)
         self._save_state(root, state)
         return self._summary(root, state)
+
+    def plan_resume(
+        self,
+        workspace_dir: Path,
+        batch_id: str,
+        *,
+        job_ids: list[str] | None = None,
+        from_stage: StageName | None = None,
+        no_cache: bool = False,
+    ) -> dict[str, Any]:
+        root, state = self._load(workspace_dir, batch_id)
+        config = self._batch_config(state)
+        concurrency = ProviderConcurrency(config.runtime)
+        jobs = list(state["jobs"])
+        selected = [
+            job for job in jobs
+            if (job_ids is None and (from_stage is not None or job["status"] != JobStatus.COMPLETED.value))
+            or (job_ids is not None and job["job_id"] in job_ids)
+        ]
+        if job_ids is not None:
+            missing = sorted(set(job_ids) - {str(job["job_id"]) for job in jobs})
+            if missing:
+                raise ValueError(f"Unknown batch job ids: {', '.join(missing)}")
+        plans: list[dict[str, object]] = []
+        for job in selected:
+            job_id = str(job["job_id"])
+            item: dict[str, object] = {
+                "job_id": job_id,
+                "input_name": str(job.get("input_name") or job.get("input_file") or ""),
+                "status": str(job.get("status") or ""),
+            }
+            try:
+                item["plan"] = JobManager(concurrency=concurrency).plan_resume(
+                    root / "jobs",
+                    job_id,
+                    from_stage=from_stage,
+                    no_cache=no_cache,
+                ).to_dict()
+            except Exception as exc:
+                item["error"] = str(exc)
+            plans.append(item)
+        return {
+            "batch_id": batch_id,
+            "workspace": str(root),
+            "selected_jobs": len(plans),
+            "jobs": plans,
+        }
 
     def status(self, workspace_dir: Path, batch_id: str) -> BatchSummary:
         root, state = self._load(workspace_dir, batch_id)

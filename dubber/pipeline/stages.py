@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from dubber.asr.timestamps import NormalizedASRTimestamps, TimestampUnit, normalize_asr_timestamps
+from dubber.asr.word_chunk_payloads import build_asr_word_chunk_payloads
 from dubber.audio.vad import VadConfig as AudioVadConfig, detect_segments
 from dubber.core.enums import StageName, StageStatus
 from dubber.core.concurrency import TaskCompletion, run_bounded
@@ -704,6 +705,27 @@ def run_asr(ctx: StageContext) -> None:
                 "silence_after_ms": int(segment.get("silence_after_ms", 0)),
             }
         )
+
+    if ctx.config.asr_chunking.enabled:
+        audio_duration_ms = max((int(segment["end_ms"]) for segment in segments), default=0)
+        word_chunk_payloads = build_asr_word_chunk_payloads(
+            asr_chunks,
+            audio_duration_ms=audio_duration_ms,
+            config=ctx.config.asr_chunking,
+        )
+        publisher.publish_json(
+            stage=StageName.ASR,
+            name="asr_word_chunks",
+            filename="asr_word_chunks.v1.json",
+            payload={
+                "schema_version": "1.0",
+                "source": "asr_segments.v1",
+                "chunks": word_chunk_payloads["chunks"],
+            },
+            done=len(segments),
+            total=len(segments),
+        )
+        asr_chunks = word_chunk_payloads["asr_chunks"]
 
     profile = _effective_domain_profile(ctx)
     transcript_segments = normalize_transcript_segments(

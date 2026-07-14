@@ -16,6 +16,7 @@ from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.orchestrator.checkpoint_store import CheckpointStore
 from dubber.orchestrator.segment_checkpoint_store import SegmentCheckpointStore
 from dubber.pipeline.job_manager import BatchManager, JobManager
+from dubber.pipeline.review_session import TerminalReviewSession
 
 
 def test_jobs_lists_existing_job_ids(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -110,18 +111,17 @@ def test_workspace_status_reports_batch_jobs_with_video_names_and_batch_resume_h
     assert "lesson-two.mp4" in out
     assert "translation 1/2" in out
     assert f"python cli.py batch resume --workspace {workspace} --batch batch_demo" in out
+    assert f"python cli.py batch review --workspace {workspace} --batch batch_demo" in out
 
 
-def test_prompt_text_replaces_invalid_terminal_bytes(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_prompt_text_replaces_invalid_terminal_bytes() -> None:
     raw_stdin = io.TextIOWrapper(io.BytesIO(b"quy tac chu\xc6oi\n"), encoding="utf-8", errors="strict")
-    monkeypatch.setattr(sys, "stdin", raw_stdin)
+    stdout = io.StringIO()
 
-    value = cli._prompt_text("  display_text", "old")
+    value = TerminalReviewSession(stdin=raw_stdin, stdout=stdout).prompt_text("  display_text", "old")
 
     assert value == "quy tac chu�oi"
-    assert "display_text [old]:" in capsys.readouterr().out
+    assert "display_text [old]:" in stdout.getvalue()
 
 
 def test_validate_returns_nonzero_for_missing_manifest(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -241,6 +241,41 @@ def test_resume_auto_reviews_waiting_review_job(
     assert '"status": "completed"' in output
 
 
+def test_resume_dry_run_prints_resume_plan_without_running(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakePlan:
+        def to_dict(self) -> dict[str, object]:
+            return {
+                "job_id": "job_1",
+                "start_stage": "tts",
+                "from_stage": "tts",
+                "no_cache": True,
+                "preserve_checkpoints": False,
+                "already_completed": False,
+                "reason": "from_stage_requested",
+            }
+
+    def fake_plan_resume(self: JobManager, workspace_dir: Path, job_id: str, **kwargs: object) -> FakePlan:
+        calls.append({"workspace_dir": workspace_dir, "job_id": job_id, **kwargs})
+        return FakePlan()
+
+    def fail_resume(self: JobManager, *args: object, **kwargs: object) -> FakeSummary:
+        raise AssertionError("resume should not run during dry-run")
+
+    monkeypatch.setattr(JobManager, "plan_resume", fake_plan_resume)
+    monkeypatch.setattr(JobManager, "resume", fail_resume)
+
+    assert main(["resume", "--workspace", "workspace", "--job", "job_1", "--from-stage", "tts", "--no-cache", "--dry-run"]) == 0
+
+    assert calls == [{"workspace_dir": Path("workspace"), "job_id": "job_1", "from_stage": StageName.TTS, "no_cache": True}]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["start_stage"] == "tts"
+    assert payload["reason"] == "from_stage_requested"
+
+
 def test_batch_resume_no_cache_is_passed_to_batch_manager(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     calls: list[dict[str, object]] = []
 
@@ -254,6 +289,91 @@ def test_batch_resume_no_cache_is_passed_to_batch_manager(monkeypatch: pytest.Mo
 
     assert calls == [{"workspace_dir": Path("workspace"), "batch_id": "batch_1", "job_ids": None, "from_stage": StageName.TTS, "no_cache": True}]
     assert "batch_1" in capsys.readouterr().out
+
+
+def test_batch_resume_dry_run_prints_selected_job_plans(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_plan_resume(self: BatchManager, workspace_dir: Path, batch_id: str, **kwargs: object) -> dict[str, object]:
+        calls.append({"workspace_dir": workspace_dir, "batch_id": batch_id, **kwargs})
+        return {
+            "batch_id": batch_id,
+            "selected_jobs": 1,
+            "jobs": [{"job_id": "job_2", "plan": {"start_stage": "translation"}}],
+        }
+
+    def fail_resume(self: BatchManager, *args: object, **kwargs: object) -> FakeSummary:
+        raise AssertionError("batch resume should not run during dry-run")
+
+    monkeypatch.setattr(BatchManager, "plan_resume", fake_plan_resume)
+    monkeypatch.setattr(BatchManager, "resume", fail_resume)
+
+    assert main(["batch", "resume", "--workspace", "workspace", "--batch", "batch_1", "--job", "job_2", "--dry-run"]) == 0
+
+    assert calls == [{"workspace_dir": Path("workspace"), "batch_id": "batch_1", "job_ids": ["job_2"], "from_stage": None, "no_cache": False}]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["jobs"][0]["job_id"] == "job_2"
+
+
+def test_batch_review_writes_locked_review_for_waiting_job(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    batch_root = workspace / "batch_review"
+    job_dir = batch_root / "jobs" / "job_waiting"
+    artifacts = job_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    write_json_atomic(
+        batch_root / "batch_state.json",
+        {
+            "schema_version": "1.0",
+            "batch_id": "batch_review",
+            "status": "waiting_review",
+            "jobs": [
+                {"job_id": "job_done", "input_name": "done.mp4", "status": "completed", "error": None},
+                {"job_id": "job_waiting", "input_name": "lesson.mp4", "status": "waiting_review", "error": None},
+            ],
+        },
+    )
+    write_json_atomic(
+        artifacts / "review.required.json",
+        {
+            "schema_version": "1.0",
+            "domain_profile": "calculus@1",
+            "cue_set_checksum": "d" * 64,
+            "status": "required",
+            "review_scope": "high_risk_cues",
+            "cues": [
+                {
+                    "cue_id": "cue_001",
+                    "reason": "asr_timeline_review_required",
+                    "source_text_raw": "Source.",
+                    "source_text_normalized": "Source.",
+                    "display_text": "Bản dịch.",
+                    "spoken_text": "Bản dịch.",
+                    "protected_spans": [],
+                    "review_overrides": {
+                        "source_text_normalized": "Source.",
+                        "display_text": "Bản dịch.",
+                        "spoken_text": "Bản dịch.",
+                        "protected_spans": [],
+                    },
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(sys, "stdin", FakeTTY("\n"))
+
+    assert main(["batch", "review", "--workspace", str(workspace), "--batch", "batch_review"]) == 0
+
+    locked = json.loads((artifacts / "review.locked.json").read_text(encoding="utf-8"))
+    assert locked["status"] == "locked"
+    assert locked["cues"][0]["cue_id"] == "cue_001"
+    out = capsys.readouterr().out
+    assert '"job_id": "job_waiting"' in out
+    assert '"status": "locked"' in out
 
 
 def test_review_interactive_writes_locked_artifacts(tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
