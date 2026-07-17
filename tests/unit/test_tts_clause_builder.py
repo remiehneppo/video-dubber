@@ -49,6 +49,31 @@ def test_build_tts_clauses_falls_back_when_translation_sentence_count_does_not_m
     assert clauses[0].segment_id == "seg_000001"
     assert clauses[0].translated_text == "Mot cau dich duy nhat."
 
+
+def test_build_tts_clauses_falls_back_for_word_chunk_when_translation_sentence_count_differs() -> None:
+    segment = {
+        "segment_id": "wchunk_000001",
+        "start_ms": 1000,
+        "end_ms": 4500,
+        "duration_ms": 3500,
+        "source_text": "First. Second.",
+        "timestamp_source": "word",
+        "risk_flags": ["hard_split"],
+        "words": [
+            {"text": "First.", "start_ms": 1000, "end_ms": 1800},
+            {"text": "Second.", "start_ms": 3000, "end_ms": 4500},
+        ],
+    }
+
+    clauses = build_tts_clauses(segment, "Mot cau dich duy nhat.", min_pause_ms=700)
+
+    assert len(clauses) == 1
+    assert clauses[0].segment_id == "wchunk_000001"
+    assert clauses[0].start_ms == 1000
+    assert clauses[0].end_ms == 4500
+    assert clauses[0].translated_text == "Mot cau dich duy nhat."
+
+
 def test_build_tts_work_items_merges_short_incomplete_fragment_with_following_segment() -> None:
     segments = [
         {

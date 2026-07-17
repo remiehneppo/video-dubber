@@ -5,6 +5,26 @@ from pathlib import Path
 import pytest
 
 from dubber.core.config import load_config
+from dubber.core.models import ASRChunkingConfig
+
+
+def test_asr_chunking_is_enabled_by_default(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("", encoding="utf-8")
+
+    config = load_config(config_file)
+
+    assert ASRChunkingConfig().enabled is True
+    assert config.asr_chunking.enabled is True
+
+
+def test_load_config_allows_explicit_asr_chunking_legacy_disable(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("asr_chunking:\n  enabled: false\n", encoding="utf-8")
+
+    config = load_config(config_file)
+
+    assert config.asr_chunking.enabled is False
 
 
 def test_load_config_applies_asr_chunking_settings(tmp_path: Path) -> None:

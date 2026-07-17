@@ -101,6 +101,7 @@ def _timeline_units(segments: list[dict[str, Any]], *, max_duration_ms: int) -> 
     units: list[dict[str, object]] = []
     for segment in segments:
         parents = list(segment.get("parent_segment_ids", [str(segment["segment_id"])]))
+        source_chunk_ids = _source_chunk_ids(segment)
         words = segment.get("words")
         if isinstance(words, list) and words:
             valid_words = [word for word in words if isinstance(word, dict)]
@@ -123,6 +124,7 @@ def _timeline_units(segments: list[dict[str, Any]], *, max_duration_ms: int) -> 
                         "start_ms": start_ms,
                         "end_ms": end_ms,
                         "parents": parents,
+                        "source_chunk_ids": source_chunk_ids,
                     })
             continue
         start_ms = int(segment["start_ms"])
@@ -143,6 +145,7 @@ def _timeline_units(segments: list[dict[str, Any]], *, max_duration_ms: int) -> 
                 "start_ms": unit_start,
                 "end_ms": unit_end,
                 "parents": parents,
+                "source_chunk_ids": source_chunk_ids,
             })
     return sorted(units, key=lambda unit: (int(unit["start_ms"]), int(unit["end_ms"])))
 
@@ -275,6 +278,14 @@ def _normalized_token(text: str) -> str:
     return token
 
 
+def _source_chunk_ids(segment: dict[str, Any]) -> list[str]:
+    raw_ids = segment.get("source_chunk_ids")
+    if isinstance(raw_ids, list):
+        return list(dict.fromkeys(str(item) for item in raw_ids if str(item)))
+    raw_id = str(segment.get("source_chunk_id", ""))
+    return [raw_id] if raw_id else []
+
+
 def _cue_from_group(group: list[dict[str, object]], *, max_duration_ms: int) -> dict[str, object]:
     start_ms = int(group[0]["start_ms"])
     end_ms = int(group[-1]["end_ms"])
@@ -282,6 +293,11 @@ def _cue_from_group(group: list[dict[str, object]], *, max_duration_ms: int) -> 
         str(parent)
         for unit in group
         for parent in list(unit.get("parents", []))
+    ))
+    source_chunk_ids = list(dict.fromkeys(
+        str(source_chunk_id)
+        for unit in group
+        for source_chunk_id in list(unit.get("source_chunk_ids", []))
     ))
     source_text = " ".join(str(unit["text"]).strip() for unit in group if str(unit["text"]).strip()).strip()
     source_text_raw = " ".join(
@@ -300,6 +316,7 @@ def _cue_from_group(group: list[dict[str, object]], *, max_duration_ms: int) -> 
         "source_text_raw": source_text_raw,
         "translated_text": "",
         "parent_segment_ids": parents,
+        "source_chunk_ids": source_chunk_ids,
         "risk_flags": (
             ["cue_duration_exceeds_max_for_safe_boundary"]
             if duration_ms > max_duration_ms

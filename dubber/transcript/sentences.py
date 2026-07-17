@@ -50,6 +50,7 @@ def _timeline_words(segments: list[dict[str, Any]]) -> list[dict[str, object]]:
     words: list[dict[str, object]] = []
     for segment in segments:
         segment_id = str(segment.get("segment_id", ""))
+        source_chunk_ids = _source_chunk_ids(segment)
         risk_flags = list(segment.get("risk_flags", []))
         raw_words = segment.get("words")
         if not isinstance(raw_words, list):
@@ -76,6 +77,7 @@ def _timeline_words(segments: list[dict[str, Any]]) -> list[dict[str, object]]:
                     "start_ms": start_ms,
                     "end_ms": end_ms,
                     "parent_segment_id": segment_id,
+                    "source_chunk_ids": source_chunk_ids,
                     "risk_flags": risk_flags,
                 }
             )
@@ -94,6 +96,11 @@ def _normalized_token(text: str) -> str:
 
 def _sentence_from_group(group: list[dict[str, object]], index: int) -> dict[str, object]:
     parents = list(dict.fromkeys(str(word["parent_segment_id"]) for word in group))
+    source_chunk_ids = list(dict.fromkeys(
+        str(source_chunk_id)
+        for word in group
+        for source_chunk_id in list(word.get("source_chunk_ids", []))
+    ))
     risk_flags = list(dict.fromkeys(
         flag
         for word in group
@@ -114,6 +121,7 @@ def _sentence_from_group(group: list[dict[str, object]], index: int) -> dict[str
         "source_text_raw": _join_words(group, "raw_text"),
         "words": words,
         "parent_segment_ids": parents,
+        "source_chunk_ids": source_chunk_ids,
         "risk_flags": risk_flags,
         "boundary_reason": (
             "sentence_punctuation"
@@ -121,6 +129,14 @@ def _sentence_from_group(group: list[dict[str, object]], index: int) -> dict[str
             else "natural_pause_or_end"
         ),
     }
+
+
+def _source_chunk_ids(segment: dict[str, Any]) -> list[str]:
+    raw_ids = segment.get("source_chunk_ids")
+    if isinstance(raw_ids, list):
+        return list(dict.fromkeys(str(item) for item in raw_ids if str(item)))
+    raw_id = str(segment.get("source_chunk_id", ""))
+    return [raw_id] if raw_id else []
 
 
 def _join_words(words: list[dict[str, object]], key: str) -> str:

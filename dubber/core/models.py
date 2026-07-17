@@ -124,7 +124,7 @@ class ASRServiceConfig:
 
 @dataclass(frozen=True)
 class ASRChunkingConfig:
-    enabled: bool = False
+    enabled: bool = True
     max_chunk_duration_ms: int = 60_000
     initial_silence_ms: int = 5_000
     min_silence_ms: int = 500

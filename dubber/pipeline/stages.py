@@ -1431,6 +1431,7 @@ def _dubbing_cue_v2(cue: dict[str, object]) -> dict[str, object]:
         "normalization_confidence": float(cue.get("normalization_confidence", 1.0)),
         "risk_flags": list(cue.get("risk_flags", [])),
         "parent_segment_ids": list(cue.get("parent_segment_ids", [])),
+        "source_chunk_ids": list(cue.get("source_chunk_ids", [])),
         "used_terms": list(cue.get("used_terms", [])),
         "translation_warnings": list(cue.get("translation_warnings", [])),
     }

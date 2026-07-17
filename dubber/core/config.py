@@ -161,7 +161,7 @@ def load_config(path: Path | str) -> DubberConfig:
 
 def _load_asr_chunking_config(values: dict[str, Any]) -> ASRChunkingConfig:
     config = ASRChunkingConfig(
-        enabled=bool(values.get("enabled", False)),
+        enabled=bool(values.get("enabled", True)),
         max_chunk_duration_ms=_positive_int_field(values, "max_chunk_duration_ms", 60_000, "asr_chunking"),
         initial_silence_ms=_positive_int_field(values, "initial_silence_ms", 5_000, "asr_chunking"),
         min_silence_ms=_positive_int_field(values, "min_silence_ms", 500, "asr_chunking"),

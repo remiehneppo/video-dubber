@@ -156,6 +156,82 @@ def test_translation_uses_blocks_and_domain_context(tmp_path: Path) -> None:
     assert translated["segments"][0]["display_text"].startswith("seo::cue_")
 
 
+def test_translation_builds_source_sentences_and_cues_from_word_chunked_transcript(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_word_chunk_translation")
+    _write_segments(paths, [{"segment_id": "seg_000001", "start_ms": 0, "end_ms": 4000}])
+    paths.artifact_path("transcript.v1.json").write_text(
+        json.dumps({
+            "schema_version": "1.0",
+            "segments": [
+                {
+                    "segment_id": "seg_000001",
+                    "source_chunk_id": "wchunk_000001",
+                    "start_ms": 0,
+                    "end_ms": 1800,
+                    "duration_ms": 1800,
+                    "source_text_raw": "First sentence.",
+                    "source_text": "First sentence.",
+                    "timestamp_source": "word",
+                    "risk_flags": [],
+                    "words": [
+                        {"text": "First", "start_ms": 0, "end_ms": 500},
+                        {"text": "sentence.", "start_ms": 700, "end_ms": 1800},
+                    ],
+                },
+                {
+                    "segment_id": "seg_000002",
+                    "source_chunk_id": "wchunk_000002",
+                    "start_ms": 2100,
+                    "end_ms": 3800,
+                    "duration_ms": 1700,
+                    "source_text_raw": "Second sentence.",
+                    "source_text": "Second sentence.",
+                    "timestamp_source": "word",
+                    "risk_flags": [],
+                    "words": [
+                        {"text": "Second", "start_ms": 2100, "end_ms": 2600},
+                        {"text": "sentence.", "start_ms": 2800, "end_ms": 3800},
+                    ],
+                },
+            ],
+        }),
+        encoding="utf-8",
+    )
+    paths.artifact_path("glossary.locked.json").write_text(
+        json.dumps({"schema_version": "1.0", "domain": "seo", "status": "locked", "terms": []}),
+        encoding="utf-8",
+    )
+    store = CheckpointStore.create(
+        paths.job_state_file, job_id="job_word_chunk_translation", input_file=Path("input/video.mp4")
+    )
+    manifest = ArtifactManifest.create("job_word_chunk_translation", paths.manifest_file)
+    ctx = StageContext(
+        paths=paths,
+        store=store,
+        manifest=manifest,
+        ffmpeg=None,
+        provider_mode="openai_compatible",
+        provider_bundle=ProviderBundle(asr=object(), llm=FakeLLMProvider(), tts=object()),
+        config=DubberConfig(project=ProjectConfig(domain="seo"), dubbing_cues=DubbingCueConfig(4000, 1000, 6000)),
+    )
+
+    assert run_translation(ctx) is False
+
+    source_sentences = json.loads(paths.artifact_path("source_sentences.v1.json").read_text(encoding="utf-8"))["sentences"]
+    cues = json.loads(paths.artifact_path("dubbing_cues.v2.json").read_text(encoding="utf-8"))["cues"]
+    assert [sentence["parent_segment_ids"] for sentence in source_sentences] == [
+        ["seg_000001"],
+        ["seg_000002"],
+    ]
+    assert [sentence["source_chunk_ids"] for sentence in source_sentences] == [
+        ["wchunk_000001"],
+        ["wchunk_000002"],
+    ]
+    assert cues[0]["parent_segment_ids"] == ["seg_000001", "seg_000002"]
+    assert cues[0]["source_chunk_ids"] == ["wchunk_000001", "wchunk_000002"]
+    assert cues[0]["source_text"] == "First sentence. Second sentence."
+
+
 class OmitsSecondBlockOnceLLMProvider:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []

@@ -7,6 +7,7 @@
 #   ghi đè một số giá trị bên dưới cho lần chạy hiện tại.
 # - provider-mode=mock không cần các API endpoint. provider-mode=openai_compatible
 #   yêu cầu base_url và api_key cho cả ASR, LLM và TTS.
+# - File này đã được đối chiếu với dubber/core/config.py; không giữ key đã bỏ.
 
 project:
   # Tên logic của dự án; được giữ trong config để nhận diện deployment.
@@ -112,11 +113,10 @@ source_normalization:
   llm_adjudication: false
 
 asr_chunking:
-  # false: giữ behavior cũ, transcript được build trực tiếp từ chunk VAD/Silero.
-  # true: VAD/Silero vẫn chỉ dùng để chia request ASR bootstrap; sau khi có
-  # word timestamps, pipeline rechunk transcript theo khoảng không có word.
-  # Nên bật khi provider trả word timestamps đáng tin cậy.
-  enabled: false
+  # true: dùng logic mới. VAD/Silero vẫn chỉ chia request ASR bootstrap;
+  # sau khi có word timestamps, pipeline rechunk transcript theo khoảng không có word.
+  # Đặt false nếu cần quay về behavior cũ: build transcript trực tiếp từ chunk VAD/Silero.
+  enabled: true
   # Nếu chunk word dài hơn ngưỡng này, giảm dần ngưỡng silence để tìm điểm cắt.
   max_chunk_duration_ms: 60000
   # Split đầu tiên tại khoảng trống giữa hai word >= 5 giây.
@@ -210,7 +210,7 @@ llm_service:
   api_key: ${LLM_API_KEY}
   model: gpt-4o-mini
   # Độ ngẫu nhiên mong muốn. Field hiện được load nhưng factory chưa forward tới
-  # adapter; model đang dùng behavior mặc định của endpoint.
+  # adapter; adapter LLM hiện đang gửi temperature=0 để giữ output ổn định.
   temperature: 0.3
 
 tts_service:
@@ -259,6 +259,7 @@ tts_service:
   # Ngưỡng biên độ PCM16 và tỷ lệ sample tối đa để phát hiện clipping.
   clipping_peak_threshold: 32760
   max_clipped_sample_ratio: 0.001
-  # Với word timestamps, pause dài hơn ngưỡng có thể tách một transcript segment
-  # thành nhiều TTS clause. Mỗi clause cũng được dùng silence trước clause kế tiếp.
+  # Với word timestamps, pause dài hơn ngưỡng này có thể tách một transcript segment
+  # thành nhiều TTS clause. Mỗi clause dùng timing riêng và silence trước clause kế tiếp.
+  # Local TTS hay nghẽn câu dài có thể giảm xuống 500; provider cloud thường giữ 700.
   clause_pause_threshold_ms: 700
