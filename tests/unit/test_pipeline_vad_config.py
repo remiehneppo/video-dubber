@@ -13,7 +13,7 @@ from dubber.pipeline.stage_context import StageContext
 from dubber.pipeline.stages import run_vad
 
 
-def test_run_vad_uses_configured_max_duration(tmp_path: Path) -> None:
+def test_run_vad_uses_configured_context_chunk_limits(tmp_path: Path) -> None:
     paths = WorkspacePaths.create(tmp_path, "job_vad")
     _write_wav(paths.audio_dir / "vocals.wav", duration_ms=1200)
     store = CheckpointStore.create(paths.job_state_file, job_id="job_vad", input_file=Path("input/video.mp4"))
@@ -27,12 +27,14 @@ def test_run_vad_uses_configured_max_duration(tmp_path: Path) -> None:
             vad=VadConfig(
                 frame_ms=100,
                 threshold_ratio=0.2,
-                min_duration_ms=100,
-                    max_duration_ms=500,
-                    silence_merge_threshold_ms=100,
-                    context_padding_ms=50,
-                    soft_split_allowed=True,
-                )
+                min_speech_duration_ms=100,
+                target_min_chunk_ms=400,
+                preferred_max_chunk_ms=500,
+                hard_max_chunk_ms=500,
+                silence_merge_threshold_ms=100,
+                context_padding_ms=50,
+                soft_split_allowed=True,
+            )
         ),
     )
 
@@ -83,7 +85,6 @@ def test_run_vad_passes_silero_config_to_audio_backend(tmp_path: Path, monkeypat
                 silero_threshold=0.6,
                 min_silence_duration_ms=450,
                 speech_padding_ms=150,
-                max_vad_chunk_ms=25000,
                 merge_gap_ms=200,
             )
         ),
@@ -97,7 +98,6 @@ def test_run_vad_passes_silero_config_to_audio_backend(tmp_path: Path, monkeypat
     assert config.silero_threshold == 0.6
     assert config.min_silence_duration_ms == 450
     assert config.speech_padding_ms == 150
-    assert config.max_vad_chunk_ms == 25000
     assert config.merge_gap_ms == 200
 
 

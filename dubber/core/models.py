@@ -44,8 +44,6 @@ class VadConfig:
     mode: str = "asr_context_chunks"
     frame_ms: int = 100
     threshold_ratio: float = 0.08
-    min_duration_ms: int = 900
-    max_duration_ms: int = 60_000
     min_speech_duration_ms: int = 700
     target_min_chunk_ms: int = 20_000
     preferred_max_chunk_ms: int = 45_000
@@ -59,7 +57,6 @@ class VadConfig:
     silero_threshold: float = 0.5
     min_silence_duration_ms: int = 500
     speech_padding_ms: int = 250
-    max_vad_chunk_ms: int = 30_000
     merge_gap_ms: int = 300
 
 

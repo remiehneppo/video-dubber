@@ -43,8 +43,10 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
                 "vad:",
                 "  frame_ms: 50",
                 "  threshold_ratio: 0.2",
-                "  min_duration_ms: 150",
-                "  max_duration_ms: 1200",
+                "  min_speech_duration_ms: 150",
+                "  target_min_chunk_ms: 500",
+                "  preferred_max_chunk_ms: 900",
+                "  hard_max_chunk_ms: 1200",
                 "  silence_merge_threshold_ms: 250",
                 "  context_padding_ms: 300",
                 "  soft_split_allowed: false",
@@ -102,8 +104,10 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
     assert config.subtitles.max_chars_per_line == 42
     assert config.vad.frame_ms == 50
     assert config.vad.threshold_ratio == 0.2
-    assert config.vad.min_duration_ms == 150
-    assert config.vad.max_duration_ms == 1200
+    assert config.vad.min_speech_duration_ms == 150
+    assert config.vad.target_min_chunk_ms == 500
+    assert config.vad.preferred_max_chunk_ms == 900
+    assert config.vad.hard_max_chunk_ms == 1200
     assert config.vad.silence_merge_threshold_ms == 250
     assert config.vad.context_padding_ms == 300
     assert config.vad.soft_split_allowed is False
@@ -177,6 +181,23 @@ def test_load_config_applies_asr_driven_segmentation_settings(tmp_path: Path) ->
     assert config.transcript_segmentation.max_segment_ms == 45_000
     assert config.transcript_segmentation.min_pause_split_ms == 600
     assert config.transcript_segmentation.prefer_punctuation_split is True
+
+
+def test_load_config_rejects_unsupported_vad_mode(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("vad:\n  mode: energy_segments\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="vad.mode must be one of: asr_context_chunks, silero_vad"):
+        load_config(config_file)
+
+
+def test_load_config_does_not_expose_removed_vad_max_chunk_field(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("vad:\n  max_vad_chunk_ms: 25000\n", encoding="utf-8")
+
+    config = load_config(config_file)
+
+    assert not hasattr(config.vad, "max_vad_chunk_ms")
 
 
 @pytest.mark.parametrize("name,value", [("max_parallel_jobs", 0), ("asr_concurrency", -1), ("llm_concurrency", 1.5), ("tts_concurrency", True)])

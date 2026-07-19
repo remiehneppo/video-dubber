@@ -11,11 +11,9 @@ from dubber.audio.silero_vad import SileroVadUnavailable, detect_silero_segments
 
 @dataclass(frozen=True)
 class VadConfig:
-    mode: str = "energy_segments"
+    mode: str = "asr_context_chunks"
     frame_ms: int = 100
     threshold_ratio: float = 0.08
-    min_duration_ms: int = 900
-    max_duration_ms: int = 60_000
     min_speech_duration_ms: int = 700
     target_min_chunk_ms: int = 20_000
     preferred_max_chunk_ms: int = 45_000
@@ -29,7 +27,6 @@ class VadConfig:
     silero_threshold: float = 0.5
     min_silence_duration_ms: int = 500
     speech_padding_ms: int = 250
-    max_vad_chunk_ms: int = 30_000
     merge_gap_ms: int = 300
 
 
@@ -100,6 +97,9 @@ def detect_segments(wav_path: Path, config: VadConfig | None = None) -> list[Vad
             for index, segment in enumerate(silero_segments, start=1)
         ]
 
+    if config.mode != "asr_context_chunks":
+        raise ValueError(f"unsupported vad.mode: {config.mode}")
+
     frames, duration_ms = _read_frames(wav_path, config.frame_ms)
     if not frames:
         raise ValueError(f"WAV contains no audio frames: {wav_path}")
@@ -113,21 +113,16 @@ def detect_segments(wav_path: Path, config: VadConfig | None = None) -> list[Vad
         intervals = _speech_intervals(frames, threshold)
         intervals = _merge_intervals(intervals, config.silence_merge_threshold_ms)
         intervals = _pad_intervals(intervals, duration_ms, config.context_padding_ms)
-        minimum_duration_ms = config.min_speech_duration_ms if config.mode == "asr_context_chunks" else config.min_duration_ms
         intervals = [
             interval
             for interval in intervals
-            if interval.end_ms - interval.start_ms >= minimum_duration_ms
+            if interval.end_ms - interval.start_ms >= config.min_speech_duration_ms
         ]
-        if config.mode == "asr_context_chunks":
-            intervals = _merge_short_context_chunks(intervals, config.target_min_chunk_ms)
+        intervals = _merge_short_context_chunks(intervals, config.target_min_chunk_ms)
         if not intervals:
             intervals = [_Interval(0, duration_ms, "vad_fallback_full_audio", ["no_speech_detected"])]
 
-    if config.mode == "asr_context_chunks":
-        split_intervals = _split_context_intervals(intervals, frames, threshold, config)
-    else:
-        split_intervals = _split_long_intervals(intervals, config.max_duration_ms, config.soft_split_allowed)
+    split_intervals = _split_context_intervals(intervals, frames, threshold, config)
     return [
         VadSegment(
             segment_id=f"seg_{index:06d}",
@@ -257,7 +252,7 @@ def _split_context_intervals(
     threshold: float,
     config: VadConfig,
 ) -> list[_Interval]:
-    hard_max_ms = min(config.hard_max_chunk_ms, config.max_duration_ms)
+    hard_max_ms = config.hard_max_chunk_ms
     preferred_max_ms = min(config.preferred_max_chunk_ms, hard_max_ms)
     if hard_max_ms <= 0:
         raise ValueError("hard_max_chunk_ms must be positive")
@@ -349,27 +344,3 @@ def _merge_risk_flags(first: list[str], second: list[str]) -> list[str]:
 
 def _add_risk_flag(flags: list[str], flag: str) -> list[str]:
     return flags if flag in flags else flags + [flag]
-
-
-def _split_long_intervals(
-    intervals: list[_Interval],
-    max_duration_ms: int,
-    soft_split_allowed: bool,
-) -> list[_Interval]:
-    if max_duration_ms <= 0:
-        raise ValueError("max_duration_ms must be positive")
-    split: list[_Interval] = []
-    for interval in intervals:
-        duration = interval.end_ms - interval.start_ms
-        if duration <= max_duration_ms:
-            split.append(interval)
-            continue
-        if not soft_split_allowed:
-            split.append(_Interval(interval.start_ms, interval.end_ms, interval.split_reason, ["segment_over_max_duration"]))
-            continue
-        start = interval.start_ms
-        while start < interval.end_ms:
-            end = min(start + max_duration_ms, interval.end_ms)
-            split.append(_Interval(start, end, "vad_soft_split", interval.risk_flags))
-            start = end
-    return split

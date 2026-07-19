@@ -84,15 +84,13 @@ def load_config(path: Path | str) -> DubberConfig:
             max_chars_per_line=int(subtitles.get("max_chars_per_line", 48)),
         ),
         vad=VadConfig(
-            mode=str(vad.get("mode", "asr_context_chunks")),
+            mode=_vad_mode(vad),
             frame_ms=int(vad.get("frame_ms", 100)),
             threshold_ratio=float(vad.get("threshold_ratio", 0.08)),
-            min_duration_ms=int(vad.get("min_duration_ms", vad.get("min_speech_duration_ms", 900))),
-            max_duration_ms=int(vad.get("max_duration_ms", vad.get("hard_max_chunk_ms", 60_000))),
-            min_speech_duration_ms=int(vad.get("min_speech_duration_ms", vad.get("min_duration_ms", 700))),
+            min_speech_duration_ms=int(vad.get("min_speech_duration_ms", 700)),
             target_min_chunk_ms=int(vad.get("target_min_chunk_ms", 20_000)),
-            preferred_max_chunk_ms=int(vad.get("preferred_max_chunk_ms", vad.get("max_duration_ms", 45_000))),
-            hard_max_chunk_ms=int(vad.get("hard_max_chunk_ms", vad.get("max_duration_ms", 90_000))),
+            preferred_max_chunk_ms=int(vad.get("preferred_max_chunk_ms", 45_000)),
+            hard_max_chunk_ms=int(vad.get("hard_max_chunk_ms", 90_000)),
             silence_merge_threshold_ms=int(vad.get("silence_merge_threshold_ms", 2_500)),
             context_padding_ms=int(vad.get("context_padding_ms", 1_500)),
             soft_split_allowed=bool(vad.get("soft_split_allowed", False)),
@@ -102,7 +100,6 @@ def load_config(path: Path | str) -> DubberConfig:
             silero_threshold=float(vad.get("silero_threshold", 0.5)),
             min_silence_duration_ms=int(vad.get("min_silence_duration_ms", 500)),
             speech_padding_ms=int(vad.get("speech_padding_ms", 250)),
-            max_vad_chunk_ms=int(vad.get("max_vad_chunk_ms", 30_000)),
             merge_gap_ms=int(vad.get("merge_gap_ms", 300)),
         ),
         asr_service=ASRServiceConfig(
@@ -157,6 +154,14 @@ def load_config(path: Path | str) -> DubberConfig:
             semantic_retry_attempts=int(tts_service.get("semantic_retry_attempts", 3)),
         ),
     )
+
+
+def _vad_mode(values: dict[str, Any]) -> str:
+    mode = str(values.get("mode", "asr_context_chunks"))
+    allowed = {"asr_context_chunks", "silero_vad"}
+    if mode not in allowed:
+        raise ValueError("vad.mode must be one of: asr_context_chunks, silero_vad")
+    return mode
 
 
 def _load_asr_chunking_config(values: dict[str, Any]) -> ASRChunkingConfig:

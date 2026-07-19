@@ -28,8 +28,10 @@ def test_detect_segments_finds_two_speech_islands(tmp_path: Path) -> None:
         VadConfig(
             frame_ms=50,
             threshold_ratio=0.2,
-            min_duration_ms=200,
-            max_duration_ms=2000,
+            min_speech_duration_ms=200,
+            target_min_chunk_ms=0,
+            preferred_max_chunk_ms=2000,
+            hard_max_chunk_ms=2000,
             silence_merge_threshold_ms=200,
         ),
     )
@@ -58,8 +60,10 @@ def test_detect_segments_merges_short_silence_gap(tmp_path: Path) -> None:
         VadConfig(
             frame_ms=50,
             threshold_ratio=0.2,
-            min_duration_ms=100,
-            max_duration_ms=2000,
+            min_speech_duration_ms=100,
+            target_min_chunk_ms=0,
+            preferred_max_chunk_ms=2000,
+            hard_max_chunk_ms=2000,
             silence_merge_threshold_ms=150,
         ),
     )
@@ -85,8 +89,10 @@ def test_detect_segments_applies_context_padding_and_merges_segments(tmp_path: P
         VadConfig(
             frame_ms=50,
             threshold_ratio=0.2,
-            min_duration_ms=100,
-            max_duration_ms=2000,
+            min_speech_duration_ms=100,
+            target_min_chunk_ms=0,
+            preferred_max_chunk_ms=2000,
+            hard_max_chunk_ms=2000,
             silence_merge_threshold_ms=100,
             context_padding_ms=150,
         ),
@@ -106,8 +112,10 @@ def test_detect_segments_splits_long_interval(tmp_path: Path) -> None:
         VadConfig(
             frame_ms=100,
             threshold_ratio=0.2,
-            min_duration_ms=100,
-            max_duration_ms=500,
+            min_speech_duration_ms=100,
+            target_min_chunk_ms=400,
+            preferred_max_chunk_ms=500,
+            hard_max_chunk_ms=500,
             silence_merge_threshold_ms=100,
             soft_split_allowed=True,
         ),
@@ -118,7 +126,7 @@ def test_detect_segments_splits_long_interval(tmp_path: Path) -> None:
         (500, 1000),
         (1000, 1200),
     ]
-    assert segments[0].split_reason == "vad_soft_split"
+    assert segments[0].split_reason == "vad_hard_split"
 
 
 def test_detect_segments_falls_back_to_full_audio_when_no_speech(tmp_path: Path) -> None:
@@ -156,7 +164,6 @@ def test_asr_context_chunks_merge_until_target_minimum(tmp_path: Path) -> None:
             target_min_chunk_ms=5000,
             preferred_max_chunk_ms=9000,
             hard_max_chunk_ms=12000,
-            max_duration_ms=12000,
             silence_merge_threshold_ms=500,
             context_padding_ms=0,
         ),
@@ -189,7 +196,6 @@ def test_asr_context_chunks_split_at_silence_before_hard_max(tmp_path: Path) -> 
             target_min_chunk_ms=4000,
             preferred_max_chunk_ms=7000,
             hard_max_chunk_ms=9500,
-            max_duration_ms=9500,
             silence_merge_threshold_ms=5000,
             context_padding_ms=0,
         ),
@@ -198,10 +204,6 @@ def test_asr_context_chunks_split_at_silence_before_hard_max(tmp_path: Path) -> 
     assert [(segment.start_ms, segment.end_ms) for segment in segments] == [(0, 5000), (5000, 10000), (10000, 14000)]
     assert segments[0].split_reason == "vad_silence_split"
     assert "hard_split" not in segments[0].risk_flags
-
-
-
-
 
 
 def test_silero_run_model_includes_context_buffer() -> None:

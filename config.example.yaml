@@ -51,45 +51,57 @@ input:
   max_duration_minutes: 180
 
 vad:
-  # asr_context_chunks: detector biên độ nhẹ, không cần model ngoài.
-  # silero_vad: dùng ONNX Silero, cần onnxruntime và model bên dưới.
+  # Stage VAD chỉ tạo bootstrap audio chunks để gửi ASR. Khi asr_chunking.enabled=true,
+  # transcript cuối không dùng trực tiếp biên VAD mà được rechunk lại bằng word timestamps.
+  # mode-specific: chỉ một backend VAD chạy mỗi job; các tham số của backend còn lại
+  # không tác động đồng thời.
+  # - asr_context_chunks: detector biên độ nhẹ, không cần model ngoài. Đây là default.
+  # - silero_vad: dùng ONNX Silero, cần onnxruntime + model; bỏ qua frame_ms và threshold_ratio.
   mode: asr_context_chunks
-  # Kích thước frame phân tích cho detector biên độ.
+
+  # Chỉ tác động khi mode=asr_context_chunks. Detector đọc audio theo frame này,
+  # tính RMS và xem frame là speech nếu RMS >= max_rms * threshold_ratio.
   frame_ms: 100
-  # Ngưỡng năng lượng tương đối của detector asr_context_chunks.
   threshold_ratio: 0.08
-  # Alias/giới hạn duration cũ, vẫn được loader hỗ trợ để tương thích config.
-  min_duration_ms: 900
-  max_duration_ms: 90000
-  # Speech ngắn hơn ngưỡng này có thể bị loại hoặc ghép.
+
+  # Dùng cho cả asr_context_chunks và silero_vad sau khi đã có speech intervals.
+  # Speech island ngắn hơn giá trị này bị loại trước khi merge; nếu toàn audio
+  # không còn speech hợp lệ, VAD fallback thành full audio với risk no_speech_detected.
   min_speech_duration_ms: 700
-  # Mục tiêu kích thước ASR chunk: ưu tiên ít nhất target_min, cố giữ dưới
-  # preferred_max và tuyệt đối không vượt hard_max nếu có điểm cắt hợp lệ.
+
+  # Dùng cho cả hai mode để tạo bootstrap ASR chunks:
+  # - target_min_chunk_ms: merge các speech intervals kế tiếp cho tới khi chunk đạt
+  #   tối thiểu gần giá trị này, nếu không vượt hard_max_chunk_ms.
+  # - preferred_max_chunk_ms: nếu chunk dài hơn ngưỡng này, ưu tiên split tại silence
+  #   gần ngưỡng nhất.
+  # - hard_max_chunk_ms: giới hạn bootstrap chunk; nếu không có silence hợp lệ và
+  #   soft_split_allowed=false, chunk được giữ nguyên và gắn segment_over_hard_max.
   target_min_chunk_ms: 20000
   preferred_max_chunk_ms: 45000
   hard_max_chunk_ms: 90000
-  # Khoảng im lặng dùng để quyết định ghép/cắt chunk ASR.
+
+  # Chỉ tác động khi mode=asr_context_chunks. Speech intervals cách nhau không quá
+  # ngưỡng này được merge trước khi thêm context padding.
   silence_merge_threshold_ms: 2500
-  # Audio context thêm quanh speech chunk để tránh cắt mất âm đầu/cuối.
+  # Chỉ tác động khi mode=asr_context_chunks. Thêm audio trước/sau speech interval
+  # để ASR không mất âm đầu/cuối; padding có thể làm các interval chạm nhau và merge.
   context_padding_ms: 1500
-  # false: không cắt giữa vùng speech liên tục; giữ chunk quá dài và gắn risk
-  # flag để review. Chỉ bật true cho debug/provider có hard upload limit.
+  # Chỉ tác động khi chunk vượt hard_max_chunk_ms mà không tìm được silence split.
+  # false an toàn hơn: không cắt giữa speech liên tục, chỉ gắn risk để review.
+  # true chỉ nên dùng khi provider có giới hạn upload cứng và chấp nhận hard_split.
   soft_split_allowed: false
 
-  # Đường dẫn và nguồn tải model Silero ONNX.
+  # Chỉ tác động khi mode=silero_vad. Các key này không đổi output khi dùng
+  # asr_context_chunks.
   silero_model_path: models/silero_vad.onnx
   silero_model_url: https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx
-  # Tự tải model khi mode=silero_vad và file chưa tồn tại.
   silero_auto_download: true
-  # Xác suất speech tối thiểu từ Silero.
   silero_threshold: 0.5
-  # Silence tối thiểu để đóng một vùng speech Silero.
+  # Silero-specific: khoảng silence tối thiểu để đóng một speech interval.
   min_silence_duration_ms: 500
-  # Padding trước/sau vùng speech Silero.
+  # Silero-specific: padding trước/sau vùng speech do model trả ra.
   speech_padding_ms: 250
-  # Giới hạn một chunk do backend Silero tạo.
-  max_vad_chunk_ms: 30000
-  # Ghép hai vùng speech nếu khoảng cách không vượt giá trị này.
+  # Silero-specific: merge hai vùng speech nếu khoảng cách không vượt giá trị này.
   merge_gap_ms: 300
 
 translation:
@@ -113,40 +125,50 @@ source_normalization:
   llm_adjudication: false
 
 asr_chunking:
-  # true: dùng logic mới. VAD/Silero vẫn chỉ chia request ASR bootstrap;
-  # sau khi có word timestamps, pipeline rechunk transcript theo khoảng không có word.
-  # Đặt false nếu cần quay về behavior cũ: build transcript trực tiếp từ chunk VAD/Silero.
+  # true: flow mới. VAD/Silero chỉ chia request ASR bootstrap; sau khi có word
+  # timestamps, pipeline rechunk transcript thành wchunk_* theo khoảng không có word.
+  # false: rollback legacy, build transcript trực tiếp từ bootstrap VAD/Silero chunks.
   enabled: true
-  # Nếu chunk word dài hơn ngưỡng này, giảm dần ngưỡng silence để tìm điểm cắt.
+  # Các tham số bên dưới chỉ có tác động khi enabled=true; nếu enabled=false thì
+  # không tác động đồng thời với transcript_segmentation/dubbing_cues.
+  # Nếu một word chunk dài hơn ngưỡng này, giảm dần silence threshold để tìm
+  # split point; nếu vẫn quá dài ở min_silence_ms thì hard split và gắn hard_split.
   max_chunk_duration_ms: 60000
-  # Split đầu tiên tại khoảng trống giữa hai word >= 5 giây.
+  # Split thử đầu tiên tại khoảng trống giữa hai word >= initial_silence_ms.
   initial_silence_ms: 5000
   # Không giảm ngưỡng silence thấp hơn giá trị này trước khi hard split.
   min_silence_ms: 500
-  # Mỗi vòng giảm ngưỡng silence từng bước này.
+  # Mỗi vòng giảm ngưỡng silence từng bước này. Giá trị nhỏ tìm điểm cắt mịn hơn
+  # nhưng có thể tạo nhiều iteration hơn.
   silence_step_ms: 500
-  # Silence sau word cuối được giữ trong cửa sổ debug/provenance nhưng bị cap.
+  # Silence sau word cuối được giữ trong cửa sổ chunk/provenance nhưng bị cap;
+  # không tự kéo dài spoken_text hay audio TTS.
   trailing_silence_cap_ms: 5000
 
 transcript_segmentation:
-  # Thời lượng mục tiêu tối thiểu. Short tail vẫn có thể ngắn hơn tại cuối ASR
-  # chunk hoặc ranh giới câu tự nhiên; TTS sẽ tận dụng silence kế tiếp.
+  # Chạy sau ASR chunking để gom wchunk_* thành transcript segments cho glossary và
+  # translation. Các knob này không cắt audio ASR bootstrap và không trực tiếp tạo
+  # file TTS; downstream dubbing_cues sẽ lập cue riêng từ transcript/source words.
+  # Nếu asr_chunking.enabled=false, input của bước này là VAD/Silero chunks cũ.
   target_min_segment_ms: 16000
-  # Sau ngưỡng này, ưu tiên tách tại pause đủ dài.
+  # Sau ngưỡng này, ưu tiên tách tại pause đủ dài hoặc punctuation đẹp.
   preferred_max_segment_ms: 32000
-  # Hard limit; segment được tách khi đạt ngưỡng kể cả không có punctuation đẹp.
+  # Hard limit transcript segment. Dubbing cue vẫn có max riêng bên dưới, nên hai
+  # giới hạn này không thay thế nhau.
   max_segment_ms: 64000
-  # Pause tối thiểu được xem là điểm tách tốt.
+  # Pause tối thiểu giữa hai word được xem là điểm tách tốt.
   min_pause_split_ms: 600
   # true: ưu tiên kết thúc segment tại '.', '?' hoặc '!' sau target minimum.
   prefer_punctuation_split: true
 
 dubbing_cues:
-  # Đơn vị timing chung cho translation, subtitle và TTS. Planner ưu tiên cắt
-  # tại punctuation/pause gần target và không vượt hard maximum.
-  target_duration_ms: 4000
-  min_duration_ms: 1500
-  max_duration_ms: 6000
+  # Đơn vị timing cho translation output, subtitles và TTS work items. Đây là nơi
+  # quyết định số cue TTS chính; không thay đổi cách VAD cắt audio gửi ASR.
+  # Cue builder ưu tiên punctuation/pause gần target, giữ source_chunk_ids để trace
+  # về wchunk_*/VAD, nhưng vẫn có thể merge/split khi cần giữ max_duration_ms.
+  target_duration_ms: 8000
+  min_duration_ms: 2500
+  max_duration_ms: 12000
 
 mixing:
   # Mức giảm âm lượng audio gốc khi trộn commentary; số âm giảm mạnh hơn.
@@ -201,6 +223,8 @@ asr_service:
   # trả timestamps. Chỉ nên bật cho debug/draft; production nên giữ false.
   allow_chunk_text_fallback: false
   # Gửi vad_filter tới server ASR. Nên false khi pipeline đã tự VAD/chunk audio.
+  # Lưu ý: flag này chỉ đi vào provider request; không tự đổi output của VAD stage
+  # và không thay thế vad.mode/asr_chunking.
   vad_filter: false
 
 llm_service:
@@ -259,7 +283,8 @@ tts_service:
   # Ngưỡng biên độ PCM16 và tỷ lệ sample tối đa để phát hiện clipping.
   clipping_peak_threshold: 32760
   max_clipped_sample_ratio: 0.001
-  # Với word timestamps, pause dài hơn ngưỡng này có thể tách một transcript segment
-  # thành nhiều TTS clause. Mỗi clause dùng timing riêng và silence trước clause kế tiếp.
-  # Local TTS hay nghẽn câu dài có thể giảm xuống 500; provider cloud thường giữ 700.
+  # Với word timestamps, pause dài hơn ngưỡng này có thể tách một dubbing cue thành
+  # nhiều TTS clause. Nếu số clause dịch không khớp số source groups, builder fallback
+  # về một cue duy nhất. Đặt cao hơn để giảm số file TTS; đặt thấp hơn nếu provider
+  # nghẽn câu dài. Knob này không tác động khi cue thiếu word timestamps.
   clause_pause_threshold_ms: 700

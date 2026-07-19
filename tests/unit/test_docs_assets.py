@@ -30,3 +30,31 @@ def test_runbook_documents_common_recovery_paths() -> None:
     assert "Crash during TTS" in runbook
     assert "Corrupt artifact" in runbook
     assert "rerun-segment" in runbook
+
+
+def test_config_example_documents_active_vad_asr_knobs() -> None:
+    example = Path("config.example.yaml").read_text(encoding="utf-8")
+
+    vad_block = example.split("translation:", 1)[0].split("vad:", 1)[1]
+
+    assert "mode-specific" in example
+    assert "không tác động đồng thời" in example
+    assert "min_duration_ms" not in vad_block
+    assert "max_vad_chunk_ms" not in vad_block
+    assert "vad_filter" in example
+    assert "không tự đổi output của VAD stage" in example
+
+
+def test_local_openai_profile_uses_current_vad_asr_defaults() -> None:
+    profile = Path("configs/profiles/local-openai-compatible.yaml").read_text(encoding="utf-8")
+
+    vad_block = profile.split("translation:", 1)[0].split("vad:", 1)[1]
+
+    assert "min_duration_ms" not in vad_block
+    assert "max_duration_ms" not in vad_block
+    assert "max_vad_chunk_ms" not in vad_block
+    assert "asr_chunking:" in profile
+    assert "  enabled: true" in profile
+    assert "  target_duration_ms: 8000" in profile
+    assert "  min_duration_ms: 2500" in profile
+    assert "  max_duration_ms: 12000" in profile
