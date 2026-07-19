@@ -5,10 +5,12 @@ from pathlib import Path
 
 import pytest
 
+from dubber.core.enums import StageName, StageStatus
 from dubber.core.models import DubberConfig, DubbingCueConfig, ProjectConfig, TTSServiceConfig
 from dubber.core.paths import WorkspacePaths
 from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.orchestrator.checkpoint_store import CheckpointStore
+from dubber.orchestrator.segment_checkpoint_store import SegmentCheckpointStore
 from dubber.pipeline.stage_context import StageContext
 from dubber.pipeline.stages import _fallback_glossary_terms_from_text, _normalize_glossary_term, _review_required_items, run_glossary, run_translation
 from dubber.providers.factory import ProviderBundle
@@ -672,6 +674,87 @@ def test_review_required_items_are_chronological_and_include_timing() -> None:
     assert [item["start_ms"] for item in items] == [1000, 3000]
     assert items[0]["review_overrides"]["start_ms"] == 1000
     assert items[0]["review_overrides"]["end_ms"] == 1800
+
+
+class NoCallLLMProvider:
+    async def complete_json(self, system_prompt: str, user_prompt: str, schema: dict) -> dict:
+        raise AssertionError("cached translation block should be reused")
+
+
+def test_cached_translation_protected_span_violation_requires_review_without_failing(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_cached_protected_review")
+    _write_segments(paths, [{"segment_id": "seg_000001", "start_ms": 0, "end_ms": 4000}])
+    paths.artifact_path("transcript.v1.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "segments": [
+                    {
+                        "segment_id": "seg_000001",
+                        "start_ms": 0,
+                        "end_ms": 4000,
+                        "duration_ms": 4000,
+                        "source_text": "The graph is y of t squared.",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    paths.artifact_path("glossary.locked.json").write_text(
+        json.dumps({"schema_version": "1.0", "domain": "mathematics", "status": "locked", "terms": []}),
+        encoding="utf-8",
+    )
+    raw_path = paths.raw_dir / "translation" / "block_000001.json"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "segments": [
+                    {
+                        "segment_id": "cue_bb78da130c88",
+                        "vi_text": "Đồ thị là y theo t bình phương.",
+                        "used_terms": [],
+                        "length_ratio": 1.0,
+                        "translation_warnings": [],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    checkpoint = SegmentCheckpointStore.create(
+        paths.artifact_path("translation_blocks.v1.json"),
+        stage=StageName.TRANSLATION.value,
+        segment_ids=["block_000001"],
+    )
+    checkpoint.mark("block_000001", StageStatus.COMPLETED, artifact=paths.to_relative(raw_path))
+    checkpoint.save()
+    store = CheckpointStore.create(paths.job_state_file, job_id="job_cached_protected_review", input_file=Path("input/video.mp4"))
+    manifest = ArtifactManifest.create("job_cached_protected_review", paths.manifest_file)
+    ctx = StageContext(
+        paths=paths,
+        store=store,
+        manifest=manifest,
+        ffmpeg=None,
+        provider_mode="openai_compatible",
+        provider_bundle=ProviderBundle(asr=object(), llm=NoCallLLMProvider(), tts=object()),
+        config=DubberConfig(
+            project=ProjectConfig(domain="mathematics", domain_profile="calculus"),
+            dubbing_cues=DubbingCueConfig(4000, 1000, 6000),
+        ),
+    )
+
+    assert run_translation(ctx) is True
+
+    required = json.loads(paths.artifact_path("review.required.json").read_text(encoding="utf-8"))
+    assert required["status"] == "required"
+    assert required["cues"][0]["reason"] == "translation_protected_span_review_required"
+    assert required["cues"][0]["error"] == "protected span y(t)² must be represented as y(t) bình phương"
+    assert required["cues"][0]["risk_flags"] == ["translation_protected_span_violation"]
 
 
 def test_translation_review_required_pauses_and_locked_review_overrides_text(tmp_path: Path) -> None:

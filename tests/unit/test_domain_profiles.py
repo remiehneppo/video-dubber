@@ -56,6 +56,16 @@ def test_calculus_profile_protects_dx_squared_as_single_notation() -> None:
     assert protected_translation_errors(source_text, "cộng với thay đổi d x bình phương", spans) == []
 
 
+def test_calculus_profile_treats_x_of_t_squared_as_function_squared() -> None:
+    profile = load_domain_profile("mathematics", explicit_profile="calculus")
+    source_text = "Well, the derivative of x of t squared is 2 times x of t times the derivative of x."
+
+    spans = detect_protected_spans(source_text, profile)
+
+    assert [span.canonical for span in spans] == ["x(t)²"]
+    assert protected_translation_errors(source_text, "Đạo hàm của x(t) bình phương bằng 2 nhân x(t).", spans) == []
+
+
 def test_calculus_profile_loads_without_pyyaml(monkeypatch: pytest.MonkeyPatch) -> None:
     real_import = builtins.__import__
 

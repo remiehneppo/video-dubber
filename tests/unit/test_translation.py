@@ -120,6 +120,32 @@ def test_validate_translations_warns_without_prepending_glossary_violation() -> 
     assert glossary_warning["original"] == "eigenvector"
 
 
+def test_validate_translations_warns_for_protected_span_violation() -> None:
+    report = validate_translations(
+        [{"segment_id": "seg_000001", "source_text": "The graph is y of t squared."}],
+        [{"segment_id": "seg_000001", "vi_text": "Đồ thị là y theo t bình phương."}],
+        [],
+        protected_spans_by_segment={
+            "seg_000001": [
+                {
+                    "canonical": "y(t)²",
+                    "spoken": "y(t) bình phương",
+                    "display": "y(t)²",
+                    "forbidden": [],
+                }
+            ]
+        },
+    )
+
+    assert report.warnings == [
+        {
+            "segment_id": "seg_000001",
+            "warning": "translation_protected_span_violation",
+            "errors": ["protected span y(t)² must be represented as y(t) bình phương"],
+        }
+    ]
+
+
 def test_validate_translations_warns_when_translation_is_too_long() -> None:
     report = validate_translations(
         [{"segment_id": "seg_000001", "source_text": "short"}],

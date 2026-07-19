@@ -71,7 +71,13 @@ def validate_translations(
             list((protected_spans_by_segment or {}).get(segment_id, [])),
         )
         if protected_errors:
-            raise TranslationValidationError(f"protected span violation for {segment_id}: {'; '.join(protected_errors)}")
+            warnings.append(
+                {
+                    "segment_id": segment_id,
+                    "warning": "translation_protected_span_violation",
+                    "errors": protected_errors,
+                }
+            )
 
         missing_terms = _missing_locked_glossary_terms(
             segment_id,

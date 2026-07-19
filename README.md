@@ -186,6 +186,60 @@ Important review rules:
 - If a job already finished ASR/translation, prefer `resume` over a fresh `run` to avoid repeating provider calls.
 - For non-calculus videos, pass `--domain-profile generic` or a suitable profile so calculus protected-span rules do not dominate prompts.
 
+## Domain And Domain Profile Files
+
+`project.domain` is the broad subject label passed into glossary and translation prompts. `project.domain_profile` selects a deterministic profile used for protected notation, glossary seeds, forbidden translations, source normalization, translation validation, and TTS spoken-text normalization.
+
+Current profile files live in `dubber/domain/`. The supported concrete profile is `dubber/domain/calculus.yaml`; `mathematics`, `math`, and `educational math` alias to it. Any unknown domain/profile currently falls back to the built-in `generic` profile, which preserves names, symbols, units, formulas, and numbers but does not load a YAML file or add deterministic protected-span rules.
+
+To create a new domain profile:
+
+1. Add `dubber/domain/<profile_id>.yaml`.
+2. Use this shape:
+
+```yaml
+id: physics
+version: 1
+description: Physics notation and terminology rules for translation and TTS.
+prompt_summary: >
+  Preserve physics symbols, units, formulas, and named laws. Keep notation
+  spoken naturally for Vietnamese dubbing.
+glossary_seeds:
+  - original: F = ma
+    vietnamese: F bằng m a
+    category: formula
+    spoken: F bằng m a
+    display: F = ma
+    forbidden: []
+forbidden_translations:
+  N: ["new"]
+```
+
+3. Wire the profile in `dubber/domain/profiles.py`:
+   - add aliases to `_PROFILE_ALIASES`, for example `"physics": "physics"`;
+   - add a loader similar to `_load_calculus_profile()`;
+   - update `load_domain_profile()` so the requested `profile_id` returns that loader;
+   - add deterministic `detect_protected_spans()` and `normalize_spoken_text()` rules only when the domain needs them.
+4. Add tests in `tests/unit/test_domain_profiles.py` for profile loading, protected-span detection, glossary seeds, forbidden translations, and spoken normalization.
+5. Select the profile in config or CLI:
+
+```yaml
+project:
+  domain: physics
+  domain_profile: physics
+```
+
+```bash
+python3 cli.py run --input lecture.mp4 --domain physics --domain-profile physics
+```
+
+Validation checklist:
+
+```bash
+pytest tests/unit/test_domain_profiles.py -q
+python3 cli.py run --input samples/short_1min.mp4 --provider-mode mock --domain physics --domain-profile physics --no-glossary-review
+```
+
 ## Status And Validation
 
 ```bash

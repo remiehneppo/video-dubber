@@ -93,6 +93,20 @@ Review notes:
 - Prefer `resume` after creating lock files. Use `--from-stage` only when you intentionally invalidate that stage and downstream artifacts.
 - Use `python3 cli.py resume --job {job_id} --dry-run` to inspect the start stage and cache behavior before changing artifacts. For batches, use `python3 cli.py batch resume --batch {batch_id} --dry-run`.
 
+## Domain profile setup
+
+Use a domain profile when a subject needs deterministic protected notation, glossary seeds, forbidden translations, or custom spoken forms for TTS.
+
+Action:
+
+1. Create `dubber/domain/{profile_id}.yaml` with `id`, `version`, `description`, `prompt_summary`, `glossary_seeds`, and `forbidden_translations`.
+2. Wire the profile in `dubber/domain/profiles.py`. Unknown profile names fall back to `generic`; adding only a YAML file is not enough.
+3. Add or update tests in `tests/unit/test_domain_profiles.py`.
+4. Select it with `project.domain_profile` in config or `--domain-profile {profile_id}` on the CLI.
+5. Run `pytest tests/unit/test_domain_profiles.py -q`.
+
+For the full file template and CLI example, see `README.md` under "Domain And Domain Profile Files".
+
 ## Crash during TTS
 
 Symptom: job status is `failed`, current stage is `tts`, and `last_error` contains a provider or simulated crash message.

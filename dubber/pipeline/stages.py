@@ -1291,15 +1291,28 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
             for segment_id, spans in cue_protected_spans.items()
         },
     )
+    protected_span_validation_errors: dict[str, list[str]] = {
+        str(warning.get("segment_id", "")): [str(error) for error in warning.get("errors", [])]
+        for warning in validation.warnings
+        if warning.get("warning") == "translation_protected_span_violation"
+    }
     translated_by_cue = {str(item["segment_id"]): item for item in translated_cues}
     for cue in cues:
-        translated = translated_by_cue[str(cue["cue_id"])]
+        cue_id = str(cue["cue_id"])
+        translated = translated_by_cue[cue_id]
         cue["translated_text"] = translated["display_text"]
         cue["display_text"] = translated["display_text"]
         cue["spoken_text"] = translated["spoken_text"]
         cue["protected_spans"] = translated.get("protected_spans", [])
         cue["used_terms"] = translated["used_terms"]
         cue["translation_warnings"] = translated["translation_warnings"]
+        protected_errors = protected_span_validation_errors.get(cue_id, [])
+        if protected_errors:
+            cue["translation_protected_span_errors"] = protected_errors
+            cue["risk_flags"] = list(dict.fromkeys([
+                *list(cue.get("risk_flags", [])),
+                "translation_protected_span_violation",
+            ]))
 
     if ctx.provider_mode == "openai_compatible":
         _annotate_tts_timing_risks(
@@ -1446,38 +1459,46 @@ def _review_required_items(cues: list[dict[str, object]]) -> list[dict[str, obje
         normalization_suggestions = list(cue.get("normalization_suggestions", []))
         risk_flags = list(cue.get("risk_flags", []))
         high_risk_flags = [flag for flag in risk_flags if flag in _HIGH_RISK_CUE_FLAGS]
-        if not normalization_edits and not normalization_suggestions and not high_risk_flags:
+        protected_errors = [
+            str(error)
+            for error in cue.get("translation_protected_span_errors", [])
+            if str(error).strip()
+        ]
+        if not normalization_edits and not normalization_suggestions and not high_risk_flags and not protected_errors:
             continue
         reason = (
-            "source_normalization_review_required"
+            "translation_protected_span_review_required"
+            if protected_errors
+            else "source_normalization_review_required"
             if normalization_edits or normalization_suggestions
             else "asr_timeline_review_required"
         )
-        items.append(
-            {
-                "cue_id": str(cue["cue_id"]),
-                "reason": reason,
-                "source_text_raw": str(cue.get("source_text_raw", cue.get("source_text", ""))),
+        item = {
+            "cue_id": str(cue["cue_id"]),
+            "reason": reason,
+            "source_text_raw": str(cue.get("source_text_raw", cue.get("source_text", ""))),
+            "source_text_normalized": str(cue.get("source_text", "")),
+            "display_text": str(cue.get("display_text") or cue.get("translated_text") or ""),
+            "spoken_text": str(cue.get("spoken_text") or cue.get("translated_text") or ""),
+            "start_ms": int(cue.get("start_ms", 0)),
+            "end_ms": int(cue.get("end_ms", cue.get("start_ms", 0))),
+            "duration_ms": int(cue.get("duration_ms", int(cue.get("end_ms", cue.get("start_ms", 0))) - int(cue.get("start_ms", 0)))),
+            "protected_spans": list(cue.get("protected_spans", [])),
+            "normalization_edits": normalization_edits,
+            "normalization_suggestions": normalization_suggestions,
+            "risk_flags": risk_flags,
+            "review_overrides": {
                 "source_text_normalized": str(cue.get("source_text", "")),
                 "display_text": str(cue.get("display_text") or cue.get("translated_text") or ""),
                 "spoken_text": str(cue.get("spoken_text") or cue.get("translated_text") or ""),
+                "protected_spans": list(cue.get("protected_spans", [])),
                 "start_ms": int(cue.get("start_ms", 0)),
                 "end_ms": int(cue.get("end_ms", cue.get("start_ms", 0))),
-                "duration_ms": int(cue.get("duration_ms", int(cue.get("end_ms", cue.get("start_ms", 0))) - int(cue.get("start_ms", 0)))),
-                "protected_spans": list(cue.get("protected_spans", [])),
-                "normalization_edits": normalization_edits,
-                "normalization_suggestions": normalization_suggestions,
-                "risk_flags": risk_flags,
-                "review_overrides": {
-                    "source_text_normalized": str(cue.get("source_text", "")),
-                    "display_text": str(cue.get("display_text") or cue.get("translated_text") or ""),
-                    "spoken_text": str(cue.get("spoken_text") or cue.get("translated_text") or ""),
-                    "protected_spans": list(cue.get("protected_spans", [])),
-                    "start_ms": int(cue.get("start_ms", 0)),
-                    "end_ms": int(cue.get("end_ms", cue.get("start_ms", 0))),
-                },
-            }
-        )
+            },
+        }
+        if protected_errors:
+            item["error"] = "; ".join(protected_errors)
+        items.append(item)
     return sorted(items, key=_review_item_sort_key)
 
 

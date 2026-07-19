@@ -254,6 +254,11 @@ def _detect_calculus_spans(text: str) -> list[ProtectedSpan]:
         for match in re.finditer(_WORD_BOUNDARY.format(token=re.escape(token)), text, flags=re.IGNORECASE):
             forbidden = ("doctor", "bác sĩ", "tiến sĩ") if token == "dr" else ()
             spans.append(_span(match, "calculus_notation", token, f"d {token[1]}", token, f"calculus.{token}", forbidden))
+    for match in re.finditer(r"(?<![A-Za-zÀ-ỹ])([A-Za-z])\s+of\s+([A-Za-z])\s+squared\b", text, flags=re.IGNORECASE):
+        function_name = match.group(1)
+        variable = match.group(2)
+        canonical = f"{function_name}({variable})²"
+        spans.append(_span(match, "power", canonical, f"{function_name}({variable}) bình phương", canonical, "calculus.function_squared_words"))
     for match in re.finditer(r"(?<![A-Za-zÀ-ỹ])([A-Za-z])(?:²|\^2)(?![A-Za-zÀ-ỹ])", text):
         variable = match.group(1)
         spans.append(_span(match, "power", f"{variable}²", f"{variable} bình phương", f"{variable}²", "calculus.variable_squared"))

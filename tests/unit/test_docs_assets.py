@@ -10,6 +10,8 @@ def test_readme_documents_core_commands_and_mock_run() -> None:
     assert "--provider-mode mock" in readme
     assert "dubber resume" in readme
     assert "dubber web" in readme
+    assert "Domain And Domain Profile Files" in readme
+    assert "dubber/domain/<profile_id>.yaml" in readme
 
 
 def test_env_example_lists_provider_secrets_without_real_values() -> None:
@@ -24,6 +26,7 @@ def test_runbook_documents_common_recovery_paths() -> None:
     runbook = Path("docs/runbook.md").read_text(encoding="utf-8")
 
     assert "Glossary review" in runbook
+    assert "Domain profile setup" in runbook
     assert "Crash during TTS" in runbook
     assert "Corrupt artifact" in runbook
     assert "rerun-segment" in runbook
