@@ -150,6 +150,7 @@ def load_config(path: Path | str) -> DubberConfig:
             overflow_reserve_ms=int(tts_service.get("overflow_reserve_ms", 120)),
             start_delay_ms=int(tts_service.get("start_delay_ms", 0)),
             retained_edge_silence_ms=int(tts_service.get("retained_edge_silence_ms", 100)),
+            semantic_validation_enabled=bool(tts_service.get("semantic_validation_enabled", True)),
             semantic_max_cer=float(tts_service.get("semantic_max_cer", 0.25)),
             semantic_min_token_recall=float(tts_service.get("semantic_min_token_recall", 0.85)),
             semantic_retry_attempts=int(tts_service.get("semantic_retry_attempts", 3)),

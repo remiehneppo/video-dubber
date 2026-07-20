@@ -14,11 +14,12 @@ project:
   name: video-dubber
   # Container đầu ra mong muốn. Pipeline hiện mux video thành MP4.
   output_format: mp4
-  # Chủ đề dùng trong prompt glossary và translation.
-  domain: mathematics
-  # Profile kỹ thuật chi phối protected notation/glossary/prompt/validator/TTS.
-  # calculus bảo vệ các ký hiệu như dr, dx, dy/dx, πr² để tránh lỗi doctor/bác sĩ.
-  domain_profile: calculus
+  # Chủ đề dùng trong prompt glossary và translation. Generic phù hợp nội dung chung;
+  # override bằng --domain hoặc config riêng cho video chuyên ngành.
+  domain: generic
+  # Profile chi phối protected notation/glossary/prompt/validator/TTS. Generic không
+  # áp luật chuyên ngành; dùng calculus cho video toán có dr, dx, dy/dx, πr².
+  domain_profile: generic
   # Giá trị mặc định mang tính mô tả; job hiện ghi output bên trong workspace job.
   output_dir: ./output
   # Workspace mặc định. CLI --workspace là nguồn quyết định khi chạy lệnh.
@@ -270,8 +271,11 @@ tts_service:
   # Silence đầu/cuối sau trim được giữ lại để mép giọng tự nhiên.
   retained_edge_silence_ms: 100
 
-  # Mọi cue TTS thật được ASR lại bằng tiếng Việt. Cả CER và token recall phải
-  # đạt ngưỡng; nếu không pipeline synthesize lại cùng final_text.
+  # Mọi cue TTS thật được ASR lại bằng tiếng Việt khi bật. Tắt để tăng tốc
+  # xử lý khi chấp nhận bỏ qua validation semantic sau synthesize.
+  semantic_validation_enabled: true
+  # Khi semantic_validation_enabled=true, cả CER và token recall phải đạt ngưỡng;
+  # nếu không pipeline synthesize lại cùng final_text.
   semantic_max_cer: 0.25
   semantic_min_token_recall: 0.85
   semantic_retry_attempts: 3

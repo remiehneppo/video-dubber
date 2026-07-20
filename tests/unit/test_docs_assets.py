@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import fields, is_dataclass
+
+import yaml
+
+from dubber.core.models import DubberConfig
 
 
 def test_readme_documents_core_commands_and_mock_run() -> None:
@@ -58,3 +63,16 @@ def test_local_openai_profile_uses_current_vad_asr_defaults() -> None:
     assert "  target_duration_ms: 8000" in profile
     assert "  min_duration_ms: 2500" in profile
     assert "  max_duration_ms: 12000" in profile
+
+
+def test_config_example_includes_all_config_sections_and_keys() -> None:
+    raw = yaml.safe_load(Path("config.example.yaml").read_text(encoding="utf-8"))
+
+    for section_field in fields(DubberConfig):
+        section = raw.get(section_field.name)
+        assert isinstance(section, dict), f"missing section {section_field.name}"
+        section_config = section_field.default_factory()
+        if not is_dataclass(section_config):
+            continue
+        expected_keys = {field.name for field in fields(section_config)}
+        assert set(section) == expected_keys, section_field.name

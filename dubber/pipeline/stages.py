@@ -2110,6 +2110,7 @@ def run_tts(
                     overflow_reserve_ms=0,
                     start_delay_ms=tts_config.start_delay_ms,
                     retained_edge_silence_ms=tts_config.retained_edge_silence_ms,
+                    semantic_validation_enabled=tts_config.semantic_validation_enabled,
                     semantic_max_cer=tts_config.semantic_max_cer,
                     semantic_min_token_recall=tts_config.semantic_min_token_recall,
                     semantic_retry_attempts=tts_config.semantic_retry_attempts,

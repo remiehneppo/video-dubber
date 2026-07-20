@@ -250,6 +250,33 @@ def test_produce_provider_tts_segment_retries_semantic_mismatch_in_vietnamese(tm
     assert concurrency.calls == Counter({"tts": 2, "asr": 2})
 
 
+def test_produce_provider_tts_segment_can_skip_semantic_asr_validation(tmp_path: Path) -> None:
+    paths = WorkspacePaths.create(tmp_path, "job_semantic_disabled")
+    segment = {"segment_id": "cue_skip", "start_ms": 0, "end_ms": 1000, "duration_ms": 1000}
+    tts = SequenceProviderTTS([900])
+    asr = SequenceASR(["đọc hoàn toàn sai"])
+    providers = ProviderBundle(asr=asr, llm=FakeLLM(), tts=tts)
+    concurrency = RecordingConcurrency()
+
+    row = asyncio.run(produce_provider_tts_segment(
+        paths=paths,
+        segment=segment,
+        text="Xin chào",
+        provider_bundle=providers,
+        ffmpeg=FakeFFmpeg(),
+        semantic_validation_enabled=False,
+        semantic_retry_attempts=3,
+        concurrency=concurrency,  # type: ignore[arg-type]
+    ))
+
+    assert len(tts.texts) == 1
+    assert asr.languages == []
+    assert row["semantic_metrics"]["cer"] == 0.0
+    assert row["quality_attempts"][-1]["semantic_ok"] is True
+    assert row["quality_attempts"][-1]["semantic_skipped"] is True
+    assert concurrency.calls == Counter({"tts": 1})
+
+
 def test_semantic_failure_preserves_attempt_trace_for_resume(tmp_path: Path) -> None:
     import json
 

@@ -169,6 +169,7 @@ def test_provider_mode_pauses_for_high_risk_source_review_then_resumes(tmp_path:
             provider_mode="openai_compatible",
             glossary_review=False,
             domain="mathematics",
+            domain_profile="calculus",
         )
     )
 

@@ -120,6 +120,8 @@ tts_service:
   clause_pause_threshold_ms: 700
   rephrase_attempts: 3
   max_speedup_ratio: 1.2
+  # Bật ASR semantic QA cho TTS; đặt false để tăng tốc khi chấp nhận bỏ qua check này.
+  semantic_validation_enabled: true
   # ASR local gộp "2 pi R" thành "2PR" và nghe "dr" thành "doctor"; CER <= 0.25
   # vẫn bắt sai nội dung tổng thể, còn recall 0.75 cân bằng chất lượng và false negative ký hiệu.
   semantic_min_token_recall: 0.75

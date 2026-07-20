@@ -145,6 +145,24 @@ def test_load_config_can_disable_llm_generated_spoken_text(tmp_path: Path) -> No
     assert config.translation.generate_spoken_text is False
 
 
+def test_load_config_can_disable_tts_semantic_validation(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("tts_service:\n  semantic_validation_enabled: false\n", encoding="utf-8")
+
+    config = load_config(config_file)
+
+    assert config.tts_service.semantic_validation_enabled is False
+
+
+def test_load_config_defaults_tts_semantic_validation_enabled(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("", encoding="utf-8")
+
+    config = load_config(config_file)
+
+    assert config.tts_service.semantic_validation_enabled is True
+
+
 def test_load_config_applies_asr_driven_segmentation_settings(tmp_path: Path) -> None:
     config_file = tmp_path / "config.yaml"
     config_file.write_text(
@@ -291,6 +309,8 @@ def test_config_example_loads_provider_sections(monkeypatch: pytest.MonkeyPatch)
 
     config = load_config(Path("config.example.yaml"))
 
+    assert config.project.domain == "generic"
+    assert config.project.domain_profile == "generic"
     assert config.asr_service.base_url == "https://asr.example/v1"
     assert config.asr_service.api_key == "asr-key"
     assert config.llm_service.model == "gpt-4o-mini"

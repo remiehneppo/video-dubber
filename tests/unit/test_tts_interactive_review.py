@@ -200,6 +200,26 @@ def test_saved_tts_override_is_applied_on_later_resume(tmp_path: Path, monkeypat
     assert manifest["segments"][0]["spoken_text"] == "saved spoken"
 
 
+def test_run_tts_passes_semantic_validation_toggle_to_producer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _context(tmp_path, [_cue("cue_1", start_ms=0, spoken_text="fast path")])
+    ctx.config = replace(
+        ctx.config,
+        tts_service=replace(ctx.config.tts_service, semantic_validation_enabled=False),
+    )
+    captured: list[bool] = []
+
+    async def fake_produce_provider_tts_segment(**kwargs):
+        captured.append(bool(kwargs["semantic_validation_enabled"]))
+        return _row(ctx, kwargs["segment"], str(kwargs["text"]))
+
+    monkeypatch.setattr(stages, "produce_provider_tts_segment", fake_produce_provider_tts_segment)
+    monkeypatch.setattr(stages, "assemble_commentary_track", lambda **kwargs: synthesize_tone_wav(kwargs["output_audio"], 1000))
+
+    stages.run_tts(ctx, 1000)
+
+    assert captured == [False]
+
+
 def test_terminal_tts_review_prefers_utf8_for_terminal_bytes(tmp_path: Path) -> None:
     ctx = _context(tmp_path, [_cue("cue_1", start_ms=0, spoken_text="bad text")])
     request = TTSReviewRequest(

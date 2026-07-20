@@ -169,6 +169,7 @@ class TTSServiceConfig:
     overflow_reserve_ms: int = 120
     start_delay_ms: int = 0
     retained_edge_silence_ms: int = 100
+    semantic_validation_enabled: bool = True
     semantic_max_cer: float = 0.25
     semantic_min_token_recall: float = 0.85
     semantic_retry_attempts: int = 3

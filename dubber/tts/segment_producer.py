@@ -93,6 +93,7 @@ async def produce_provider_tts_segment(
     overflow_reserve_ms: int = 120,
     start_delay_ms: int = 0,
     retained_edge_silence_ms: int = 100,
+    semantic_validation_enabled: bool = True,
     semantic_max_cer: float = 0.25,
     semantic_min_token_recall: float = 0.85,
     semantic_retry_attempts: int = 3,
@@ -234,7 +235,7 @@ async def produce_provider_tts_segment(
                 if waveform_failures >= max(1, quality_retry_attempts):
                     break
                 continue
-            if provider_bundle.asr is not None:
+            if semantic_validation_enabled and provider_bundle.asr is not None:
                 if concurrency is None:
                     asr_result = await provider_bundle.asr.transcribe(tts_result.audio_path, language="vi")
                 else:
