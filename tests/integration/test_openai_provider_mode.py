@@ -84,6 +84,7 @@ class FakeLLMProvider:
             {
                 "segment_id": segment["segment_id"],
                 "vi_text": "Hãy nói về vectơ riêng.",
+                "spoken_text": "Hãy nói về vectơ riêng.",
                 "used_terms": ["eigenvectors"],
                 "length_ratio": 1.0,
                 "translation_warnings": [],
@@ -102,6 +103,7 @@ class CalculusReviewLLMProvider:
                 {
                     "segment_id": segment["segment_id"],
                     "vi_text": "Độ dày là d r.",
+                    "spoken_text": "Độ dày là d r.",
                     "used_terms": ["dr"],
                     "length_ratio": 1.0,
                     "translation_warnings": [],

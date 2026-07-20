@@ -6,13 +6,22 @@ from pathlib import Path
 import pytest
 
 from dubber.core.enums import StageName, StageStatus
-from dubber.core.models import DubberConfig, DubbingCueConfig, ProjectConfig, TTSServiceConfig
+from dubber.core.models import DubberConfig, DubbingCueConfig, ProjectConfig, TranslationConfig, TTSServiceConfig
 from dubber.core.paths import WorkspacePaths
 from dubber.orchestrator.artifact_manifest import ArtifactManifest
 from dubber.orchestrator.checkpoint_store import CheckpointStore
 from dubber.orchestrator.segment_checkpoint_store import SegmentCheckpointStore
 from dubber.pipeline.stage_context import StageContext
-from dubber.pipeline.stages import _fallback_glossary_terms_from_text, _normalize_glossary_term, _review_required_items, run_glossary, run_translation
+from dubber.pipeline.stages import (
+    _fallback_glossary_terms_from_text,
+    _normalize_glossary_term,
+    _review_required_items,
+    _translation_instruction,
+    _translation_response_schema,
+    _translation_system_prompt,
+    run_glossary,
+    run_translation,
+)
 from dubber.providers.factory import ProviderBundle
 from dubber.transcript.cues import build_dubbing_cues
 
@@ -68,6 +77,7 @@ class FakeLLMProvider:
             {
                 "segment_id": context_ids[0],
                 "vi_text": "context-only",
+                "spoken_text": "context-only",
                 "used_terms": [],
                 "length_ratio": 1.0,
                 "translation_warnings": [],
@@ -78,6 +88,7 @@ class FakeLLMProvider:
                 {
                     "segment_id": segment["segment_id"],
                     "vi_text": f"seo::{segment['segment_id']}",
+                    "spoken_text": f"seo::{segment['segment_id']}",
                     "used_terms": ["AI"],
                     "length_ratio": 1.0,
                     "translation_warnings": [],
@@ -120,6 +131,36 @@ def test_normalize_glossary_term_accepts_string_items() -> None:
     assert term["locked"] is True
 
 
+def test_translation_prompt_and_schema_require_spoken_text_when_enabled() -> None:
+    instruction = _translation_instruction(generate_spoken_text=True)
+    prompt = _translation_system_prompt("AI", generate_spoken_text=True)
+    schema = _translation_response_schema(generate_spoken_text=True)
+    segment_schema = schema["properties"]["segments"]["items"]
+
+    assert "display_text" in instruction
+    assert "spoken_text" in instruction
+    assert "TTS-ready" in prompt
+    assert "symbols" in prompt
+    assert "acronyms" in prompt
+    assert "d y" in prompt
+    assert "o x y" in prompt
+    assert "display_text" in segment_schema["required"]
+    assert "spoken_text" in segment_schema["required"]
+    assert "spoken_text" in segment_schema["properties"]
+
+
+def test_translation_prompt_and_schema_keep_legacy_mode_when_disabled() -> None:
+    instruction = _translation_instruction(generate_spoken_text=False)
+    prompt = _translation_system_prompt("AI", generate_spoken_text=False)
+    schema = _translation_response_schema(generate_spoken_text=False)
+    segment_schema = schema["properties"]["segments"]["items"]
+
+    assert "do not return spoken_text" in instruction
+    assert "pipeline derives spoken_text deterministically" in prompt
+    assert "spoken_text" not in segment_schema["required"]
+
+
+
 def test_translation_uses_blocks_and_domain_context(tmp_path: Path) -> None:
     paths = WorkspacePaths.create(tmp_path, "job_domain")
     segments = [
@@ -156,6 +197,108 @@ def test_translation_uses_blocks_and_domain_context(tmp_path: Path) -> None:
     cues = json.loads(paths.artifact_path("dubbing_cues.v2.json").read_text(encoding="utf-8"))["cues"]
     assert all(cue["display_text"] == f"seo::{cue['cue_id']}" for cue in cues)
     assert translated["segments"][0]["display_text"].startswith("seo::cue_")
+
+
+class SpokenTranslationLLMProvider:
+    def __init__(self, *, include_spoken: bool = True, spoken_text: str = "Đọc d y thật rõ.") -> None:
+        self.include_spoken = include_spoken
+        self.spoken_text = spoken_text
+        self.calls: list[dict[str, object]] = []
+
+    async def complete_json(self, system_prompt: str, user_prompt: str, schema: dict) -> dict:
+        payload = json.loads(user_prompt)
+        self.calls.append({"system_prompt": system_prompt, "user_prompt": user_prompt, "schema": schema})
+        segments = []
+        for segment in payload["target_segments"]:
+            item = {
+                "segment_id": segment["segment_id"],
+                "vi_text": "Đọc dy thật rõ.",
+                "display_text": "Đọc dy thật rõ.",
+                "used_terms": [],
+                "length_ratio": 1.0,
+                "translation_warnings": [],
+            }
+            if self.include_spoken:
+                item["spoken_text"] = self.spoken_text
+            segments.append(item)
+        return {"segments": segments}
+
+
+def _translation_ctx_for_single_segment(tmp_path: Path, llm: object, *, config: DubberConfig | None = None) -> tuple[WorkspacePaths, StageContext]:
+    paths = WorkspacePaths.create(tmp_path, "job_spoken_translation")
+    segments = [{"segment_id": "seg_000001", "start_ms": 0, "end_ms": 4000}]
+    _write_segments(paths, segments)
+    paths.artifact_path("transcript.v1.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "segments": [
+                    {
+                        "segment_id": "seg_000001",
+                        "start_ms": 0,
+                        "end_ms": 4000,
+                        "duration_ms": 4000,
+                        "source_text": "Read dy clearly.",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    paths.artifact_path("glossary.locked.json").write_text(
+        json.dumps({"schema_version": "1.0", "domain": "mathematics", "status": "locked", "terms": []}),
+        encoding="utf-8",
+    )
+    ctx = StageContext(
+        paths=paths,
+        store=CheckpointStore.create(paths.job_state_file, job_id="job_spoken_translation", input_file=Path("input/video.mp4")),
+        manifest=ArtifactManifest.create("job_spoken_translation", paths.manifest_file),
+        ffmpeg=None,
+        provider_mode="openai_compatible",
+        provider_bundle=ProviderBundle(asr=object(), llm=llm, tts=object()),
+        config=config or DubberConfig(project=ProjectConfig(domain="mathematics", domain_profile="calculus")),
+    )
+    return paths, ctx
+
+
+def test_translation_persists_llm_generated_spoken_text(tmp_path: Path) -> None:
+    llm = SpokenTranslationLLMProvider(spoken_text="Đọc d y thật rõ.")
+    paths, ctx = _translation_ctx_for_single_segment(tmp_path, llm)
+
+    assert run_translation(ctx) is False
+
+    cues = json.loads(paths.artifact_path("dubbing_cues.v2.json").read_text(encoding="utf-8"))["cues"]
+    assert cues[0]["display_text"] == "Đọc dy thật rõ."
+    assert cues[0]["spoken_text"] == "Đọc d y thật rõ."
+
+
+def test_translation_requires_review_when_llm_spoken_text_is_missing(tmp_path: Path) -> None:
+    paths, ctx = _translation_ctx_for_single_segment(tmp_path, SpokenTranslationLLMProvider(include_spoken=False))
+
+    assert run_translation(ctx) is True
+
+    required = json.loads(paths.artifact_path("review.required.json").read_text(encoding="utf-8"))
+    assert required["status"] == "required"
+    assert required["cues"][0]["reason"] == "translation_spoken_text_review_required"
+    assert required["cues"][0]["display_text"] == "Đọc dy thật rõ."
+    assert required["cues"][0]["spoken_text"] == ""
+    assert "translation_spoken_text_invalid" in required["cues"][0]["risk_flags"]
+
+
+def test_translation_can_disable_llm_spoken_text_and_use_deterministic_normalization(tmp_path: Path) -> None:
+    config = DubberConfig(
+        project=ProjectConfig(domain="mathematics", domain_profile="calculus"),
+        translation=TranslationConfig(generate_spoken_text=False),
+    )
+    paths, ctx = _translation_ctx_for_single_segment(tmp_path, SpokenTranslationLLMProvider(include_spoken=False), config=config)
+
+    assert run_translation(ctx) is False
+
+    cues = json.loads(paths.artifact_path("dubbing_cues.v2.json").read_text(encoding="utf-8"))["cues"]
+    assert cues[0]["display_text"] == "Đọc dy thật rõ."
+    assert cues[0]["spoken_text"] == "Đọc d y thật rõ."
+
 
 
 def test_translation_builds_source_sentences_and_cues_from_word_chunked_transcript(tmp_path: Path) -> None:
@@ -250,6 +393,7 @@ class OmitsSecondBlockOnceLLMProvider:
                 {
                     "segment_id": segment["segment_id"],
                     "vi_text": f"retry::{segment['segment_id']}",
+                    "spoken_text": f"retry::{segment['segment_id']}",
                     "used_terms": [],
                     "length_ratio": 1.0,
                     "translation_warnings": [],
@@ -307,6 +451,7 @@ class PartialTranslationLLMProvider:
                 {
                     "segment_id": segment_id,
                     "vi_text": f"partial::{segment_id}",
+                    "spoken_text": f"partial::{segment_id}",
                     "used_terms": [],
                     "length_ratio": 1.0,
                     "translation_warnings": [],
@@ -365,6 +510,7 @@ class BoundaryDedupeLLMProvider:
                 {
                     "segment_id": target_segments[0]["segment_id"],
                     "vi_text": "Cụm mở đầu. Phần tiếp theo.",
+                    "spoken_text": "Cụm mở đầu. Phần tiếp theo.",
                     "used_terms": [],
                     "length_ratio": 1.0,
                     "translation_warnings": [],
@@ -372,6 +518,7 @@ class BoundaryDedupeLLMProvider:
                 {
                     "segment_id": target_segments[1]["segment_id"],
                     "vi_text": "Cụm mở đầu. Phần tiếp theo mở rộng.",
+                    "spoken_text": "Cụm mở đầu. Phần tiếp theo mở rộng.",
                     "used_terms": [],
                     "length_ratio": 1.0,
                     "translation_warnings": [],
@@ -432,6 +579,7 @@ class ProtectedSpanRetryLLMProvider:
                     {
                         "segment_id": segment_id,
                         "vi_text": "Diện tích là 2 pi r nhân doctor.",
+                        "spoken_text": "Diện tích là 2 pi r nhân doctor.",
                         "used_terms": [],
                         "length_ratio": 1.0,
                         "translation_warnings": [],
@@ -444,7 +592,7 @@ class ProtectedSpanRetryLLMProvider:
                 {
                     "segment_id": segment_id,
                     "vi_text": "Diện tích là 2 pi r nhân d r.",
-                    "spoken_text": "Diện tích là 2 pi r nhân doctor.",
+                    "spoken_text": "Diện tích là 2 pi r nhân d r.",
                     "used_terms": ["dr"],
                     "length_ratio": 1.0,
                     "translation_warnings": [],
@@ -466,6 +614,7 @@ class PersistentProtectedSpanFailureLLMProvider:
                 {
                     "segment_id": segment_id,
                     "vi_text": "sự thay đổi theo thời gian bình phương",
+                    "spoken_text": "sự thay đổi theo thời gian bình phương",
                     "used_terms": [],
                     "length_ratio": 1.0,
                     "translation_warnings": [],
@@ -616,6 +765,7 @@ class ReviewCueLLMProvider:
                 {
                     "segment_id": segment["segment_id"],
                     "vi_text": "Bản dịch trước review d r.",
+                    "spoken_text": "Bản dịch trước review d r.",
                     "used_terms": ["dr"],
                     "length_ratio": 1.0,
                     "translation_warnings": [],
@@ -633,6 +783,7 @@ class DenseTranslationLLMProvider(ReviewCueLLMProvider):
                 {
                     "segment_id": segment["segment_id"],
                     "vi_text": "Nội dung kỹ thuật này quá dài để đọc trong cửa sổ ngắn.",
+                    "spoken_text": "Nội dung kỹ thuật này quá dài để đọc trong cửa sổ ngắn.",
                     "used_terms": [],
                     "length_ratio": 1.0,
                     "translation_warnings": [],
@@ -716,6 +867,7 @@ def test_cached_translation_protected_span_violation_requires_review_without_fai
                     {
                         "segment_id": "cue_bb78da130c88",
                         "vi_text": "Đồ thị là y theo t bình phương.",
+                        "spoken_text": "Đồ thị là y theo t bình phương.",
                         "used_terms": [],
                         "length_ratio": 1.0,
                         "translation_warnings": [],

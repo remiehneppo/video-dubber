@@ -50,6 +50,7 @@ def load_config(path: Path | str) -> DubberConfig:
         ),
         translation=TranslationConfig(
             glossary_review=bool(translation.get("glossary_review", True)),
+            generate_spoken_text=bool(translation.get("generate_spoken_text", True)),
             min_context_words=int(translation.get("min_context_words", 120)),
             max_context_words=int(translation.get("max_context_words", 350)),
             context_overlap_words=int(translation.get("context_overlap_words", 40)),

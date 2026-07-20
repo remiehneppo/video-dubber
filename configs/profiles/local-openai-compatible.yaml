@@ -41,6 +41,8 @@ vad:
   merge_gap_ms: 600
 
 translation:
+  # true: LLM sinh spoken_text TTS-ready cùng display_text; false dùng deterministic normalization cũ.
+  generate_spoken_text: true
   glossary_review: true
   min_context_words: 128
   max_context_words: 256

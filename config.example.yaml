@@ -105,6 +105,10 @@ vad:
   merge_gap_ms: 300
 
 translation:
+  # true: yêu cầu LLM trả display_text và spoken_text trong cùng request translation.
+  # display_text dùng cho subtitle; spoken_text là bản TTS-ready. Nếu LLM trả thiếu
+  # hoặc vi phạm protected spans/forbidden terms, pipeline dừng ở review.required.json.
+  generate_spoken_text: true
   # true: dừng ở glossary.draft.json chờ người dùng tạo glossary.locked.json.
   # CLI có thể ghi đè bằng --glossary-review hoặc --no-glossary-review.
   glossary_review: true

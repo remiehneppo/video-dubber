@@ -106,13 +106,36 @@ def _glossary_instruction() -> str:
     )
 
 
-def _translation_system_prompt(domain: str, profile: DomainProfile | None = None, retry_instruction: str = "") -> str:
-    profile_text = (
-        f"Domain profile {profile.artifact_id}: {profile.prompt_summary}\n"
-        "Protected calculus notation is binding: do not translate dr/dx/dy/dt as English abbreviations, doctor, bác sĩ, or tiến sĩ.\n"
-        "Produce subtitle/display translation only. The pipeline derives spoken_text deterministically from display_text and protected notation.\n"
-        if profile is not None and profile.profile_id != "generic"
-        else ""
+def _translation_system_prompt(
+    domain: str,
+    profile: DomainProfile | None = None,
+    retry_instruction: str = "",
+    *,
+    generate_spoken_text: bool = True,
+) -> str:
+    if profile is not None and profile.profile_id != "generic":
+        profile_lines = [f"Domain profile {profile.artifact_id}: {profile.prompt_summary}"]
+        if generate_spoken_text:
+            profile_lines.append(
+                "Protected notation is binding: keep required display/spoken forms for names, symbols, variables, formulas, units, and acronyms."
+            )
+        else:
+            profile_lines.extend(
+                [
+                    "Protected calculus notation is binding: do not translate dr/dx/dy/dt as English abbreviations, doctor, bác sĩ, or tiến sĩ.",
+                    "Produce subtitle/display translation only. The pipeline derives spoken_text deterministically from display_text and protected notation.",
+                ]
+            )
+        profile_text = "\n".join(profile_lines) + "\n"
+    else:
+        profile_text = ""
+    spoken_text_guidance = (
+        "For each segment, return display_text for subtitles and spoken_text for TTS-ready speech. "
+        "display_text should be natural Vietnamese for reading/display and may preserve symbols when suitable. "
+        "spoken_text must write how the TTS should pronounce the same meaning: separate letters, symbols, acronyms, formulas, variable-like tokens, units, and names that could be merged or misread. "
+        "Use protected_spans spoken values exactly. Examples: dy as notation should be spoken d y, not one blended syllable; oxy as a symbol-like letter sequence should be spoken o x y, not an ordinary word.\n"
+        if generate_spoken_text
+        else "Produce subtitle/display translation only; the pipeline derives spoken_text deterministically from display_text and protected notation.\n"
     )
     return (
         f"You translate target_segments from a {domain} educational video transcript into natural Vietnamese dubbing text.\n"
@@ -125,21 +148,28 @@ def _translation_system_prompt(domain: str, profile: DomainProfile | None = None
         "Do not translate word by word or preserve awkward English syntax. First understand the speaker's intent, then rephrase the idea as a natural Vietnamese explanation.\n"
         "Prefer smooth, idiomatic Vietnamese that a teacher would actually say aloud; combine, reorder, or simplify clauses when that makes the meaning clearer.\n"
         "Use locked glossary terms when their originals appear or clearly apply; preserve names, formulas, symbols, variables, units, and numbers accurately.\n"
+        f"{spoken_text_guidance}"
         "Optimize for spoken Vietnamese: clear, concise, educational, and easy for TTS to read. Avoid overly literal English word order.\n"
-        "Keep vi_text short enough for the segment duration when possible, but never drop technical meaning.\n"
+        "Keep vi_text/display_text short enough for the segment duration when possible, but never drop technical meaning.\n"
         "Fill used_terms with glossary original terms actually used; use translation_warnings for uncertainty, missing context, or length risk."
         f"{retry_instruction}"
     )
 
 
-def _translation_instruction() -> str:
+def _translation_instruction(*, generate_spoken_text: bool = True) -> str:
+    if generate_spoken_text:
+        return (
+            "Return exactly one JSON object with a segments array. "
+            "Return exactly one object for every required target ID and no objects for context-only IDs. "
+            "For each object include segment_id, vi_text, display_text, spoken_text, used_terms, length_ratio, and translation_warnings. "
+            "vi_text may match display_text; display_text is for subtitles, and spoken_text is TTS-ready wording for the same meaning."
+        )
     return (
         "Return exactly one JSON object with a segments array. "
         "Return exactly one object for every required target ID and no objects for context-only IDs. "
         "For each object include segment_id, vi_text, used_terms, length_ratio, and translation_warnings. "
         "You may include display_text as an alias of vi_text; do not return spoken_text."
     )
-
 
 def _translation_blocks(ctx: StageContext, segments: list[dict[str, object]]) -> list[TranslationContextBlock]:
     config = ctx.config.translation
@@ -285,7 +315,32 @@ def _fallback_glossary_terms_from_text(
     return terms
 
 
-def _translation_response_schema() -> dict[str, object]:
+def _translation_response_schema(*, generate_spoken_text: bool = True) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "segment_id": {"type": "string"},
+        "vi_text": {"type": "string"},
+        "display_text": {"type": "string"},
+        "used_terms": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "length_ratio": {"type": "number"},
+        "translation_warnings": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    }
+    required = [
+        "segment_id",
+        "vi_text",
+        "display_text",
+        "used_terms",
+        "length_ratio",
+        "translation_warnings",
+    ]
+    if generate_spoken_text:
+        properties["spoken_text"] = {"type": "string"}
+        required.insert(3, "spoken_text")
     return {
         "type": "object",
         "additionalProperties": False,
@@ -295,33 +350,13 @@ def _translation_response_schema() -> dict[str, object]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "properties": {
-                        "segment_id": {"type": "string"},
-                        "vi_text": {"type": "string"},
-                        "display_text": {"type": "string"},
-                        "used_terms": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                        "length_ratio": {"type": "number"},
-                        "translation_warnings": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "required": [
-                        "segment_id",
-                        "vi_text",
-                        "used_terms",
-                        "length_ratio",
-                        "translation_warnings",
-                    ],
+                    "properties": properties,
+                    "required": required,
                 },
             }
         },
         "required": ["segments"],
     }
-
 
 def _source_normalization_suggestion_schema() -> dict[str, object]:
     return {
@@ -1117,10 +1152,17 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
                     concurrency.run_llm(
                         lambda: _request_structured_json(
                             ctx.require_provider_bundle().llm,
-                            _translation_system_prompt(domain, profile, retry_instruction=retry_instruction),
+                            _translation_system_prompt(
+                                domain,
+                                profile,
+                                retry_instruction=retry_instruction,
+                                generate_spoken_text=ctx.config.translation.generate_spoken_text,
+                            ),
                             json.dumps(
                                 {
-                                    "instruction": _translation_instruction(),
+                                    "instruction": _translation_instruction(
+                                        generate_spoken_text=ctx.config.translation.generate_spoken_text
+                                    ),
                                     "required_target_segment_ids": missing,
                                     "domain": domain,
                                     "domain_profile": profile.artifact_id,
@@ -1136,7 +1178,9 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
                                 },
                                 ensure_ascii=False,
                             ),
-                            _translation_response_schema(),
+                            _translation_response_schema(
+                                generate_spoken_text=ctx.config.translation.generate_spoken_text
+                            ),
                             response_name="translation_output",
                             response_description="Vietnamese translation segments.",
                         )
@@ -1171,6 +1215,31 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
                         protected_retry_used.add(segment_id)
                         protected_retry_messages[segment_id] = errors
                         continue
+                    if ctx.config.translation.generate_spoken_text:
+                        spoken_errors = _translation_spoken_text_errors(
+                            vi_text,
+                            str(item.get("spoken_text") or ""),
+                            cue_protected_spans.get(segment_id, []),
+                        )
+                        if spoken_errors:
+                            override = locked_translation_overrides.get(segment_id)
+                            if override is not None and _review_override_has_translation_text(override):
+                                collected[segment_id] = _translation_item_from_review_override(segment_id, override)
+                                continue
+                            if segment_id in protected_retry_used:
+                                raise TranslationProtectedSpanManualReviewRequired(
+                                    segment_id=segment_id,
+                                    errors=spoken_errors,
+                                    review_item=_translation_spoken_text_review_item(
+                                        targets_by_id[segment_id],
+                                        item,
+                                        errors=spoken_errors,
+                                        protected_spans=cue_protected_spans.get(segment_id, []),
+                                    ),
+                                )
+                            protected_retry_used.add(segment_id)
+                            protected_retry_messages[segment_id] = spoken_errors
+                            continue
                     collected[segment_id] = item
             missing = [segment_id for segment_id in target_ids if segment_id not in collected]
             if missing:
@@ -1233,6 +1302,10 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
                     {
                         "segment_id": source["segment_id"],
                         "vi_text": f"Đây là lát cắt dọc thuyết minh tiếng Việt mẫu cho {source['segment_id']}.",
+                        "spoken_text": normalize_spoken_text(
+                            f"Đây là lát cắt dọc thuyết minh tiếng Việt mẫu cho {source['segment_id']}.",
+                            cue_protected_spans.get(str(source["segment_id"]), []),
+                        ),
                         "used_terms": ["vertical slice"],
                         "length_ratio": 1.0,
                         "translation_warnings": [],
@@ -1268,10 +1341,13 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
         compressed = compress_segment_translation(candidate, glossary["terms"], max_length_ratio=3.0)
         candidate["vi_text"] = compressed.vi_text
         candidate["display_text"] = compressed.vi_text
-        candidate["spoken_text"] = normalize_spoken_text(
-            str(candidate["display_text"]),
-            cue_protected_spans.get(str(source["segment_id"]), []),
-        )
+        if ctx.config.translation.generate_spoken_text:
+            candidate["spoken_text"] = re.sub(r"\s+", " ", str(provider_segment.get("spoken_text") or "")).strip()
+        else:
+            candidate["spoken_text"] = normalize_spoken_text(
+                str(candidate["display_text"]),
+                cue_protected_spans.get(str(source["segment_id"]), []),
+            )
         candidate["translation_warnings"] = list(candidate["translation_warnings"]) + compressed.warnings
         translated_cues.append(candidate)
 
@@ -1309,6 +1385,18 @@ def run_translation(ctx: StageContext, *, total_duration_ms: int | None = None) 
                 *list(cue.get("risk_flags", [])),
                 "translation_protected_span_violation",
             ]))
+        if ctx.config.translation.generate_spoken_text and not protected_errors:
+            spoken_errors = _translation_spoken_text_errors(
+                str(translated["display_text"]),
+                str(translated["spoken_text"]),
+                cue_protected_spans.get(cue_id, []),
+            )
+            if spoken_errors:
+                cue["translation_spoken_text_errors"] = spoken_errors
+                cue["risk_flags"] = list(dict.fromkeys([
+                    *list(cue.get("risk_flags", [])),
+                    "translation_spoken_text_invalid",
+                ]))
 
     if ctx.provider_mode == "openai_compatible":
         _annotate_tts_timing_risks(
@@ -1460,11 +1548,24 @@ def _review_required_items(cues: list[dict[str, object]]) -> list[dict[str, obje
             for error in cue.get("translation_protected_span_errors", [])
             if str(error).strip()
         ]
-        if not normalization_edits and not normalization_suggestions and not high_risk_flags and not protected_errors:
+        spoken_text_errors = [
+            str(error)
+            for error in cue.get("translation_spoken_text_errors", [])
+            if str(error).strip()
+        ]
+        if (
+            not normalization_edits
+            and not normalization_suggestions
+            and not high_risk_flags
+            and not protected_errors
+            and not spoken_text_errors
+        ):
             continue
         reason = (
             "translation_protected_span_review_required"
             if protected_errors
+            else "translation_spoken_text_review_required"
+            if spoken_text_errors
             else "source_normalization_review_required"
             if normalization_edits or normalization_suggestions
             else "asr_timeline_review_required"
@@ -1494,6 +1595,8 @@ def _review_required_items(cues: list[dict[str, object]]) -> list[dict[str, obje
         }
         if protected_errors:
             item["error"] = "; ".join(protected_errors)
+        elif spoken_text_errors:
+            item["error"] = "; ".join(spoken_text_errors)
         items.append(item)
     return sorted(items, key=_review_item_sort_key)
 
@@ -1532,6 +1635,71 @@ def _translation_error_review_item(
         "duration_ms": int(source.get("duration_ms", end_ms - start_ms)),
         "protected_spans": protected,
         "risk_flags": list(dict.fromkeys([*list(source.get("risk_flags", [])), "translation_protected_span_violation"])),
+        "review_overrides": {
+            "source_text_normalized": str(source.get("source_text", "")),
+            "display_text": display_text,
+            "spoken_text": spoken_text,
+            "protected_spans": protected,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+        },
+    }
+
+
+def _translation_spoken_text_errors(
+    display_text: str,
+    spoken_text: str,
+    protected_spans: list[ProtectedSpan],
+) -> list[str]:
+    if not display_text.strip():
+        return []
+    errors: list[str] = []
+    if not spoken_text.strip():
+        errors.append("spoken_text is required when display_text is not empty")
+    display_lower = display_text.lower()
+    spoken_lower = spoken_text.lower()
+    for span in protected_spans:
+        item = span.to_dict()
+        canonical = str(item.get("canonical", "")).strip()
+        expected_spoken = str(item.get("spoken", "")).strip().lower()
+        forbidden = [str(value).lower() for value in item.get("forbidden", []) if str(value).strip()]
+        for value in forbidden:
+            if value in display_lower:
+                errors.append(f"protected span {canonical} was translated as forbidden term {value} in display_text")
+            if value in spoken_lower:
+                errors.append(f"protected span {canonical} was translated as forbidden term {value} in spoken_text")
+        if expected_spoken and expected_spoken not in spoken_lower:
+            errors.append(f"protected span {canonical} must appear in spoken_text as {expected_spoken}")
+    return errors
+
+
+def _translation_spoken_text_review_item(
+    source: dict[str, object],
+    provider_item: dict[str, object],
+    *,
+    errors: list[str],
+    protected_spans: list[ProtectedSpan],
+) -> dict[str, object]:
+    cue_id = str(source["segment_id"])
+    display_text = str(provider_item.get("display_text") or provider_item.get("vi_text") or "")
+    spoken_text = str(provider_item.get("spoken_text") or "")
+    protected = [span.to_dict() for span in protected_spans]
+    start_ms = int(source.get("start_ms", 0))
+    end_ms = int(source.get("end_ms", start_ms))
+    risk_flags = list(dict.fromkeys([*list(source.get("risk_flags", [])), "translation_spoken_text_invalid"]))
+    return {
+        "cue_id": cue_id,
+        "reason": "translation_spoken_text_review_required",
+        "error": "; ".join(errors),
+        "source_text_raw": str(source.get("source_text_raw", source.get("source_text", ""))),
+        "source_text_normalized": str(source.get("source_text", "")),
+        "display_text": display_text,
+        "spoken_text": spoken_text,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "duration_ms": int(source.get("duration_ms", end_ms - start_ms)),
+        "protected_spans": protected,
+        "risk_flags": risk_flags,
         "review_overrides": {
             "source_text_normalized": str(source.get("source_text", "")),
             "display_text": display_text,

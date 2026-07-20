@@ -112,6 +112,7 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
     assert config.vad.context_padding_ms == 300
     assert config.vad.soft_split_allowed is False
     assert config.translation.glossary_review is False
+    assert config.translation.generate_spoken_text is True
     assert config.dubbing_cues.target_duration_ms == 3800
     assert config.dubbing_cues.min_duration_ms == 1400
     assert config.dubbing_cues.max_duration_ms == 5900
@@ -133,6 +134,15 @@ def test_load_config_applies_defaults_and_env_placeholders(tmp_path: Path, monke
     assert config.tts_service.semantic_min_token_recall == 0.9
     assert config.tts_service.semantic_retry_attempts == 5
     assert config.input.allowed_extensions == [".mp4", ".mkv", ".mov"]
+
+
+def test_load_config_can_disable_llm_generated_spoken_text(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("translation:\n  generate_spoken_text: false\n", encoding="utf-8")
+
+    config = load_config(config_file)
+
+    assert config.translation.generate_spoken_text is False
 
 
 def test_load_config_applies_asr_driven_segmentation_settings(tmp_path: Path) -> None:

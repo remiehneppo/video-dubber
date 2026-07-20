@@ -87,6 +87,7 @@ class SubtitleConfig:
 @dataclass(frozen=True)
 class TranslationConfig:
     glossary_review: bool = True
+    generate_spoken_text: bool = True
     min_context_words: int = 120
     max_context_words: int = 350
     context_overlap_words: int = 40

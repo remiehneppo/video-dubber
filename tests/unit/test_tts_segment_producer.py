@@ -12,7 +12,20 @@ from dubber.core.paths import WorkspacePaths
 from dubber.providers.base import TTSResult
 from dubber.providers.factory import ProviderBundle
 from dubber.tts.mock import synthesize_silence_wav, synthesize_tone_wav
+from dubber.pipeline.stages import _tts_text_for_segment
 from dubber.tts.segment_producer import produce_mock_tts_segment, produce_provider_tts_rows, produce_provider_tts_segment
+
+
+def test_tts_text_for_segment_prefers_spoken_text_over_display_text() -> None:
+    segment = {
+        "segment_id": "cue_1",
+        "display_text": "Đọc dy thật rõ.",
+        "spoken_text": "Đọc d y thật rõ.",
+        "translated_text": "legacy",
+    }
+
+    assert _tts_text_for_segment(segment) == "Đọc d y thật rõ."
+
 
 
 def test_produce_mock_tts_segment_returns_manifest_row(tmp_path: Path) -> None:
